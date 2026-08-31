@@ -47,6 +47,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/system/plugins", s.requireUser(http.HandlerFunc(s.pluginList)))
 	mux.Handle("GET /api/v1/providers", s.requireUser(http.HandlerFunc(s.providerList)))
 	mux.Handle("POST /api/v1/providers", s.requireUser(http.HandlerFunc(s.providerCreate)))
+	mux.Handle("PUT /api/v1/providers/{id}", s.requireUser(http.HandlerFunc(s.providerUpdate)))
 	mux.Handle("POST /api/v1/providers/{id}/test", s.requireUser(http.HandlerFunc(s.providerTest)))
 	mux.Handle("GET /api/v1/conversations", s.requireUser(http.HandlerFunc(s.conversationList)))
 	mux.Handle("POST /api/v1/conversations", s.requireUser(http.HandlerFunc(s.conversationCreate)))
@@ -129,6 +130,18 @@ func (s *Server) providerCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusCreated, p)
+}
+func (s *Server) providerUpdate(w http.ResponseWriter, r *http.Request) {
+	var in provider.Input
+	if !decode(w, r, &in) {
+		return
+	}
+	p, err := s.providers.Update(r.Context(), currentUser(r).ID, r.PathValue("id"), in)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, p)
 }
 func (s *Server) providerTest(w http.ResponseWriter, r *http.Request) {
 	if err := s.providers.Test(r.Context(), currentUser(r).ID, r.PathValue("id")); err != nil {

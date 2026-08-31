@@ -112,6 +112,24 @@ func (s *Store) UpsertProvider(ctx context.Context, p domain.Provider, cipher, n
 	return err
 }
 
+func (s *Store) UpdateProvider(ctx context.Context, p domain.Provider, cipher, nonce []byte) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,kind=?,base_url=?,model=?,api_key_cipher=?,api_key_nonce=?,updated_at=? WHERE id=? AND user_id=?`, p.Name, p.Kind, p.BaseURL, p.Model, cipher, nonce, p.UpdatedAt, p.ID, p.UserID)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
+		return domain.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) ListProviders(ctx context.Context, userID string) ([]domain.Provider, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,kind,base_url,model,length(api_key_cipher)>0,created_at,updated_at FROM providers WHERE user_id=? ORDER BY updated_at DESC`, userID)
 	if err != nil {
