@@ -1,0 +1,12 @@
+.npm-cache/
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+frontend/.wrangler/
+backend/data/
+data/
+work/
+*.log
+.env
+.env.*
+!.env.example
