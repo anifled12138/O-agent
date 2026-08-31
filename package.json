@@ -1,0 +1,11 @@
+{
+  "name": "axiom-agent",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev:web": "npm --prefix frontend run dev",
+    "build:web": "npm --prefix frontend run build",
+    "lint:web": "npm --prefix frontend run lint",
+    "audit:web": "npm --prefix frontend audit --audit-level=high"
+  }
+}
