@@ -20,6 +20,7 @@ Requirements: Go 1.27+ and Node.js 22+.
 ```powershell
 # terminal 1
 cd D:\agent-harness\backend
+$env:Path = 'D:\DevTools\go\bin;' + $env:Path
 go run ./cmd/axiom
 
 # terminal 2
@@ -37,4 +38,3 @@ Open `http://127.0.0.1:3000`. Runtime data is written to
 | `AXIOM_ADDR` | `127.0.0.1:8080` | Backend listen address |
 | `AXIOM_DATA_DIR` | `../data` | SQLite database and encryption key directory |
 | `AXIOM_FRONTEND_ORIGIN` | `http://127.0.0.1:3000` | Allowed browser origin |
-
