@@ -1,6 +1,6 @@
 'use client';
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 type User = { id: string; email: string; displayName: string };
 type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; hasApiKey: boolean };
@@ -8,6 +8,11 @@ type Conversation = { id: string; title: string; providerId: string; updatedAt: 
 type Message = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string };
 type ConversationDetail = Conversation & { messages: Message[] };
 type Plugin = { id: string; version: string; description: string; state: string; capabilities: string[] };
+type PermissionSet = { workspaceRead: boolean; pluginDataWrite: boolean; network: string[]; secrets: string[]; background: boolean };
+type Release = { id: string; projectId: string; pluginId: string; version: string; digest: string; manifest: { name: string; description: string; permissions: PermissionSet; capabilities: Capability[] } };
+type ForgeProject = { id: string; name: string; slug: string; description: string; state: string; lastError?: string; updatedAt: string; latestRelease?: Release; releases: Release[] };
+type Installation = { id: string; pluginId: string; projectId: string; activeReleaseId: string; status: string };
+type Capability = { id: string; summary: string; risk: string; pluginId?: string; releaseId?: string; version?: string };
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8080/api/v1';
 
@@ -29,6 +34,7 @@ export default function AxiomApp() {
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [active, setActive] = useState<ConversationDetail | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pluginsOpen, setPluginsOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState('');
 
@@ -79,11 +85,12 @@ export default function AxiomApp() {
   if (loading) return <Splash />;
   if (!user) return <AuthScreen onAuthenticated={async (next) => { setUser(next); await hydrate(); }} />;
   return <main className="app-shell">
-    <Sidebar user={user} conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onSettings={() => setSettingsOpen(true)} onLogout={async () => { await request('/auth/logout', { method: 'POST' }); setUser(null); }} />
+    <Sidebar user={user} conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} onLogout={async () => { await request('/auth/logout', { method: 'POST' }); setUser(null); }} />
     <section className="workspace"><header className="workspace-header"><div><span className="eyebrow">LOCAL AGENT / MISSION</span><h1>{active?.title ?? 'Untitled workspace'}</h1></div><div className="header-actions"><span className="status-pill"><i /> runtime online</span><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Open settings">⌘</button></div></header>
       <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} onSend={send} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} /></div>
     </section>
     {settingsOpen && <Settings providers={providers} onClose={() => setSettingsOpen(false)} onSaved={(next) => { setProviders((items) => items.some((item) => item.id === next.id) ? items.map((item) => item.id === next.id ? next : item) : [next, ...items]); setNotice('Provider saved'); }} />}
+    {pluginsOpen && <PluginCenter onClose={() => setPluginsOpen(false)} />}
   </main>;
 }
 
@@ -100,8 +107,8 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: User) => Prom
     <section className="auth-panel"><div className="auth-box"><span className="step-label">01 / IDENTITY</span><h2>{mode === 'register' ? 'Create your local operator' : 'Welcome back'}</h2><p>{mode === 'register' ? 'This account exists only in your Axiom instance.' : 'Continue your local missions.'}</p><form onSubmit={submit}>{mode === 'register' && <label>DISPLAY NAME<input name="displayName" placeholder="Operator" required /></label>}<label>EMAIL<input name="email" type="email" placeholder="you@example.com" required /></label><label>PASSWORD<input name="password" type="password" minLength={10} placeholder="10+ characters" required /></label>{error && <div className="form-error">{error}</div>}<button className="primary-button" disabled={busy}>{busy ? 'Working…' : mode === 'register' ? 'Initialize workspace' : 'Enter workspace'}<span>→</span></button></form><button className="text-button" onClick={() => { setMode(mode === 'register' ? 'login' : 'register'); setError(''); }}>{mode === 'register' ? 'Already initialized? Sign in' : 'Need a local account? Create one'}</button></div></section></main>;
 }
 
-function Sidebar({ user, conversations, activeId, onNew, onOpen, onSettings, onLogout }: { user: User; conversations: Conversation[]; activeId?: string; onNew: () => void; onOpen: (id: string) => void; onSettings: () => void; onLogout: () => void }) {
-  return <aside className="sidebar"><div className="brand"><div className="brand-mark">A</div><span>AXIOM</span><small>0.1</small></div><button className="new-button" onClick={onNew}><span>＋</span> New mission <kbd>⌘ N</kbd></button><nav><p>MISSIONS</p>{conversations.length === 0 ? <div className="empty-nav">No missions yet.<br/>Start with an objective.</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onSettings}><i>⚙</i><span>Provider settings</span></button><div className="operator"><span>{user.displayName.slice(0,2).toUpperCase()}</span><div><b>{user.displayName}</b><small>{user.email}</small></div><button onClick={onLogout} title="Sign out">↗</button></div></div></aside>;
+function Sidebar({ user, conversations, activeId, onNew, onOpen, onPlugins, onSettings, onLogout }: { user: User; conversations: Conversation[]; activeId?: string; onNew: () => void; onOpen: (id: string) => void; onPlugins: () => void; onSettings: () => void; onLogout: () => void }) {
+  return <aside className="sidebar"><div className="brand"><div className="brand-mark">A</div><span>AXIOM</span><small>0.1</small></div><button className="new-button" onClick={onNew}><span>＋</span> New mission <kbd>⌘ N</kbd></button><nav><p>MISSIONS</p>{conversations.length === 0 ? <div className="empty-nav">No missions yet.<br/>Start with an objective.</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onPlugins}><i>◇</i><span>Plugin Forge</span></button><button onClick={onSettings}><i>⚙</i><span>Provider settings</span></button><div className="operator"><span>{user.displayName.slice(0,2).toUpperCase()}</span><div><b>{user.displayName}</b><small>{user.email}</small></div><button onClick={onLogout} title="Sign out">↗</button></div></div></aside>;
 }
 
 function Chat({ active, providers, sending, notice, onSend, onConfigure }: { active: ConversationDetail | null; providers: Provider[]; sending: boolean; notice: string; onSend: (content: string) => void; onConfigure: () => void }) {
@@ -112,6 +119,131 @@ function Chat({ active, providers, sending, notice, onSend, onConfigure }: { act
 function RuntimePanel({ plugins, provider, messageCount }: { plugins: Plugin[]; provider?: Provider; messageCount: number }) {
   const running = plugins.filter((item) => item.state === 'running').length;
   return <aside className="runtime-panel"><div className="panel-title"><div><span className="eyebrow">LIVE INSPECTOR</span><h3>Runtime</h3></div><span className="live-dot">LIVE</span></div><div className="runtime-metric"><span>Plugin graph</span><b>{running}<small> / {plugins.length} running</small></b><div className="meter"><i style={{width: plugins.length ? `${running/plugins.length*100}%` : '0%'}}/></div></div><div className="runtime-section"><p>ACTIVE MODEL</p>{provider ? <div className="model-card"><div className="model-icon">M</div><div><b>{provider.model}</b><small>{provider.name} · API</small></div><i>●</i></div> : <div className="muted-card">No provider mounted</div>}</div><div className="runtime-section"><p>TURN STATE</p><dl><div><dt>Phase</dt><dd>{messageCount ? 'checkpointed' : 'idle'}</dd></div><div><dt>Messages</dt><dd>{messageCount}</dd></div><div><dt>Policy</dt><dd>runtime.agent.v1</dd></div></dl></div><div className="runtime-section plugin-list"><p>PLUGIN GRAPH</p>{plugins.slice(0,6).map((item) => <div key={item.id}><i className={item.state}/><span>{item.id.replace('core.','').replace('.v1','')}</span><small>{item.version}</small></div>)}</div><div className="runtime-foot"><span>STATE</span><b>LOCAL / ENCRYPTED</b></div></aside>;
+}
+
+function PluginCenter({ onClose }: { onClose: () => void }) {
+  const [projects, setProjects] = useState<ForgeProject[]>([]);
+  const [installations, setInstallations] = useState<Installation[]>([]);
+  const [capabilities, setCapabilities] = useState<Capability[]>([]);
+  const [selectedId, setSelectedId] = useState<string>('');
+  const [busy, setBusy] = useState<string>('');
+  const [error, setError] = useState('');
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+
+  const refresh = useCallback(async () => {
+    const [nextProjects, nextInstallations, nextCapabilities] = await Promise.all([
+      request<ForgeProject[]>('/plugin-forge/projects'),
+      request<Installation[]>('/plugin-runtime/installations'),
+      request<Capability[]>('/plugin-runtime/capabilities'),
+    ]);
+    setProjects(nextProjects); setInstallations(nextInstallations); setCapabilities(nextCapabilities);
+    setSelectedId((current) => current || nextProjects[0]?.id || '');
+  }, []);
+
+  useEffect(() => {
+    void Promise.all([
+      request<ForgeProject[]>('/plugin-forge/projects'),
+      request<Installation[]>('/plugin-runtime/installations'),
+      request<Capability[]>('/plugin-runtime/capabilities'),
+    ]).then(([nextProjects, nextInstallations, nextCapabilities]) => {
+      setProjects(nextProjects); setInstallations(nextInstallations); setCapabilities(nextCapabilities);
+      setSelectedId(nextProjects[0]?.id || '');
+    }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load plugins'));
+  }, []);
+  const selected = projects.find((project) => project.id === selectedId) ?? projects[0];
+  const installation = installations.find((item) => item.projectId === selected?.id && item.status === 'active');
+
+  useEffect(() => {
+    async function bridge(event: MessageEvent) {
+      if (event.source !== iframeRef.current?.contentWindow || !selected?.latestRelease) return;
+      const data = event.data as { type?: string; id?: string; capabilitySuffix?: string; input?: unknown };
+      if (data.type !== 'axiom.plugin.invoke' || !data.id || !data.capabilitySuffix) return;
+      const capability = capabilities.find((item) => item.pluginId === selected.latestRelease?.pluginId && item.id.endsWith(data.capabilitySuffix!));
+      if (!capability) {
+        iframeRef.current?.contentWindow?.postMessage({ type: 'axiom.plugin.result', id: data.id, error: 'Capability is not active' }, '*');
+        return;
+      }
+      try {
+        const result = await request<{ output: unknown }>(`/plugin-runtime/capabilities/${encodeURIComponent(capability.id)}/invoke`, { method: 'POST', body: JSON.stringify({ input: data.input ?? {} }) });
+        iframeRef.current?.contentWindow?.postMessage({ type: 'axiom.plugin.result', id: data.id, output: result.output }, '*');
+      } catch (reason) {
+        iframeRef.current?.contentWindow?.postMessage({ type: 'axiom.plugin.result', id: data.id, error: reason instanceof Error ? reason.message : 'Invocation failed' }, '*');
+      }
+    }
+    window.addEventListener('message', bridge);
+    return () => window.removeEventListener('message', bridge);
+  }, [capabilities, selected]);
+
+  async function create(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy('create'); setError('');
+    const form = new FormData(event.currentTarget);
+    try {
+      const project = await request<ForgeProject>('/plugin-forge/projects', { method: 'POST', body: JSON.stringify(Object.fromEntries(form)) });
+      setProjects((items) => [project, ...items]); setSelectedId(project.id); event.currentTarget.reset();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create plugin'); }
+    finally { setBusy(''); }
+  }
+
+  async function act(project: ForgeProject, action: string) {
+    setBusy(`${project.id}:${action}`); setError('');
+    try {
+      await request(`/plugin-forge/projects/${project.id}/${action}`, { method: 'POST' });
+      await refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Plugin action failed'); await refresh().catch(() => undefined); }
+    finally { setBusy(''); }
+  }
+
+  async function rollback(project: ForgeProject, releaseId: string) {
+    setBusy(`${project.id}:rollback`); setError('');
+    try {
+      await request(`/plugin-forge/projects/${project.id}/rollback`, { method: 'POST', body: JSON.stringify({ releaseId }) });
+      await refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Rollback failed'); }
+    finally { setBusy(''); }
+  }
+
+  const nextAction = selected ? forgeAction(selected.state) : null;
+  const permissions = selected?.latestRelease?.manifest.permissions;
+  return <div className="modal-backdrop forge-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="forge-modal">
+    <header className="forge-header"><div><span className="eyebrow">SYSTEM / PLUGIN FORGE</span><h2>Build capabilities, safely.</h2><p>Each plugin is generated as its own Git project, verified, approved by you, then mounted as an isolated release.</p></div><button onClick={onClose}>×</button></header>
+    <div className="forge-layout"><aside className="forge-rail"><form onSubmit={create} className="forge-create"><label>PLUGIN NAME<input name="name" placeholder="Workspace Inspector" required /></label><label>WHAT SHOULD IT DO?<textarea name="description" placeholder="Describe one concrete capability…" required /></label><button disabled={busy === 'create'}>{busy === 'create' ? 'Creating…' : 'Create proposal'} <span>＋</span></button></form><div className="forge-projects"><p className="eyebrow">PROJECTS</p>{projects.length === 0 ? <div className="forge-empty">No plugin projects yet.</div> : projects.map((project) => <button key={project.id} className={project.id === selected?.id ? 'active' : ''} onClick={() => setSelectedId(project.id)}><i className={`state-${project.state}`}/><span><b>{project.name}</b><small>{project.state.replaceAll('_', ' ')}</small></span><em>›</em></button>)}</div></aside>
+      <div className="forge-stage">{selected ? <><div className="forge-title"><div><span className="eyebrow">{selected.latestRelease?.pluginId ?? `DRAFT / ${selected.slug}`}</span><h3>{selected.name}</h3><p>{selected.description}</p></div><span className={`forge-state state-${selected.state}`}>{selected.state.replaceAll('_', ' ')}</span></div>
+        <div className="forge-pipeline">{['proposed','generated','tested','approved','active'].map((state, index) => <div key={state} className={pipelineReached(selected.state, state) ? 'reached' : ''}><span>{index + 1}</span><b>{state}</b></div>)}</div>
+        {selected.lastError && <div className="forge-error"><b>Last run failed</b><span>{selected.lastError}</span></div>}
+        {permissions && <section className="permission-card"><div><span className="eyebrow">PERMISSION CONTRACT</span><h4>Release-bound access</h4></div><div className="permission-grid"><Permission label="Workspace read" enabled={permissions.workspaceRead}/><Permission label="Plugin data write" enabled={permissions.pluginDataWrite}/><Permission label="Background jobs" enabled={permissions.background}/><Permission label={`Network ${permissions.network.length ? permissions.network.join(', ') : 'blocked'}`} enabled={permissions.network.length > 0}/><Permission label={`Secrets ${permissions.secrets.length ? permissions.secrets.join(', ') : 'none'}`} enabled={permissions.secrets.length > 0}/></div></section>}
+        {selected.state === 'active' && selected.releases?.length > 1 && <section className="release-history"><span className="eyebrow">IMMUTABLE RELEASES</span>{selected.releases.map((release) => <div key={release.id}><span><b>{release.version}</b><small>{release.digest.slice(0, 12)}</small></span>{installation?.activeReleaseId === release.id ? <em>ACTIVE</em> : <button onClick={() => rollback(selected, release.id)} disabled={busy !== ''}>Roll back</button>}</div>)}</section>}
+        {installation && selected.latestRelease ? <section className="plugin-preview"><div className="preview-bar"><span><i/> LIVE · {selected.latestRelease.version}</span><small>Sandboxed frontend · pinned release</small></div><iframe ref={iframeRef} title={`${selected.name} plugin`} sandbox="allow-scripts" src={`${API}/plugin-assets/${installation.activeReleaseId}/index.html`} /></section> : <section className="forge-wait"><span>{selected.state === 'proposed' ? '◇' : '◌'}</span><h4>{forgeGuidance(selected.state).title}</h4><p>{forgeGuidance(selected.state).body}</p></section>}
+        <div className="forge-actions"><div><span className="eyebrow">NEXT CONTROLLED STEP</span><small>Nothing installs or expands permissions without approval.</small></div><div className="forge-action-buttons">{selected.state === 'active' && <button className="secondary" onClick={() => act(selected, 'revise')} disabled={busy !== ''}>Create update</button>}{nextAction && <button onClick={() => act(selected, nextAction.action)} disabled={busy !== ''}>{busy.startsWith(selected.id) ? 'Working…' : nextAction.label}<span>→</span></button>}</div></div>
+      </> : <div className="forge-wait"><span>◇</span><h4>Define the first capability</h4><p>Create a proposal. Generation will only begin when you explicitly start it.</p></div>}</div>
+    </div>{error && <div className="forge-toast">{error}</div>}
+  </section></div>;
+}
+
+function Permission({ label, enabled }: { label: string; enabled: boolean }) { return <div className={enabled ? 'enabled' : ''}><i>{enabled ? '✓' : '—'}</i><span>{label}</span></div>; }
+function forgeAction(state: string): { action: string; label: string } | null {
+  if (state === 'proposed' || state === 'generation_failed') return { action: 'generate', label: 'Generate source' };
+  if (state === 'generated' || state === 'build_failed') return { action: 'build', label: 'Build & test' };
+  if (state === 'tested') return { action: 'request-approval', label: 'Review permissions' };
+  if (state === 'awaiting_approval') return { action: 'approve', label: 'Approve release' };
+  if (state === 'approved' || state === 'installed' || state === 'inactive' || state === 'activation_failed') return { action: 'install', label: state === 'inactive' ? 'Activate plugin' : 'Install & activate' };
+  if (state === 'active') return { action: 'deactivate', label: 'Deactivate' };
+  return null;
+}
+function pipelineReached(current: string, target: string) {
+  const order = ['proposed','generating','generated','building','tested','awaiting_approval','approved','installed','active'];
+  const normalized = current.includes('failed') ? current.replace('_failed', '') : current;
+  return order.indexOf(normalized) >= order.indexOf(target);
+}
+function forgeGuidance(state: string) {
+  const copy: Record<string, { title: string; body: string }> = {
+    proposed: { title: 'Proposal ready', body: 'Generate a standalone full-stack plugin source tree with its own Git history.' },
+    generated: { title: 'Source generated', body: 'The source exists outside Axiom core. Build & test creates an immutable release.' },
+    tested: { title: 'Verification passed', body: 'Inspect the permission contract before opening the approval gate.' },
+    awaiting_approval: { title: 'Your approval is required', body: 'Approval is bound to this exact release digest and permission hash.' },
+    approved: { title: 'Release approved', body: 'Install starts a candidate sidecar, health-checks it, then atomically mounts its capabilities.' },
+    inactive: { title: 'Plugin is detached', body: 'Its release remains installed and can be mounted again without rebuilding.' },
+  };
+  return copy[state] ?? { title: 'Lifecycle in progress', body: 'Axiom is preserving the current state and audit trail.' };
 }
 
 function Settings({ providers, onClose, onSaved }: { providers: Provider[]; onClose: () => void; onSaved: (provider: Provider) => void }) {
