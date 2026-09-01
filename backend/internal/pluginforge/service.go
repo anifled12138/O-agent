@@ -28,6 +28,9 @@ type Runtime interface {
 	Deactivate(context.Context, string, string) error
 	Invoke(context.Context, string, string, json.RawMessage) (json.RawMessage, error)
 	Capabilities(string) []CapabilityBinding
+	SurfaceStates(string, string) []SurfaceState
+	UI(string, string) (UIBinding, bool)
+	Skills(string) []SkillBinding
 }
 
 type Service struct {
@@ -92,6 +95,13 @@ func (s *Service) ListInstallations(ctx context.Context, userID string) ([]Insta
 func (s *Service) Capabilities(userID string) []CapabilityBinding {
 	return s.runtime.Capabilities(userID)
 }
+func (s *Service) SurfaceStates(ctx context.Context, userID string) ([]SurfaceState, error) {
+	return s.repo.SurfaceStates(ctx, userID)
+}
+func (s *Service) UIBinding(userID, pluginID string) (UIBinding, bool) {
+	return s.runtime.UI(userID, pluginID)
+}
+func (s *Service) Skills(userID string) []SkillBinding { return s.runtime.Skills(userID) }
 
 func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Project, error) {
 	in.Name = strings.TrimSpace(in.Name)
@@ -274,7 +284,8 @@ func (s *Service) Install(ctx context.Context, userID, projectID string) (Projec
 		}
 		return Project{}, Installation{}, err
 	}
-	if err = s.runtime.Activate(ctx, userID, release); err != nil {
+	installation, err := s.activateRelease(ctx, userID, release)
+	if err != nil {
 		failed, _ := s.repo.Transition(ctx, userID, projectID, StateActivationFailed, err.Error())
 		return failed, Installation{}, err
 	}
@@ -283,10 +294,6 @@ func (s *Service) Install(ctx context.Context, userID, projectID string) (Projec
 		if err != nil {
 			return p, Installation{}, err
 		}
-	}
-	installation, err := s.repo.Activate(ctx, userID, release)
-	if err != nil {
-		return p, Installation{}, err
 	}
 	p, err = s.repo.Transition(ctx, userID, projectID, StateActive, "")
 	if err == nil {
@@ -339,15 +346,47 @@ func (s *Service) Rollback(ctx context.Context, userID, projectID, releaseID str
 		}
 		return Project{}, Installation{}, err
 	}
-	if err = s.runtime.Activate(ctx, userID, release); err != nil {
-		return Project{}, Installation{}, err
-	}
-	installation, err := s.repo.Activate(ctx, userID, release)
+	installation, err := s.activateRelease(ctx, userID, release)
 	if err != nil {
 		return Project{}, Installation{}, err
 	}
 	s.audit(ctx, project, "plugin.rolled_back", map[string]any{"releaseId": release.ID})
 	return project, installation, nil
+}
+
+// activateRelease coordinates the in-memory registry swap with the durable
+// installation/surface transaction. If persistence fails, it restores the
+// previous mounted release (or detaches the candidate) before returning.
+func (s *Service) activateRelease(ctx context.Context, userID string, release Release) (Installation, error) {
+	var previous *Release
+	installations, listErr := s.repo.ListInstallations(ctx, userID)
+	if listErr != nil {
+		return Installation{}, listErr
+	}
+	for _, item := range installations {
+		if item.PluginID == release.PluginID && item.Status == "active" {
+			loaded, loadErr := s.repo.Release(ctx, item.ActiveReleaseID)
+			if loadErr != nil {
+				return Installation{}, loadErr
+			}
+			previous = &loaded
+			break
+		}
+	}
+	if err := s.runtime.Activate(ctx, userID, release); err != nil {
+		return Installation{}, err
+	}
+	surfaces := s.runtime.SurfaceStates(userID, release.PluginID)
+	installation, err := s.repo.ActivateWithSurfaces(ctx, userID, release, surfaces)
+	if err == nil {
+		return installation, nil
+	}
+	if previous != nil {
+		_ = s.runtime.Activate(context.Background(), userID, *previous)
+	} else {
+		_ = s.runtime.Deactivate(context.Background(), userID, release.PluginID)
+	}
+	return Installation{}, fmt.Errorf("persist plugin activation: %w", err)
 }
 
 func (s *Service) Invoke(ctx context.Context, userID, capabilityID string, input json.RawMessage) (json.RawMessage, error) {
@@ -367,6 +406,9 @@ func (s *Service) Restore(ctx context.Context) error {
 		release, loadErr := s.repo.Release(ctx, installation.ActiveReleaseID)
 		if loadErr == nil {
 			loadErr = s.runtime.Activate(ctx, installation.UserID, release)
+			if loadErr == nil {
+				_, loadErr = s.repo.ActivateWithSurfaces(ctx, installation.UserID, release, s.runtime.SurfaceStates(installation.UserID, release.PluginID))
+			}
 		}
 		if loadErr != nil {
 			joined = errors.Join(joined, fmt.Errorf("restore %s: %w", installation.PluginID, loadErr))
@@ -381,9 +423,11 @@ func (s *Service) Asset(ctx context.Context, userID, releaseID, asset string) (s
 		return "", err
 	}
 	allowed := false
+	pluginID := ""
 	for _, i := range installations {
 		if i.ActiveReleaseID == releaseID && i.Status == "active" {
 			allowed = true
+			pluginID = i.PluginID
 			break
 		}
 	}
@@ -394,12 +438,17 @@ func (s *Service) Asset(ctx context.Context, userID, releaseID, asset string) (s
 	if err != nil {
 		return "", err
 	}
+	ui, ok := s.runtime.UI(userID, pluginID)
+	if !ok || ui.ReleaseID != releaseID {
+		return "", domain.ErrNotFound
+	}
 	clean := filepath.Clean(filepath.FromSlash(asset))
 	if clean == "." || strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
 		return "", domain.ErrInvalid
 	}
-	path := filepath.Join(release.BundleDir, "frontend", clean)
-	root, rootErr := filepath.Abs(filepath.Join(release.BundleDir, "frontend"))
+	uiRoot := filepath.Join(release.BundleDir, filepath.Dir(filepath.FromSlash(ui.UI.Entry)))
+	path := filepath.Join(uiRoot, clean)
+	root, rootErr := filepath.Abs(uiRoot)
 	absolute, absoluteErr := filepath.Abs(path)
 	if rootErr != nil || absoluteErr != nil {
 		return "", domain.ErrInvalid

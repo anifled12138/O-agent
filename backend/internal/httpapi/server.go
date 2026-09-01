@@ -63,6 +63,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/plugin-forge/projects/{id}/{action}", s.requireUser(http.HandlerFunc(s.forgeProjectAction)))
 	mux.Handle("GET /api/v1/plugin-runtime/installations", s.requireUser(http.HandlerFunc(s.runtimeInstallationList)))
 	mux.Handle("GET /api/v1/plugin-runtime/capabilities", s.requireUser(http.HandlerFunc(s.runtimeCapabilityList)))
+	mux.Handle("GET /api/v1/plugin-runtime/surfaces", s.requireUser(http.HandlerFunc(s.runtimeSurfaceList)))
+	mux.Handle("GET /api/v1/plugin-runtime/ui/{plugin}", s.requireUser(http.HandlerFunc(s.runtimeUIGet)))
 	mux.Handle("POST /api/v1/plugin-runtime/capabilities/{id}/invoke", s.requireUser(http.HandlerFunc(s.runtimeInvoke)))
 	mux.Handle("GET /api/v1/plugin-assets/{release}/{path...}", s.requireUser(http.HandlerFunc(s.pluginAsset)))
 	return s.recoverer(s.cors(s.logging(mux)))
@@ -296,6 +298,24 @@ func (s *Server) runtimeInstallationList(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) runtimeCapabilityList(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, s.forge.Capabilities(currentUser(r).ID))
+}
+
+func (s *Server) runtimeSurfaceList(w http.ResponseWriter, r *http.Request) {
+	items, err := s.forge.SurfaceStates(r.Context(), currentUser(r).ID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, items)
+}
+
+func (s *Server) runtimeUIGet(w http.ResponseWriter, r *http.Request) {
+	binding, ok := s.forge.UIBinding(currentUser(r).ID, r.PathValue("plugin"))
+	if !ok {
+		fail(w, domain.ErrNotFound)
+		return
+	}
+	write(w, http.StatusOK, binding)
 }
 
 func (s *Server) runtimeInvoke(w http.ResponseWriter, r *http.Request) {

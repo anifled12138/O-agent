@@ -140,6 +140,38 @@ type Installation struct {
 	UpdatedAt       time.Time `json:"updatedAt"`
 }
 
+type SurfaceState struct {
+	UserID    string    `json:"-"`
+	PluginID  string    `json:"pluginId"`
+	ReleaseID string    `json:"releaseId"`
+	Kind      string    `json:"kind"`
+	SurfaceID string    `json:"surfaceId"`
+	Status    string    `json:"status"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type UIBinding struct {
+	PluginID  string            `json:"pluginId"`
+	ReleaseID string            `json:"releaseId"`
+	Version   string            `json:"version"`
+	UI        pluginmanifest.UI `json:"ui"`
+}
+
+type ServiceBinding struct {
+	PluginID  string                       `json:"pluginId"`
+	ReleaseID string                       `json:"releaseId"`
+	Version   string                       `json:"version"`
+	Service   pluginmanifest.ServiceExport `json:"service"`
+}
+
+type SkillBinding struct {
+	PluginID  string                     `json:"pluginId"`
+	ReleaseID string                     `json:"releaseId"`
+	Version   string                     `json:"version"`
+	BundleDir string                     `json:"-"`
+	Skill     pluginmanifest.SkillExport `json:"skill"`
+}
+
 type CapabilityBinding struct {
 	pluginmanifest.ToolExport
 	PluginID  string `json:"pluginId"`

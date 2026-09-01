@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS plugin_audit_events (
  plugin_id TEXT NOT NULL DEFAULT '', action TEXT NOT NULL, details_json BLOB NOT NULL,
  created_at DATETIME NOT NULL
 );
+CREATE TABLE IF NOT EXISTS plugin_surface_states (
+ user_id TEXT NOT NULL REFERENCES users(id), plugin_id TEXT NOT NULL, release_id TEXT NOT NULL REFERENCES plugin_releases(id),
+ kind TEXT NOT NULL, surface_id TEXT NOT NULL, status TEXT NOT NULL, updated_at DATETIME NOT NULL,
+ PRIMARY KEY(user_id, plugin_id, kind, surface_id)
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_surface_states_release ON plugin_surface_states(user_id, release_id);
 `
 	_, err := r.db.ExecContext(ctx, schema)
 	return err
@@ -204,14 +210,39 @@ func (r *Repository) HasGrant(ctx context.Context, userID string, release Releas
 }
 
 func (r *Repository) Activate(ctx context.Context, userID string, release Release) (Installation, error) {
+	return r.ActivateWithSurfaces(ctx, userID, release, nil)
+}
+
+func (r *Repository) ActivateWithSurfaces(ctx context.Context, userID string, release Release, surfaces []SurfaceState) (Installation, error) {
 	now := time.Now().UTC()
 	installation := Installation{ID: "ins_" + release.Digest[:16], UserID: userID, PluginID: release.PluginID, ProjectID: release.ProjectID, ActiveReleaseID: release.ID, Status: "active", InstalledAt: now, UpdatedAt: now}
-	_, err := r.db.ExecContext(ctx, `INSERT INTO plugin_installations(id,user_id,plugin_id,project_id,active_release_id,status,installed_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,plugin_id) DO UPDATE SET active_release_id=excluded.active_release_id,status='active',updated_at=excluded.updated_at`, installation.ID, userID, installation.PluginID, installation.ProjectID, installation.ActiveReleaseID, installation.Status, installation.InstalledAt, installation.UpdatedAt)
-	return installation, err
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return installation, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO plugin_installations(id,user_id,plugin_id,project_id,active_release_id,status,installed_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,plugin_id) DO UPDATE SET active_release_id=excluded.active_release_id,status='active',updated_at=excluded.updated_at`, installation.ID, userID, installation.PluginID, installation.ProjectID, installation.ActiveReleaseID, installation.Status, installation.InstalledAt, installation.UpdatedAt); err != nil {
+		return installation, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE plugin_surface_states SET status='inactive',updated_at=? WHERE user_id=? AND plugin_id=?`, now, userID, release.PluginID); err != nil {
+		return installation, err
+	}
+	for _, surface := range surfaces {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO plugin_surface_states(user_id,plugin_id,release_id,kind,surface_id,status,updated_at) VALUES(?,?,?,?,?,'active',?) ON CONFLICT(user_id,plugin_id,kind,surface_id) DO UPDATE SET release_id=excluded.release_id,status='active',updated_at=excluded.updated_at`, userID, release.PluginID, release.ID, surface.Kind, surface.SurfaceID, now); err != nil {
+			return installation, err
+		}
+	}
+	return installation, tx.Commit()
 }
 
 func (r *Repository) SetInstallationStatus(ctx context.Context, userID, pluginID, status string) error {
-	result, err := r.db.ExecContext(ctx, `UPDATE plugin_installations SET status=?,updated_at=? WHERE user_id=? AND plugin_id=?`, status, time.Now().UTC(), userID, pluginID)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `UPDATE plugin_installations SET status=?,updated_at=? WHERE user_id=? AND plugin_id=?`, status, now, userID, pluginID)
 	if err != nil {
 		return err
 	}
@@ -219,7 +250,27 @@ func (r *Repository) SetInstallationStatus(ctx context.Context, userID, pluginID
 	if rows == 0 {
 		return domain.ErrNotFound
 	}
-	return nil
+	if _, err = tx.ExecContext(ctx, `UPDATE plugin_surface_states SET status=?,updated_at=? WHERE user_id=? AND plugin_id=?`, status, now, userID, pluginID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *Repository) SurfaceStates(ctx context.Context, userID string) ([]SurfaceState, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT user_id,plugin_id,release_id,kind,surface_id,status,updated_at FROM plugin_surface_states WHERE user_id=? ORDER BY plugin_id,kind,surface_id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []SurfaceState{}
+	for rows.Next() {
+		var item SurfaceState
+		if err := rows.Scan(&item.UserID, &item.PluginID, &item.ReleaseID, &item.Kind, &item.SurfaceID, &item.Status, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
 }
 func (r *Repository) ListInstallations(ctx context.Context, userID string) ([]Installation, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT id,user_id,plugin_id,project_id,active_release_id,status,installed_at,updated_at FROM plugin_installations WHERE user_id=? ORDER BY updated_at DESC`, userID)

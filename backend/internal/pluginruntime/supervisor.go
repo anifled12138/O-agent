@@ -25,8 +25,24 @@ import (
 type Supervisor struct {
 	mu            sync.RWMutex
 	workspaceRoot string
-	plugins       map[string]*process
+	plugins       map[string]*mountedRelease
 	capabilities  map[string]*binding
+	services      map[string]pluginforge.ServiceBinding
+	skills        map[string]pluginforge.SkillBinding
+	uis           map[string]pluginforge.UIBinding
+	hooks         map[string]surfaceBinding
+	jobs          map[string]surfaceBinding
+}
+
+type mountedRelease struct {
+	release pluginforge.Release
+	process *process
+}
+
+type surfaceBinding struct {
+	PluginID  string
+	ReleaseID string
+	ID        string
 }
 
 type binding struct {
@@ -69,21 +85,36 @@ func New(workspaceRoot string) (*Supervisor, error) {
 	if err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("plugin workspace root is unavailable: %s", root)
 	}
-	return &Supervisor{workspaceRoot: root, plugins: map[string]*process{}, capabilities: map[string]*binding{}}, nil
+	return &Supervisor{
+		workspaceRoot: root, plugins: map[string]*mountedRelease{}, capabilities: map[string]*binding{},
+		services: map[string]pluginforge.ServiceBinding{}, skills: map[string]pluginforge.SkillBinding{},
+		uis: map[string]pluginforge.UIBinding{}, hooks: map[string]surfaceBinding{}, jobs: map[string]surfaceBinding{},
+	}, nil
 }
 
 func (s *Supervisor) Activate(ctx context.Context, userID string, release pluginforge.Release) error {
 	if err := release.Manifest.Validate(); err != nil {
 		return err
 	}
-	candidate, err := startProcess(ctx, release)
-	if err != nil {
-		return err
+	var candidate *process
+	if release.Manifest.Runtime != nil && release.Manifest.Runtime.Backend != nil {
+		var startErr error
+		candidate, startErr = startProcess(ctx, release)
+		if startErr != nil {
+			return startErr
+		}
 	}
 
 	pluginKey := key(userID, release.PluginID)
+	mount := &mountedRelease{release: release, process: candidate}
 	newBindings := make(map[string]*binding, len(release.Manifest.Exports.Tools))
 	for _, capability := range release.Manifest.Exports.Tools {
+		if capability.Executor.Kind != "backend" {
+			if candidate != nil {
+				_ = candidate.forceStop()
+			}
+			return fmt.Errorf("tool %q uses unsupported executor kind %q", capability.ID, capability.Executor.Kind)
+		}
 		capabilityKey := key(userID, capability.ID)
 		newBindings[capabilityKey] = &binding{process: candidate, capability: pluginforge.CapabilityBinding{
 			ToolExport: capability,
@@ -92,25 +123,62 @@ func (s *Supervisor) Activate(ctx context.Context, userID string, release plugin
 			Version:    release.Version,
 		}}
 	}
+	newServices := make(map[string]pluginforge.ServiceBinding, len(release.Manifest.Exports.Services))
+	for _, service := range release.Manifest.Exports.Services {
+		newServices[key(userID, service.ID)] = pluginforge.ServiceBinding{PluginID: release.PluginID, ReleaseID: release.ID, Version: release.Version, Service: service}
+	}
+	newSkills := make(map[string]pluginforge.SkillBinding, len(release.Manifest.Exports.Skills))
+	for _, skill := range release.Manifest.Exports.Skills {
+		newSkills[key(userID, skill.ID)] = pluginforge.SkillBinding{PluginID: release.PluginID, ReleaseID: release.ID, Version: release.Version, BundleDir: release.BundleDir, Skill: skill}
+	}
+	var nextUI *pluginforge.UIBinding
+	if release.Manifest.UI != nil {
+		binding := pluginforge.UIBinding{PluginID: release.PluginID, ReleaseID: release.ID, Version: release.Version, UI: *release.Manifest.UI}
+		nextUI = &binding
+	}
+	newHooks := make(map[string]surfaceBinding, len(release.Manifest.Exports.Hooks))
+	for _, hook := range release.Manifest.Exports.Hooks {
+		newHooks[key(userID, hook.ID)] = surfaceBinding{PluginID: release.PluginID, ReleaseID: release.ID, ID: hook.ID}
+	}
+	newJobs := make(map[string]surfaceBinding, len(release.Manifest.Exports.Jobs))
+	for _, job := range release.Manifest.Exports.Jobs {
+		newJobs[key(userID, job.ID)] = surfaceBinding{PluginID: release.PluginID, ReleaseID: release.ID, ID: job.ID}
+	}
 
 	s.mu.Lock()
 	old := s.plugins[pluginKey]
-	if old != nil {
-		for capabilityKey, current := range s.capabilities {
-			if current.process == old {
-				delete(s.capabilities, capabilityKey)
-			}
+	if conflict := s.registrationConflict(userID, release.PluginID, newBindings, newServices, newSkills, newHooks, newJobs); conflict != "" {
+		s.mu.Unlock()
+		if candidate != nil {
+			_ = candidate.forceStop()
 		}
+		return errors.New(conflict)
 	}
-	s.plugins[pluginKey] = candidate
+	s.removePluginBindings(userID, release.PluginID)
+	s.plugins[pluginKey] = mount
 	for capabilityKey, next := range newBindings {
 		s.capabilities[capabilityKey] = next
 	}
+	for id, service := range newServices {
+		s.services[id] = service
+	}
+	for id, skill := range newSkills {
+		s.skills[id] = skill
+	}
+	for id, hook := range newHooks {
+		s.hooks[id] = hook
+	}
+	for id, job := range newJobs {
+		s.jobs[id] = job
+	}
+	if nextUI != nil {
+		s.uis[pluginKey] = *nextUI
+	}
 	s.mu.Unlock()
 
-	if old != nil {
-		old.draining.Store(true)
-		go old.stop(shutdownDuration(backendShutdownMillis(old.release)))
+	if old != nil && old.process != nil {
+		old.process.draining.Store(true)
+		go old.process.stop(shutdownDuration(backendShutdownMillis(old.release)))
 	}
 	return nil
 }
@@ -123,15 +191,12 @@ func (s *Supervisor) Deactivate(_ context.Context, userID, pluginID string) erro
 		s.mu.Unlock()
 		return nil
 	}
-	delete(s.plugins, pluginKey)
-	for capabilityKey, value := range s.capabilities {
-		if value.process == current {
-			delete(s.capabilities, capabilityKey)
-		}
-	}
+	s.removePluginBindings(userID, pluginID)
 	s.mu.Unlock()
-	current.draining.Store(true)
-	go current.stop(shutdownDuration(backendShutdownMillis(current.release)))
+	if current.process != nil {
+		current.process.draining.Store(true)
+		go current.process.stop(shutdownDuration(backendShutdownMillis(current.release)))
+	}
 	return nil
 }
 
@@ -192,20 +257,143 @@ func (s *Supervisor) Capabilities(userID string) []pluginforge.CapabilityBinding
 	return result
 }
 
+func (s *Supervisor) SurfaceStates(userID, pluginID string) []pluginforge.SurfaceState {
+	s.mu.RLock()
+	mounted := s.plugins[key(userID, pluginID)]
+	s.mu.RUnlock()
+	if mounted == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	result := make([]pluginforge.SurfaceState, 0)
+	add := func(kind, id string) {
+		result = append(result, pluginforge.SurfaceState{UserID: userID, PluginID: pluginID, ReleaseID: mounted.release.ID, Kind: kind, SurfaceID: id, Status: "active", UpdatedAt: now})
+	}
+	if mounted.release.Manifest.Runtime != nil {
+		add("runtime", "backend")
+	}
+	if mounted.release.Manifest.UI != nil {
+		add("ui", mounted.release.Manifest.UI.Entry)
+	}
+	for _, item := range mounted.release.Manifest.Exports.Services {
+		add("service", item.ID)
+	}
+	for _, item := range mounted.release.Manifest.Exports.Tools {
+		add("tool", item.ID)
+	}
+	for _, item := range mounted.release.Manifest.Exports.Skills {
+		add("skill", item.ID)
+	}
+	for _, item := range mounted.release.Manifest.Exports.Hooks {
+		add("hook", item.ID)
+	}
+	for _, item := range mounted.release.Manifest.Exports.Jobs {
+		add("job", item.ID)
+	}
+	return result
+}
+
+func (s *Supervisor) UI(userID, pluginID string) (pluginforge.UIBinding, bool) {
+	s.mu.RLock()
+	value, ok := s.uis[key(userID, pluginID)]
+	s.mu.RUnlock()
+	return value, ok
+}
+
+func (s *Supervisor) Skills(userID string) []pluginforge.SkillBinding {
+	prefix := userID + "\x00"
+	s.mu.RLock()
+	result := make([]pluginforge.SkillBinding, 0)
+	for id, item := range s.skills {
+		if strings.HasPrefix(id, prefix) {
+			result = append(result, item)
+		}
+	}
+	s.mu.RUnlock()
+	return result
+}
+
 func (s *Supervisor) Close() error {
 	s.mu.Lock()
 	processes := make([]*process, 0, len(s.plugins))
 	for _, current := range s.plugins {
-		current.draining.Store(true)
-		processes = append(processes, current)
+		if current.process != nil {
+			current.process.draining.Store(true)
+			processes = append(processes, current.process)
+		}
 	}
-	s.plugins = map[string]*process{}
+	s.plugins = map[string]*mountedRelease{}
 	s.capabilities = map[string]*binding{}
+	s.services = map[string]pluginforge.ServiceBinding{}
+	s.skills = map[string]pluginforge.SkillBinding{}
+	s.uis = map[string]pluginforge.UIBinding{}
+	s.hooks = map[string]surfaceBinding{}
+	s.jobs = map[string]surfaceBinding{}
 	s.mu.Unlock()
 	for _, current := range processes {
 		current.stop(shutdownDuration(backendShutdownMillis(current.release)))
 	}
 	return nil
+}
+
+func (s *Supervisor) registrationConflict(userID, pluginID string, tools map[string]*binding, services map[string]pluginforge.ServiceBinding, skills map[string]pluginforge.SkillBinding, hooks, jobs map[string]surfaceBinding) string {
+	for id := range tools {
+		if current := s.capabilities[id]; current != nil && current.capability.PluginID != pluginID {
+			return fmt.Sprintf("tool export %q is already registered", strings.TrimPrefix(id, userID+"\x00"))
+		}
+	}
+	for id := range services {
+		if current, ok := s.services[id]; ok && current.PluginID != pluginID {
+			return fmt.Sprintf("service export %q is already registered", strings.TrimPrefix(id, userID+"\x00"))
+		}
+	}
+	for id := range skills {
+		if current, ok := s.skills[id]; ok && current.PluginID != pluginID {
+			return fmt.Sprintf("skill export %q is already registered", strings.TrimPrefix(id, userID+"\x00"))
+		}
+	}
+	for id := range hooks {
+		if current, ok := s.hooks[id]; ok && current.PluginID != pluginID {
+			return fmt.Sprintf("hook export %q is already registered", strings.TrimPrefix(id, userID+"\x00"))
+		}
+	}
+	for id := range jobs {
+		if current, ok := s.jobs[id]; ok && current.PluginID != pluginID {
+			return fmt.Sprintf("job export %q is already registered", strings.TrimPrefix(id, userID+"\x00"))
+		}
+	}
+	return ""
+}
+
+func (s *Supervisor) removePluginBindings(userID, pluginID string) {
+	pluginKey := key(userID, pluginID)
+	delete(s.plugins, pluginKey)
+	delete(s.uis, pluginKey)
+	for id, item := range s.capabilities {
+		if item.capability.PluginID == pluginID && strings.HasPrefix(id, userID+"\x00") {
+			delete(s.capabilities, id)
+		}
+	}
+	for id, item := range s.services {
+		if item.PluginID == pluginID && strings.HasPrefix(id, userID+"\x00") {
+			delete(s.services, id)
+		}
+	}
+	for id, item := range s.skills {
+		if item.PluginID == pluginID && strings.HasPrefix(id, userID+"\x00") {
+			delete(s.skills, id)
+		}
+	}
+	for id, item := range s.hooks {
+		if item.PluginID == pluginID && strings.HasPrefix(id, userID+"\x00") {
+			delete(s.hooks, id)
+		}
+	}
+	for id, item := range s.jobs {
+		if item.PluginID == pluginID && strings.HasPrefix(id, userID+"\x00") {
+			delete(s.jobs, id)
+		}
+	}
 }
 
 func startProcess(ctx context.Context, release pluginforge.Release) (*process, error) {
