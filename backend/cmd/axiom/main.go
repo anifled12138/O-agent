@@ -16,6 +16,8 @@ import (
 	"axiom.local/agent/internal/config"
 	"axiom.local/agent/internal/core"
 	"axiom.local/agent/internal/httpapi"
+	"axiom.local/agent/internal/pluginforge"
+	"axiom.local/agent/internal/pluginruntime"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/secure"
 	"axiom.local/agent/internal/storage"
@@ -39,6 +41,8 @@ func run() error {
 	host := core.NewHost()
 	plugins := core.NewManager(host)
 	var store *storage.Store
+	var forgeRepo *pluginforge.Repository
+	var forgeRuntime *pluginruntime.Supervisor
 	register(plugins, &core.Component{Info: core.Manifest{ID: "core.storage.sqlite", Version: "0.1.0", Description: "Local transactional state", Capabilities: []string{"storage.sql", "storage.migrations"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		var err error
 		store, err = storage.Open(cfg.DataDir)
@@ -72,7 +76,7 @@ func run() error {
 		}
 		return h.Provide("providers", provider.New(st, vault))
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.agent.v1", Version: "0.1.0", Description: "Persistent provider-neutral reasoning loop", Requires: []string{"core.storage.sqlite", "provider.openai-compatible"}, Capabilities: []string{"agent.conversation", "agent.turn"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.agent.v1", Version: "0.1.0", Description: "Persistent provider-neutral reasoning loop", Requires: []string{"core.storage.sqlite", "provider.openai-compatible", "runtime.plugin-forge.v1"}, Capabilities: []string{"agent.conversation", "agent.turn", "agent.tools"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		st, err := core.Service[*storage.Store](h, "storage")
 		if err != nil {
 			return err
@@ -81,9 +85,32 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		return h.Provide("agent", agent.New(st, providers))
+		forge, err := core.Service[*pluginforge.Service](h, "plugin-forge")
+		if err != nil {
+			return err
+		}
+		return h.Provide("agent", agent.New(st, providers, forge))
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "transport.http.v1", Version: "0.1.0", Description: "Local product API", Requires: []string{"core.auth.local", "runtime.agent.v1"}, Capabilities: []string{"transport.http"}}})
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.plugin-forge.v1", Version: "0.1.0", Description: "User-controlled full-stack plugin forge and sidecar runtime", Requires: []string{"core.storage.sqlite"}, Capabilities: []string{"plugin.generate", "plugin.build", "plugin.approve", "plugin.install", "plugin.invoke"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+		var err error
+		forgeRepo, err = pluginforge.OpenRepository(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		forgeRuntime, err = pluginruntime.New(cfg.WorkspaceRoot)
+		if err != nil {
+			_ = forgeRepo.Close()
+			return err
+		}
+		forge := pluginforge.NewService(forgeRepo, forgeRuntime, cfg.DataDir, cfg.WorkspaceRoot)
+		if restoreErr := forge.Restore(ctx); restoreErr != nil {
+			slog.Warn("some plugins could not be restored", "error", restoreErr)
+		}
+		return h.Provide("plugin-forge", forge)
+	}, StopFn: func(context.Context) error {
+		return errors.Join(forgeRuntime.Close(), forgeRepo.Close())
+	}})
+	register(plugins, &core.Component{Info: core.Manifest{ID: "transport.http.v1", Version: "0.1.0", Description: "Local product API", Requires: []string{"core.auth.local", "runtime.agent.v1", "runtime.plugin-forge.v1"}, Capabilities: []string{"transport.http"}}})
 	if err := plugins.StartAll(ctx); err != nil {
 		return err
 	}
@@ -97,7 +124,8 @@ func run() error {
 	authService, _ := core.Service[*auth.Service](host, "auth")
 	providerService, _ := core.Service[*provider.Service](host, "providers")
 	agentService, _ := core.Service[*agent.Service](host, "agent")
-	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(authService, providerService, agentService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	forgeService, _ := core.Service[*pluginforge.Service](host, "plugin-forge")
+	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(authService, providerService, agentService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErrors := make(chan error, 1)
 	go func() {
 		slog.Info("axiom ready", "address", "http://"+cfg.Addr, "data", absoluteData)

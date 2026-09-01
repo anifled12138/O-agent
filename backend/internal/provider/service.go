@@ -26,8 +26,31 @@ type Input struct {
 	APIKey  string `json:"apiKey"`
 }
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+}
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+type ToolFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+type ToolDefinition struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  json.RawMessage `json:"parameters"`
+	} `json:"function"`
+}
+type Completion struct {
+	Content   string
+	ToolCalls []ToolCall
 }
 type Service struct {
 	store  *storage.Store
@@ -140,41 +163,57 @@ func (s *Service) Test(ctx context.Context, userID, id string) error {
 }
 
 func (s *Service) Complete(ctx context.Context, userID, id string, messages []ChatMessage) (string, error) {
-	p, key, err := s.secret(ctx, userID, id)
+	result, err := s.CompleteWithTools(ctx, userID, id, messages, nil)
 	if err != nil {
 		return "", err
 	}
+	if strings.TrimSpace(result.Content) == "" {
+		return "", errors.New("provider returned no assistant message")
+	}
+	return result.Content, nil
+}
+
+func (s *Service) CompleteWithTools(ctx context.Context, userID, id string, messages []ChatMessage, tools []ToolDefinition) (Completion, error) {
+	p, key, err := s.secret(ctx, userID, id)
+	if err != nil {
+		return Completion{}, err
+	}
 	payload := map[string]any{"model": p.Model, "messages": messages, "temperature": 0.2}
+	if len(tools) > 0 {
+		payload["tools"] = tools
+		payload["tool_choice"] = "auto"
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		return Completion{}, err
 	}
 	endpoint := apiEndpoint(p.BaseURL, "/chat/completions")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return Completion{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", err
+		return Completion{}, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return "", err
+		return Completion{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("provider returned %s from %s: %s", resp.Status, endpoint, bodyPreview(raw))
+		return Completion{}, fmt.Errorf("provider returned %s from %s: %s", resp.Status, endpoint, bodyPreview(raw))
 	}
 	if !json.Valid(raw) {
-		return "", fmt.Errorf("provider returned non-JSON content from %s (%s); check the API base URL", endpoint, responseType(resp))
+		return Completion{}, fmt.Errorf("provider returned non-JSON content from %s (%s); check the API base URL", endpoint, responseType(resp))
 	}
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string     `json:"content"`
+				ToolCalls []ToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 		Error *struct {
@@ -182,15 +221,19 @@ func (s *Service) Complete(ctx context.Context, userID, id string, messages []Ch
 		} `json:"error"`
 	}
 	if err = json.Unmarshal(raw, &result); err != nil {
-		return "", err
+		return Completion{}, err
 	}
 	if result.Error != nil {
-		return "", errors.New(result.Error.Message)
+		return Completion{}, errors.New(result.Error.Message)
 	}
-	if len(result.Choices) == 0 || strings.TrimSpace(result.Choices[0].Message.Content) == "" {
-		return "", errors.New("provider returned no assistant message")
+	if len(result.Choices) == 0 {
+		return Completion{}, errors.New("provider returned no assistant choice")
 	}
-	return result.Choices[0].Message.Content, nil
+	message := result.Choices[0].Message
+	if strings.TrimSpace(message.Content) == "" && len(message.ToolCalls) == 0 {
+		return Completion{}, errors.New("provider returned neither content nor tool calls")
+	}
+	return Completion{Content: message.Content, ToolCalls: message.ToolCalls}, nil
 }
 
 func (s *Service) secret(ctx context.Context, userID, id string) (domain.Provider, string, error) {

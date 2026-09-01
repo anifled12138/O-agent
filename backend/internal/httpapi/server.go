@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"axiom.local/agent/internal/auth"
 	"axiom.local/agent/internal/core"
 	"axiom.local/agent/internal/domain"
+	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/storage"
 )
@@ -27,14 +31,15 @@ type Server struct {
 	auth           *auth.Service
 	providers      *provider.Service
 	agent          *agent.Service
+	forge          *pluginforge.Service
 	store          *storage.Store
 	plugins        *core.Manager
 	frontendOrigin string
 	secureCookies  bool
 }
 
-func New(authService *auth.Service, providerService *provider.Service, agentService *agent.Service, store *storage.Store, plugins *core.Manager, origin string) *Server {
-	return &Server{auth: authService, providers: providerService, agent: agentService, store: store, plugins: plugins, frontendOrigin: strings.TrimRight(origin, "/"), secureCookies: strings.HasPrefix(origin, "https://")}
+func New(authService *auth.Service, providerService *provider.Service, agentService *agent.Service, forgeService *pluginforge.Service, store *storage.Store, plugins *core.Manager, origin string) *Server {
+	return &Server{auth: authService, providers: providerService, agent: agentService, forge: forgeService, store: store, plugins: plugins, frontendOrigin: strings.TrimRight(origin, "/"), secureCookies: strings.HasPrefix(origin, "https://")}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -53,6 +58,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/conversations", s.requireUser(http.HandlerFunc(s.conversationCreate)))
 	mux.Handle("GET /api/v1/conversations/{id}", s.requireUser(http.HandlerFunc(s.conversationGet)))
 	mux.Handle("POST /api/v1/conversations/{id}/messages", s.requireUser(http.HandlerFunc(s.messageCreate)))
+	mux.Handle("GET /api/v1/plugin-forge/projects", s.requireUser(http.HandlerFunc(s.forgeProjectList)))
+	mux.Handle("POST /api/v1/plugin-forge/projects", s.requireUser(http.HandlerFunc(s.forgeProjectCreate)))
+	mux.Handle("POST /api/v1/plugin-forge/projects/{id}/{action}", s.requireUser(http.HandlerFunc(s.forgeProjectAction)))
+	mux.Handle("GET /api/v1/plugin-runtime/installations", s.requireUser(http.HandlerFunc(s.runtimeInstallationList)))
+	mux.Handle("GET /api/v1/plugin-runtime/capabilities", s.requireUser(http.HandlerFunc(s.runtimeCapabilityList)))
+	mux.Handle("POST /api/v1/plugin-runtime/capabilities/{id}/invoke", s.requireUser(http.HandlerFunc(s.runtimeInvoke)))
+	mux.Handle("GET /api/v1/plugin-assets/{release}/{path...}", s.requireUser(http.HandlerFunc(s.pluginAsset)))
 	return s.recoverer(s.cors(s.logging(mux)))
 }
 
@@ -195,6 +207,135 @@ func (s *Server) messageCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusCreated, m)
+}
+
+func (s *Server) forgeProjectList(w http.ResponseWriter, r *http.Request) {
+	items, err := s.forge.ListProjects(r.Context(), currentUser(r).ID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, items)
+}
+
+func (s *Server) forgeProjectCreate(w http.ResponseWriter, r *http.Request) {
+	var in pluginforge.CreateInput
+	if !decode(w, r, &in) {
+		return
+	}
+	project, err := s.forge.Create(r.Context(), currentUser(r).ID, in)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusCreated, project)
+}
+
+func (s *Server) forgeProjectAction(w http.ResponseWriter, r *http.Request) {
+	userID := currentUser(r).ID
+	projectID := r.PathValue("id")
+	switch r.PathValue("action") {
+	case "generate":
+		project, err := s.forge.Generate(r.Context(), userID, projectID)
+		s.writeForgeResult(w, project, nil, nil, err)
+	case "build":
+		project, release, err := s.forge.BuildAndTest(r.Context(), userID, projectID)
+		s.writeForgeResult(w, project, &release, nil, err)
+	case "request-approval":
+		project, release, err := s.forge.RequestApproval(r.Context(), userID, projectID)
+		s.writeForgeResult(w, project, &release, nil, err)
+	case "approve":
+		project, err := s.forge.Approve(r.Context(), userID, projectID)
+		s.writeForgeResult(w, project, nil, nil, err)
+	case "install":
+		project, installation, err := s.forge.Install(r.Context(), userID, projectID)
+		s.writeForgeResult(w, project, nil, &installation, err)
+	case "deactivate":
+		project, err := s.forge.Deactivate(r.Context(), userID, projectID)
+		s.writeForgeResult(w, project, nil, nil, err)
+	case "revise":
+		project, err := s.forge.BeginRevision(r.Context(), userID, projectID)
+		s.writeForgeResult(w, project, nil, nil, err)
+	case "write-source":
+		var in pluginforge.SourceFileInput
+		if !decode(w, r, &in) {
+			return
+		}
+		project, err := s.forge.WriteSourceFile(r.Context(), userID, projectID, in)
+		s.writeForgeResult(w, project, nil, nil, err)
+	case "rollback":
+		var in struct {
+			ReleaseID string `json:"releaseId"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		project, installation, err := s.forge.Rollback(r.Context(), userID, projectID, in.ReleaseID)
+		s.writeForgeResult(w, project, nil, &installation, err)
+	default:
+		write(w, http.StatusNotFound, map[string]string{"error": "unknown plugin action"})
+	}
+}
+
+func (s *Server) writeForgeResult(w http.ResponseWriter, project pluginforge.Project, release *pluginforge.Release, installation *pluginforge.Installation, err error) {
+	if err != nil {
+		write(w, http.StatusConflict, map[string]any{"error": err.Error(), "project": project})
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"project": project, "release": release, "installation": installation})
+}
+
+func (s *Server) runtimeInstallationList(w http.ResponseWriter, r *http.Request) {
+	items, err := s.forge.ListInstallations(r.Context(), currentUser(r).ID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, items)
+}
+
+func (s *Server) runtimeCapabilityList(w http.ResponseWriter, r *http.Request) {
+	write(w, http.StatusOK, s.forge.Capabilities(currentUser(r).ID))
+}
+
+func (s *Server) runtimeInvoke(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	result, err := s.forge.Invoke(r.Context(), currentUser(r).ID, r.PathValue("id"), in.Input)
+	if err != nil {
+		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"output": result})
+}
+
+func (s *Server) pluginAsset(w http.ResponseWriter, r *http.Request) {
+	path, err := s.forge.Asset(r.Context(), currentUser(r).ID, r.PathValue("release"), r.PathValue("path"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self' data:; frame-ancestors "+s.frontendOrigin)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if contentType := mime.TypeByExtension(filepath.Ext(path)); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		fail(w, domain.ErrNotFound)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		fail(w, domain.ErrNotFound)
+		return
+	}
+	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 }
 
 func (s *Server) requireUser(next http.Handler) http.Handler {

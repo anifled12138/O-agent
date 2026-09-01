@@ -4,6 +4,7 @@ frontend/.next/
 frontend/dist/
 frontend/.wrangler/
 backend/data/
+backend/axiom.exe
 data/
 work/
 *.log
