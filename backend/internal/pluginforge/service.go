@@ -27,6 +27,7 @@ type Runtime interface {
 	Activate(context.Context, string, Release) error
 	Deactivate(context.Context, string, string) error
 	Invoke(context.Context, string, string, json.RawMessage) (json.RawMessage, error)
+	UICall(context.Context, string, string, string, json.RawMessage) (json.RawMessage, error)
 	Capabilities(string) []CapabilityBinding
 	SurfaceStates(string, string) []SurfaceState
 	UI(string, string) (UIBinding, bool)
@@ -394,6 +395,13 @@ func (s *Service) Invoke(ctx context.Context, userID, capabilityID string, input
 		input = json.RawMessage(`{}`)
 	}
 	return s.runtime.Invoke(ctx, userID, capabilityID, input)
+}
+
+func (s *Service) UICall(ctx context.Context, userID, pluginID, operation string, input json.RawMessage) (json.RawMessage, error) {
+	if len(input) == 0 {
+		input = json.RawMessage(`{}`)
+	}
+	return s.runtime.UICall(ctx, userID, pluginID, operation, input)
 }
 
 func (s *Service) Restore(ctx context.Context) error {

@@ -109,7 +109,11 @@ func writeProjectV2(p Project, manifest pluginmanifest.Manifest, shape string) e
 		if err := os.MkdirAll(frontendDir, 0o700); err != nil {
 			return err
 		}
-		files[filepath.Join(frontendDir, "index.html")] = []byte(referenceFrontendSource)
+		frontend := referenceFrontendSource
+		if shape == ShapeUI {
+			frontend = referenceStaticFrontendSource
+		}
+		files[filepath.Join(frontendDir, "index.html")] = []byte(frontend)
 	}
 	if len(manifest.Exports.Skills) > 0 {
 		skillDir := filepath.Join(p.SourceDir, "skills", "guide")
@@ -216,6 +220,13 @@ func handle(req request) (any,error) {
  case "plugin.health": return map[string]any{"status":"healthy"},nil
  case "capabilities.list": return []string{"workspace.scan"},nil
  case "plugin.shutdown": return map[string]any{"status":"stopping"},nil
+ case "ui.call":
+  var input struct { Operation string ` + "`json:\"operation\"`" + `; Root string ` + "`json:\"root\"`" + ` }
+  if err:=json.Unmarshal(req.Params,&input);err!=nil{return nil,err}
+  if input.Operation!="scan"{return nil,fmt.Errorf("unknown UI operation %s",input.Operation)}
+  if input.Root==""{return nil,fmt.Errorf("workspace access is not granted")}
+  items,err:=scanTodos(input.Root);if err!=nil{return nil,err}
+  return map[string]any{"count":len(items),"items":items},nil
  case "capability.invoke":
   var input struct { Root string ` + "`json:\"root\"`" + ` }
   if err:=json.Unmarshal(req.Params,&input);err!=nil{return nil,err}
@@ -251,4 +262,6 @@ const referenceFrontendSource = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>
 :root{color-scheme:dark;font-family:ui-monospace,monospace;background:#0e1112;color:#e8ecea}*{box-sizing:border-box}body{margin:0;padding:24px}header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #293033;padding-bottom:16px}h1{font:600 18px system-ui;margin:0}button{border:0;background:#c8ff4f;color:#0a0c0d;padding:10px 15px;font-weight:700;cursor:pointer}.meta{font-size:10px;color:#7e898c;letter-spacing:.12em}.summary{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:18px 0}.card{border:1px solid #293033;padding:14px}.card b{display:block;font-size:26px;color:#c8ff4f}.item{border-top:1px solid #22282a;padding:10px 0;font-size:11px}.item span{color:#899296}.empty{color:#768083;padding:30px 0}.error{color:#ff875e}</style></head>
 <body><header><div><div class="meta">AXIOM GENERATED PLUGIN</div><h1>Workspace TODO Inspector</h1></div><button id="scan">Scan workspace</button></header><div class="summary"><div class="card"><span class="meta">MARKERS</span><b id="count">—</b></div><div class="card"><span class="meta">RUNTIME</span><b>HOT</b></div></div><main id="result" class="empty">Run the capability to inspect this workspace.</main>
-<script>var requestId=0;var pending={};document.getElementById('scan').onclick=function(){var id='ui_'+(++requestId);pending[id]=true;document.getElementById('result').textContent='Scanning…';parent.postMessage({type:'axiom.plugin.invoke',id:id,capabilitySuffix:'.scan',input:{}},'*')};addEventListener('message',function(event){var data=event.data||{};if(data.type!=='axiom.plugin.result'||!pending[data.id])return;delete pending[data.id];var result=document.getElementById('result');if(data.error){result.className='error';result.textContent=data.error;return}var output=data.output||{};document.getElementById('count').textContent=output.count||0;result.className='';result.innerHTML='';(output.items||[]).slice(0,100).forEach(function(item){var row=document.createElement('div');row.className='item';row.textContent=item.kind+' · '+item.file+':'+item.line+' ';var span=document.createElement('span');span.textContent=item.text;row.appendChild(span);result.appendChild(row)});if(!output.count){result.className='empty';result.textContent='No TODO or FIXME markers found.'}});parent.postMessage({type:'axiom.plugin.ready'},'*');</script></body></html>`
+<script>var requestId=0;var pending={};document.getElementById('scan').onclick=function(){var id='ui_'+(++requestId);pending[id]=true;document.getElementById('result').textContent='Scanning…';parent.postMessage({type:'axiom.ui.call',id:id,operation:'scan',input:{}},'*')};addEventListener('message',function(event){var data=event.data||{};if(data.type!=='axiom.ui.result'||!pending[data.id])return;delete pending[data.id];var result=document.getElementById('result');if(data.error){result.className='error';result.textContent=data.error;return}var output=data.output||{};document.getElementById('count').textContent=output.count||0;result.className='';result.innerHTML='';(output.items||[]).slice(0,100).forEach(function(item){var row=document.createElement('div');row.className='item';row.textContent=item.kind+' · '+item.file+':'+item.line+' ';var span=document.createElement('span');span.textContent=item.text;row.appendChild(span);result.appendChild(row)});if(!output.count){result.className='empty';result.textContent='No TODO or FIXME markers found.'}});parent.postMessage({type:'axiom.ui.ready'},'*');</script></body></html>`
+
+const referenceStaticFrontendSource = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>:root{color-scheme:dark;font-family:system-ui;background:#0e1112;color:#e8ecea}body{margin:0;padding:28px}.card{border:1px solid #293033;padding:24px}small{color:#c8ff4f;letter-spacing:.12em}h1{font-size:22px}p{color:#9aa4a6;line-height:1.6}</style></head><body><section class="card"><small>AXIOM UI EXTENSION</small><h1>Presentation surface active</h1><p>This plugin contributes a sandboxed UI only. It does not expose an Agent tool or start a backend process.</p></section><script>parent.postMessage({type:'axiom.ui.ready'},'*')</script></body></html>`

@@ -244,6 +244,46 @@ func (s *Supervisor) Invoke(ctx context.Context, userID, capabilityID string, in
 	return result, nil
 }
 
+// UICall is the Presentation-plane bridge. It deliberately resolves a mounted
+// UI/backend pair by plugin ID and never consults the Agent tool registry.
+func (s *Supervisor) UICall(ctx context.Context, userID, pluginID, operation string, input json.RawMessage) (json.RawMessage, error) {
+	if operation == "" || len(operation) > 128 || strings.ContainsAny(operation, " \t\r\n") {
+		return nil, errors.New("invalid UI operation")
+	}
+	s.mu.RLock()
+	mounted := s.plugins[key(userID, pluginID)]
+	_, hasUI := s.uis[key(userID, pluginID)]
+	if mounted != nil && mounted.process != nil && hasUI && !mounted.process.draining.Load() {
+		mounted.process.inFlight.Add(1)
+	} else {
+		mounted = nil
+	}
+	s.mu.RUnlock()
+	if mounted == nil {
+		return nil, fmt.Errorf("plugin UI %q has no active backend bridge", pluginID)
+	}
+	defer mounted.process.inFlight.Done()
+	var value any = map[string]any{}
+	if len(input) > 0 {
+		if err := json.Unmarshal(input, &value); err != nil {
+			return nil, fmt.Errorf("invalid UI call input: %w", err)
+		}
+	}
+	params := map[string]any{"operation": operation, "input": value}
+	if hasPermission(mounted.release.Manifest.Permissions.Filesystem.Read, "${workspace}") {
+		params["root"] = s.workspaceRoot
+	}
+	raw, _ := json.Marshal(params)
+	result, err := mounted.process.call(ctx, "ui.call", raw)
+	if err != nil {
+		return nil, err
+	}
+	if !json.Valid(result) {
+		return nil, errors.New("plugin returned invalid JSON")
+	}
+	return result, nil
+}
+
 func (s *Supervisor) Capabilities(userID string) []pluginforge.CapabilityBinding {
 	prefix := userID + "\x00"
 	s.mu.RLock()
