@@ -40,6 +40,7 @@ type Service struct {
 type CreateInput struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Shape       string `json:"shape"`
 }
 
 type SourceFileInput struct {
@@ -95,6 +96,7 @@ func (s *Service) Capabilities(userID string) []CapabilityBinding {
 func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Project, error) {
 	in.Name = strings.TrimSpace(in.Name)
 	in.Description = strings.TrimSpace(in.Description)
+	in.Shape = normalizeShape(in.Shape)
 	if in.Name == "" || in.Description == "" {
 		return Project{}, domain.ErrInvalid
 	}
@@ -106,7 +108,7 @@ func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Pr
 	if slug[0] < 'a' || slug[0] > 'z' {
 		slug = "plugin-" + slug
 	}
-	spec, _ := json.Marshal(map[string]any{"goal": in.Description, "acceptance": []string{"backend compiles and passes tests", "frontend loads in a sandbox", "capability output matches its schema", "permissions remain workspace-readonly"}, "requestedBy": "user"})
+	spec, _ := json.Marshal(map[string]any{"goal": in.Description, "shape": in.Shape, "acceptance": acceptanceForShape(in.Shape), "requestedBy": "user"})
 	now := time.Now().UTC()
 	sourceDir := filepath.Join(s.dataDir, "plugin-workspaces", userID, slug)
 	p := Project{ID: id, UserID: userID, Name: in.Name, Slug: slug, Description: in.Description, State: StateProposed, SourceDir: sourceDir, Spec: spec, CreatedAt: now, UpdatedAt: now}
@@ -122,15 +124,16 @@ func (s *Service) Generate(ctx context.Context, userID, projectID string) (Proje
 	if err != nil {
 		return Project{}, err
 	}
-	manifest := referenceManifest(p)
-	if err = writeProject(p, manifest); err != nil {
+	shape := projectShape(p.Spec)
+	manifest := referenceManifestV2(p, shape)
+	if err = writeProjectV2(p, manifest, shape); err != nil {
 		failed, _ := s.repo.Transition(ctx, userID, projectID, StateGenerationFailed, err.Error())
 		return failed, err
 	}
 	commitGeneratedProject(p.SourceDir)
 	p, err = s.repo.Transition(ctx, userID, projectID, StateGenerated, "")
 	if err == nil {
-		s.audit(ctx, p, "project.generated", map[string]any{"sourceDir": p.SourceDir})
+		s.audit(ctx, p, "project.generated", map[string]any{"sourceDir": p.SourceDir, "specVersion": pluginmanifest.SpecV2, "shape": shape})
 	}
 	return p, err
 }
@@ -186,53 +189,22 @@ func (s *Service) BuildAndTest(ctx context.Context, userID, projectID string) (P
 	if err != nil {
 		return fail(fmt.Errorf("manifest compatibility validation failed: %w", err))
 	}
-	if document.SourceVersion != pluginmanifest.SourceV1 {
-		return fail(errors.New("axiom.plugin/v2 authoring requires the surface-aware build planner"))
-	}
-	var manifest Manifest
-	if err = json.Unmarshal(manifestRaw, &manifest); err != nil {
-		return fail(err)
-	}
-	if err = manifest.Validate(); err != nil {
-		return fail(err)
-	}
-	goExe, err := findGo()
+	result, err := s.executeBuildPlan(ctx, p, document, manifestRaw)
 	if err != nil {
 		return fail(err)
 	}
-	backendDir := filepath.Join(p.SourceDir, "backend")
-	if err = validateBackendPolicy(backendDir); err != nil {
-		return fail(err)
+	release := Release{
+		ID:             "rel_" + result.digest[:24],
+		ProjectID:      p.ID,
+		PluginID:       document.Manifest.ID,
+		Version:        document.Manifest.Version,
+		Digest:         result.digest,
+		BundleDir:      result.bundleDir,
+		Manifest:       document.Manifest,
+		TestReport:     result.report,
+		PermissionHash: pluginmanifest.GrantDigest(document.Manifest),
+		CreatedAt:      time.Now().UTC(),
 	}
-	testStarted := time.Now()
-	testOutput, err := runCommand(ctx, backendDir, goExe, "test", "./...")
-	if err != nil {
-		return fail(fmt.Errorf("plugin tests failed: %s", testOutput))
-	}
-	buildDir := filepath.Join(p.SourceDir, "build", time.Now().UTC().Format("20060102T150405.000000000"))
-	if err = os.MkdirAll(buildDir, 0o700); err != nil {
-		return fail(err)
-	}
-	exeName := "plugin"
-	if runtime.GOOS == "windows" {
-		exeName += ".exe"
-	}
-	builtExe := filepath.Join(buildDir, exeName)
-	buildOutput, err := runCommand(ctx, backendDir, goExe, "build", "-trimpath", "-o", builtExe, ".")
-	if err != nil {
-		return fail(fmt.Errorf("plugin build failed: %s", buildOutput))
-	}
-	frontendSource := filepath.Join(p.SourceDir, "frontend", "index.html")
-	digest, err := artifactDigest(manifestRaw, builtExe, frontendSource)
-	if err != nil {
-		return fail(err)
-	}
-	bundleDir := filepath.Join(s.dataDir, "plugin-store", "sha256", digest)
-	if err = packageRelease(bundleDir, builtExe, frontendSource, manifestRaw); err != nil {
-		return fail(err)
-	}
-	report, _ := json.Marshal(map[string]any{"passed": true, "goTest": strings.TrimSpace(testOutput), "build": strings.TrimSpace(buildOutput), "durationMillis": time.Since(testStarted).Milliseconds(), "checkedAt": time.Now().UTC()})
-	release := Release{ID: "rel_" + digest[:24], ProjectID: p.ID, PluginID: manifest.ID, Version: manifest.Version, Digest: digest, BundleDir: bundleDir, Manifest: manifest, TestReport: report, PermissionHash: pluginmanifest.GrantDigest(document.Manifest), CreatedAt: time.Now().UTC()}
 	if err = s.repo.CreateRelease(ctx, release); err != nil && !strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return fail(err)
 	}
@@ -240,7 +212,7 @@ func (s *Service) BuildAndTest(ctx context.Context, userID, projectID string) (P
 	if err != nil {
 		return p, release, err
 	}
-	s.audit(ctx, p, "release.tested", map[string]any{"releaseId": release.ID, "digest": digest})
+	s.audit(ctx, p, "release.tested", map[string]any{"releaseId": release.ID, "digest": result.digest, "sourceVersion": document.SourceVersion})
 	return p, release, nil
 }
 
@@ -544,6 +516,9 @@ func allowedSourcePath(path string) bool {
 	}
 	if strings.HasPrefix(forward, "frontend/") {
 		return extension == ".html" || extension == ".css" || extension == ".js" || extension == ".json"
+	}
+	if strings.HasPrefix(forward, "skills/") {
+		return extension == ".md" || extension == ".json" || extension == ".txt"
 	}
 	return path == "README.md"
 }

@@ -82,11 +82,11 @@ func (s *Supervisor) Activate(ctx context.Context, userID string, release plugin
 	}
 
 	pluginKey := key(userID, release.PluginID)
-	newBindings := make(map[string]*binding, len(release.Manifest.Capabilities))
-	for _, capability := range release.Manifest.Capabilities {
+	newBindings := make(map[string]*binding, len(release.Manifest.Exports.Tools))
+	for _, capability := range release.Manifest.Exports.Tools {
 		capabilityKey := key(userID, capability.ID)
 		newBindings[capabilityKey] = &binding{process: candidate, capability: pluginforge.CapabilityBinding{
-			Capability: capability,
+			ToolExport: capability,
 			PluginID:   release.PluginID,
 			ReleaseID:  release.ID,
 			Version:    release.Version,
@@ -110,7 +110,7 @@ func (s *Supervisor) Activate(ctx context.Context, userID string, release plugin
 
 	if old != nil {
 		old.draining.Store(true)
-		go old.stop(shutdownDuration(old.release.Manifest.Backend.ShutdownMillis))
+		go old.stop(shutdownDuration(backendShutdownMillis(old.release)))
 	}
 	return nil
 }
@@ -131,7 +131,7 @@ func (s *Supervisor) Deactivate(_ context.Context, userID, pluginID string) erro
 	}
 	s.mu.Unlock()
 	current.draining.Store(true)
-	go current.stop(shutdownDuration(current.release.Manifest.Backend.ShutdownMillis))
+	go current.stop(shutdownDuration(backendShutdownMillis(current.release)))
 	return nil
 }
 
@@ -160,7 +160,7 @@ func (s *Supervisor) Invoke(ctx context.Context, userID, capabilityID string, in
 	}
 	params["_axiomCapabilityId"] = capabilityID
 	// The host, not plugin UI or model output, chooses the filesystem boundary.
-	if selected.process.release.Manifest.Permissions.WorkspaceRead {
+	if hasPermission(selected.process.release.Manifest.Permissions.Filesystem.Read, "${workspace}") {
 		params["root"] = s.workspaceRoot
 	} else {
 		delete(params, "root")
@@ -203,7 +203,7 @@ func (s *Supervisor) Close() error {
 	s.capabilities = map[string]*binding{}
 	s.mu.Unlock()
 	for _, current := range processes {
-		current.stop(shutdownDuration(current.release.Manifest.Backend.ShutdownMillis))
+		current.stop(shutdownDuration(backendShutdownMillis(current.release)))
 	}
 	return nil
 }
@@ -213,7 +213,10 @@ func startProcess(ctx context.Context, release pluginforge.Release) (*process, e
 	if err != nil {
 		return nil, err
 	}
-	artifact := filepath.Clean(filepath.FromSlash(release.Manifest.Backend.Artifact))
+	if release.Manifest.Runtime == nil || release.Manifest.Runtime.Backend == nil {
+		return nil, errors.New("plugin release has no backend runtime")
+	}
+	artifact := filepath.Clean(filepath.FromSlash(release.Manifest.Runtime.Backend.Artifact))
 	if runtime.GOOS != "windows" {
 		artifact = strings.TrimSuffix(artifact, ".exe")
 	}
@@ -353,4 +356,20 @@ func shutdownDuration(milliseconds int) time.Duration {
 		milliseconds = 10000
 	}
 	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func backendShutdownMillis(release pluginforge.Release) int {
+	if release.Manifest.Runtime == nil || release.Manifest.Runtime.Backend == nil {
+		return 10000
+	}
+	return release.Manifest.Runtime.Backend.ShutdownMillis
+}
+
+func hasPermission(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

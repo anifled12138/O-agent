@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"axiom.local/agent/internal/domain"
+	"axiom.local/agent/internal/pluginmanifest"
 	_ "modernc.org/sqlite"
 )
 
@@ -148,7 +149,11 @@ func scanRelease(row interface{ Scan(...any) error }) (Release, error) {
 	var manifest, test []byte
 	err := row.Scan(&release.ID, &release.ProjectID, &release.PluginID, &release.Version, &release.Digest, &release.BundleDir, &manifest, &test, &release.PermissionHash, &release.CreatedAt)
 	if err == nil {
-		err = json.Unmarshal(manifest, &release.Manifest)
+		var document pluginmanifest.Document
+		document, err = pluginmanifest.Decode(manifest)
+		if err == nil {
+			release.Manifest = document.Manifest
+		}
 		release.TestReport = json.RawMessage(test)
 	}
 	return release, err

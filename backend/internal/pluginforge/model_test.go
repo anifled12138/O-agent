@@ -51,7 +51,7 @@ func TestManifestRejectsInvalidProtocol(t *testing.T) {
 }
 
 func TestSourceEditsStayInsidePluginWorkspace(t *testing.T) {
-	for _, path := range []string{"plugin.json", "backend/main.go", "backend/go.mod", "frontend/index.html", "frontend/app.js", "README.md"} {
+	for _, path := range []string{"plugin.json", "backend/main.go", "backend/go.mod", "frontend/index.html", "frontend/app.js", "skills/guide/SKILL.md", "README.md"} {
 		if !allowedSourcePath(path) {
 			t.Fatalf("expected %q to be allowed", path)
 		}
@@ -59,6 +59,29 @@ func TestSourceEditsStayInsidePluginWorkspace(t *testing.T) {
 	for _, path := range []string{"../main.go", "backend/plugin.exe", "../../frontend/index.html", "host.go", "frontend/secret.exe"} {
 		if allowedSourcePath(path) {
 			t.Fatalf("expected %q to be rejected", path)
+		}
+	}
+}
+
+func TestReferenceV2ShapesDeclareOnlyRequestedSurfaces(t *testing.T) {
+	project := Project{Name: "Inspector", Slug: "inspector", Description: "Inspect workspace"}
+	tests := []struct {
+		shape                    string
+		backend, ui, tool, skill bool
+	}{
+		{ShapeHybrid, true, true, true, false},
+		{ShapeAgentTool, true, false, true, false},
+		{ShapeUI, false, true, false, false},
+		{ShapeService, true, false, false, false},
+		{ShapeSkill, false, false, false, true},
+	}
+	for _, test := range tests {
+		manifest := referenceManifestV2(project, test.shape)
+		if err := manifest.Validate(); err != nil {
+			t.Fatalf("shape %s is invalid: %v", test.shape, err)
+		}
+		if (manifest.Runtime != nil) != test.backend || (manifest.UI != nil) != test.ui || (len(manifest.Exports.Tools) > 0) != test.tool || (len(manifest.Exports.Skills) > 0) != test.skill {
+			t.Fatalf("shape %s declared unexpected surfaces: %#v", test.shape, manifest)
 		}
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"axiom.local/agent/internal/pluginmanifest"
 )
 
 type State string
@@ -115,16 +117,16 @@ type ProjectView struct {
 }
 
 type Release struct {
-	ID             string          `json:"id"`
-	ProjectID      string          `json:"projectId"`
-	PluginID       string          `json:"pluginId"`
-	Version        string          `json:"version"`
-	Digest         string          `json:"digest"`
-	BundleDir      string          `json:"-"`
-	Manifest       Manifest        `json:"manifest"`
-	TestReport     json.RawMessage `json:"testReport"`
-	PermissionHash string          `json:"permissionHash"`
-	CreatedAt      time.Time       `json:"createdAt"`
+	ID             string                  `json:"id"`
+	ProjectID      string                  `json:"projectId"`
+	PluginID       string                  `json:"pluginId"`
+	Version        string                  `json:"version"`
+	Digest         string                  `json:"digest"`
+	BundleDir      string                  `json:"-"`
+	Manifest       pluginmanifest.Manifest `json:"manifest"`
+	TestReport     json.RawMessage         `json:"testReport"`
+	PermissionHash string                  `json:"permissionHash"`
+	CreatedAt      time.Time               `json:"createdAt"`
 }
 
 type Installation struct {
@@ -139,7 +141,7 @@ type Installation struct {
 }
 
 type CapabilityBinding struct {
-	Capability
+	pluginmanifest.ToolExport
 	PluginID  string `json:"pluginId"`
 	ReleaseID string `json:"releaseId"`
 	Version   string `json:"version"`
