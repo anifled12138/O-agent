@@ -27,11 +27,13 @@ type Runtime interface {
 	Activate(context.Context, string, Release) error
 	Deactivate(context.Context, string, string) error
 	Invoke(context.Context, string, string, json.RawMessage) (json.RawMessage, error)
+	InvokePinned(context.Context, string, string, string, json.RawMessage) (json.RawMessage, error)
 	UICall(context.Context, string, string, string, json.RawMessage) (json.RawMessage, error)
 	Capabilities(string) []CapabilityBinding
 	SurfaceStates(string, string) []SurfaceState
 	UI(string, string) (UIBinding, bool)
 	Skills(string) []SkillBinding
+	BeginTurn(string) TurnLease
 }
 
 type Service struct {
@@ -103,6 +105,7 @@ func (s *Service) UIBinding(userID, pluginID string) (UIBinding, bool) {
 	return s.runtime.UI(userID, pluginID)
 }
 func (s *Service) Skills(userID string) []SkillBinding { return s.runtime.Skills(userID) }
+func (s *Service) BeginTurn(userID string) TurnLease   { return s.runtime.BeginTurn(userID) }
 
 func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Project, error) {
 	in.Name = strings.TrimSpace(in.Name)
@@ -395,6 +398,43 @@ func (s *Service) Invoke(ctx context.Context, userID, capabilityID string, input
 		input = json.RawMessage(`{}`)
 	}
 	return s.runtime.Invoke(ctx, userID, capabilityID, input)
+}
+
+func (s *Service) InvokePinned(ctx context.Context, userID, capabilityID, releaseID string, input json.RawMessage) (json.RawMessage, error) {
+	if len(input) == 0 {
+		input = json.RawMessage(`{}`)
+	}
+	return s.runtime.InvokePinned(ctx, userID, capabilityID, releaseID, input)
+}
+
+func (s *Service) LoadSkill(userID, skillID, releaseID string) (string, error) {
+	for _, binding := range s.runtime.Skills(userID) {
+		if binding.Skill.ID == skillID && binding.ReleaseID == releaseID {
+			return s.LoadPinnedSkill(binding)
+		}
+	}
+	return "", domain.ErrNotFound
+}
+
+func (s *Service) LoadPinnedSkill(binding SkillBinding) (string, error) {
+	root, err := filepath.Abs(binding.BundleDir)
+	if err != nil {
+		return "", err
+	}
+	target, err := filepath.Abs(filepath.Join(root, filepath.FromSlash(binding.Skill.Entry)))
+	if err != nil || !pathWithin(root, target) {
+		return "", errors.New("skill entry escapes its release")
+	}
+	file, err := os.Open(target)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, 64<<10))
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 func (s *Service) UICall(ctx context.Context, userID, pluginID, operation string, input json.RawMessage) (json.RawMessage, error) {

@@ -1,6 +1,7 @@
 package pluginforge
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -170,6 +171,13 @@ type SkillBinding struct {
 	Version   string                     `json:"version"`
 	BundleDir string                     `json:"-"`
 	Skill     pluginmanifest.SkillExport `json:"skill"`
+}
+
+type TurnLease interface {
+	Capabilities() []CapabilityBinding
+	Skills() []SkillBinding
+	Invoke(context.Context, string, json.RawMessage) (json.RawMessage, error)
+	Close()
 }
 
 type CapabilityBinding struct {

@@ -45,6 +45,14 @@ type surfaceBinding struct {
 	ID        string
 }
 
+type turnLease struct {
+	supervisor *Supervisor
+	tools      map[string]*binding
+	skills     []pluginforge.SkillBinding
+	processes  []*process
+	closed     atomic.Bool
+}
+
 type binding struct {
 	capability pluginforge.CapabilityBinding
 	process    *process
@@ -201,9 +209,17 @@ func (s *Supervisor) Deactivate(_ context.Context, userID, pluginID string) erro
 }
 
 func (s *Supervisor) Invoke(ctx context.Context, userID, capabilityID string, input json.RawMessage) (json.RawMessage, error) {
+	return s.invoke(ctx, userID, capabilityID, "", input)
+}
+
+func (s *Supervisor) InvokePinned(ctx context.Context, userID, capabilityID, releaseID string, input json.RawMessage) (json.RawMessage, error) {
+	return s.invoke(ctx, userID, capabilityID, releaseID, input)
+}
+
+func (s *Supervisor) invoke(ctx context.Context, userID, capabilityID, releaseID string, input json.RawMessage) (json.RawMessage, error) {
 	s.mu.RLock()
 	selected := s.capabilities[key(userID, capabilityID)]
-	if selected != nil && !selected.process.draining.Load() {
+	if selected != nil && (releaseID == "" || selected.capability.ReleaseID == releaseID) && !selected.process.draining.Load() {
 		selected.process.inFlight.Add(1)
 	} else {
 		selected = nil
@@ -213,7 +229,10 @@ func (s *Supervisor) Invoke(ctx context.Context, userID, capabilityID string, in
 		return nil, fmt.Errorf("capability %q is not active", capabilityID)
 	}
 	defer selected.process.inFlight.Done()
+	return s.invokeBinding(ctx, selected, capabilityID, input)
+}
 
+func (s *Supervisor) invokeBinding(ctx context.Context, selected *binding, capabilityID string, input json.RawMessage) (json.RawMessage, error) {
 	params := map[string]any{}
 	if len(input) > 0 {
 		if err := json.Unmarshal(input, &params); err != nil {
@@ -351,6 +370,63 @@ func (s *Supervisor) Skills(userID string) []pluginforge.SkillBinding {
 	}
 	s.mu.RUnlock()
 	return result
+}
+
+func (s *Supervisor) BeginTurn(userID string) pluginforge.TurnLease {
+	prefix := userID + "\x00"
+	s.mu.RLock()
+	lease := &turnLease{supervisor: s, tools: map[string]*binding{}}
+	seen := map[*process]bool{}
+	for id, item := range s.capabilities {
+		if !strings.HasPrefix(id, prefix) || item.process.draining.Load() {
+			continue
+		}
+		lease.tools[item.capability.ID] = item
+		if !seen[item.process] {
+			item.process.inFlight.Add(1)
+			seen[item.process] = true
+			lease.processes = append(lease.processes, item.process)
+		}
+	}
+	for id, item := range s.skills {
+		if strings.HasPrefix(id, prefix) {
+			lease.skills = append(lease.skills, item)
+		}
+	}
+	s.mu.RUnlock()
+	return lease
+}
+
+func (l *turnLease) Capabilities() []pluginforge.CapabilityBinding {
+	result := make([]pluginforge.CapabilityBinding, 0, len(l.tools))
+	for _, item := range l.tools {
+		result = append(result, item.capability)
+	}
+	return result
+}
+
+func (l *turnLease) Skills() []pluginforge.SkillBinding {
+	return append([]pluginforge.SkillBinding(nil), l.skills...)
+}
+
+func (l *turnLease) Invoke(ctx context.Context, capabilityID string, input json.RawMessage) (json.RawMessage, error) {
+	if l.closed.Load() {
+		return nil, errors.New("Agent turn capability lease is closed")
+	}
+	selected := l.tools[capabilityID]
+	if selected == nil {
+		return nil, fmt.Errorf("capability %q was not pinned for this Agent turn", capabilityID)
+	}
+	return l.supervisor.invokeBinding(ctx, selected, capabilityID, input)
+}
+
+func (l *turnLease) Close() {
+	if l.closed.Swap(true) {
+		return
+	}
+	for _, current := range l.processes {
+		current.inFlight.Done()
+	}
 }
 
 func (s *Supervisor) Close() error {

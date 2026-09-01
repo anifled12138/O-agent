@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS messages (
  role TEXT NOT NULL, content TEXT NOT NULL, created_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
+CREATE TABLE IF NOT EXISTS agent_trace_events (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), turn_id TEXT NOT NULL,
+ sequence INTEGER NOT NULL, kind TEXT NOT NULL, details_json BLOB NOT NULL, created_at DATETIME NOT NULL,
+ UNIQUE(turn_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_trace_conversation ON agent_trace_events(conversation_id, created_at);
 `
 	_, err := s.db.ExecContext(ctx, schema)
 	return err
@@ -219,6 +225,37 @@ func (s *Store) AddMessage(ctx context.Context, userID string, m domain.Message)
 	}
 	_, err = s.db.ExecContext(ctx, `UPDATE conversations SET updated_at=? WHERE id=?`, m.CreatedAt, m.ConversationID)
 	return err
+}
+
+func (s *Store) AddTraceEvent(ctx context.Context, userID string, event domain.TraceEvent) error {
+	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) SELECT ?,?,?,?,?,?,? FROM conversations WHERE id=? AND user_id=?`, event.ID, event.ConversationID, event.TurnID, event.Sequence, event.Kind, []byte(event.Details), event.CreatedAt, event.ConversationID, userID)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) TraceEvents(ctx context.Context, userID, conversationID string) ([]domain.TraceEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT t.id,t.conversation_id,t.turn_id,t.sequence,t.kind,t.details_json,t.created_at FROM agent_trace_events t JOIN conversations c ON c.id=t.conversation_id WHERE t.conversation_id=? AND c.user_id=? ORDER BY t.created_at,t.sequence`, conversationID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []domain.TraceEvent{}
+	for rows.Next() {
+		var event domain.TraceEvent
+		var details []byte
+		if err := rows.Scan(&event.ID, &event.ConversationID, &event.TurnID, &event.Sequence, &event.Kind, &details, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		event.Details = details
+		result = append(result, event)
+	}
+	return result, rows.Err()
 }
 
 func (s *Store) Ping(ctx context.Context) error {

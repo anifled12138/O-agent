@@ -57,6 +57,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/conversations", s.requireUser(http.HandlerFunc(s.conversationList)))
 	mux.Handle("POST /api/v1/conversations", s.requireUser(http.HandlerFunc(s.conversationCreate)))
 	mux.Handle("GET /api/v1/conversations/{id}", s.requireUser(http.HandlerFunc(s.conversationGet)))
+	mux.Handle("GET /api/v1/conversations/{id}/trace", s.requireUser(http.HandlerFunc(s.conversationTrace)))
 	mux.Handle("POST /api/v1/conversations/{id}/messages", s.requireUser(http.HandlerFunc(s.messageCreate)))
 	mux.Handle("GET /api/v1/plugin-forge/projects", s.requireUser(http.HandlerFunc(s.forgeProjectList)))
 	mux.Handle("POST /api/v1/plugin-forge/projects", s.requireUser(http.HandlerFunc(s.forgeProjectCreate)))
@@ -196,6 +197,15 @@ func (s *Server) conversationGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusOK, c)
+}
+
+func (s *Server) conversationTrace(w http.ResponseWriter, r *http.Request) {
+	events, err := s.agent.Trace(r.Context(), currentUser(r).ID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, events)
 }
 func (s *Server) messageCreate(w http.ResponseWriter, r *http.Request) {
 	var in struct {

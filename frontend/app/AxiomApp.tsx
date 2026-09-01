@@ -14,6 +14,7 @@ type ForgeProject = { id: string; name: string; slug: string; description: strin
 type Installation = { id: string; pluginId: string; projectId: string; activeReleaseId: string; status: string };
 type Capability = { id: string; summary: string; risk: string; pluginId?: string; releaseId?: string; version?: string };
 type SurfaceState = { pluginId: string; releaseId: string; kind: string; surfaceId: string; status: string };
+type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; details: Record<string, unknown>; createdAt: string };
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8080/api/v1';
 const ASSET_ORIGIN = new URL(API).origin;
@@ -39,6 +40,7 @@ export default function AxiomApp() {
   const [pluginsOpen, setPluginsOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState('');
+  const [trace, setTrace] = useState<TraceEvent[]>([]);
 
   const hydrate = useCallback(async () => {
     const me = await request<User>('/auth/me');
@@ -59,11 +61,11 @@ export default function AxiomApp() {
       setUser(me); setProviders(providerList); setConversations(conversationList); setPlugins(pluginList);
     }).catch(() => setUser(null)).finally(() => setLoading(false));
   }, []);
-  async function openConversation(id: string) { setActive(await request<ConversationDetail>(`/conversations/${id}`)); }
+  async function openConversation(id: string) { const [detail, events] = await Promise.all([request<ConversationDetail>(`/conversations/${id}`), request<TraceEvent[]>(`/conversations/${id}/trace`)]); setActive(detail); setTrace(events); }
   async function newConversation() {
     if (!providers.length) { setSettingsOpen(true); return; }
     const created = await request<Conversation>('/conversations', { method: 'POST', body: JSON.stringify({ title: 'New mission', providerId: providers[0].id }) });
-    setConversations((items) => [created, ...items]); setActive({ ...created, messages: [] });
+    setConversations((items) => [created, ...items]); setActive({ ...created, messages: [] }); setTrace([]);
   }
   async function send(content: string) {
     if (!content.trim() || sending) return;
@@ -79,6 +81,8 @@ export default function AxiomApp() {
       setActive({ ...target, messages: [...target.messages, pending] });
       await request<Message>(`/conversations/${target.id}/messages`, { method: 'POST', body: JSON.stringify({ content }) });
       const refreshed = await request<ConversationDetail>(`/conversations/${target.id}`);
+      const events = await request<TraceEvent[]>(`/conversations/${target.id}/trace`);
+      setTrace(events);
       setActive(refreshed); setConversations((items) => items.map((item) => item.id === refreshed.id ? refreshed : item));
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Agent turn failed'); }
     finally { setSending(false); }
@@ -89,7 +93,7 @@ export default function AxiomApp() {
   return <main className="app-shell">
     <Sidebar user={user} conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} onLogout={async () => { await request('/auth/logout', { method: 'POST' }); setUser(null); }} />
     <section className="workspace"><header className="workspace-header"><div><span className="eyebrow">LOCAL AGENT / MISSION</span><h1>{active?.title ?? 'Untitled workspace'}</h1></div><div className="header-actions"><span className="status-pill"><i /> runtime online</span><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Open settings">⌘</button></div></header>
-      <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} onSend={send} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} /></div>
+      <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} onSend={send} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} trace={trace} /></div>
     </section>
     {settingsOpen && <Settings providers={providers} onClose={() => setSettingsOpen(false)} onSaved={(next) => { setProviders((items) => items.some((item) => item.id === next.id) ? items.map((item) => item.id === next.id ? next : item) : [next, ...items]); setNotice('Provider saved'); }} />}
     {pluginsOpen && <PluginCenter onClose={() => setPluginsOpen(false)} />}
@@ -118,9 +122,9 @@ function Chat({ active, providers, sending, notice, onSend, onConfigure }: { act
   return <div className="chat-column"><div className="messages">{!active?.messages.length ? <div className="empty-chat"><div className="pulse-orbit"><span>A</span></div><span className="eyebrow">AGENT READY</span><h2>What are we building?</h2><p>Give Axiom a concrete outcome. The runtime will retain the mission state and route it through your configured model.</p>{!providers.length ? <button className="setup-card" onClick={onConfigure}><span>01</span><div><b>Connect a model provider</b><small>Add any OpenAI-compatible API endpoint</small></div><i>→</i></button> : <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setDraft(text)}>{text}<span>↗</span></button>)}</div>}</div> : active.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><div className="message-role">{message.role === 'user' ? 'YOU' : 'AXIOM'}</div><div className="message-body">{message.content}</div></article>)}{sending && <article className="message assistant"><div className="message-role">AXIOM</div><div className="thinking"><i/><i/><i/> reasoning</div></article>}</div>{notice && <div className="notice">{notice}</div>}<div className="composer"><textarea value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }} placeholder={providers.length ? 'Describe the outcome, constraints, or next move…' : 'Configure a model provider to begin…'} disabled={!providers.length || sending}/><div className="composer-row"><span>Enter to run · Shift Enter for newline</span><button onClick={submit} disabled={!draft.trim() || sending}>Run <i>↑</i></button></div></div></div>;
 }
 
-function RuntimePanel({ plugins, provider, messageCount }: { plugins: Plugin[]; provider?: Provider; messageCount: number }) {
+function RuntimePanel({ plugins, provider, messageCount, trace }: { plugins: Plugin[]; provider?: Provider; messageCount: number; trace: TraceEvent[] }) {
   const running = plugins.filter((item) => item.state === 'running').length;
-  return <aside className="runtime-panel"><div className="panel-title"><div><span className="eyebrow">LIVE INSPECTOR</span><h3>Runtime</h3></div><span className="live-dot">LIVE</span></div><div className="runtime-metric"><span>Plugin graph</span><b>{running}<small> / {plugins.length} running</small></b><div className="meter"><i style={{width: plugins.length ? `${running/plugins.length*100}%` : '0%'}}/></div></div><div className="runtime-section"><p>ACTIVE MODEL</p>{provider ? <div className="model-card"><div className="model-icon">M</div><div><b>{provider.model}</b><small>{provider.name} · API</small></div><i>●</i></div> : <div className="muted-card">No provider mounted</div>}</div><div className="runtime-section"><p>TURN STATE</p><dl><div><dt>Phase</dt><dd>{messageCount ? 'checkpointed' : 'idle'}</dd></div><div><dt>Messages</dt><dd>{messageCount}</dd></div><div><dt>Policy</dt><dd>runtime.agent.v1</dd></div></dl></div><div className="runtime-section plugin-list"><p>PLUGIN GRAPH</p>{plugins.slice(0,6).map((item) => <div key={item.id}><i className={item.state}/><span>{item.id.replace('core.','').replace('.v1','')}</span><small>{item.version}</small></div>)}</div><div className="runtime-foot"><span>STATE</span><b>LOCAL / ENCRYPTED</b></div></aside>;
+  return <aside className="runtime-panel"><div className="panel-title"><div><span className="eyebrow">LIVE INSPECTOR</span><h3>Runtime</h3></div><span className="live-dot">LIVE</span></div><div className="runtime-metric"><span>Plugin graph</span><b>{running}<small> / {plugins.length} running</small></b><div className="meter"><i style={{width: plugins.length ? `${running/plugins.length*100}%` : '0%'}}/></div></div><div className="runtime-section"><p>ACTIVE MODEL</p>{provider ? <div className="model-card"><div className="model-icon">M</div><div><b>{provider.model}</b><small>{provider.name} · API</small></div><i>●</i></div> : <div className="muted-card">No provider mounted</div>}</div><div className="runtime-section"><p>TURN STATE</p><dl><div><dt>Phase</dt><dd>{trace.at(-1)?.kind ?? (messageCount ? 'checkpointed' : 'idle')}</dd></div><div><dt>Messages</dt><dd>{messageCount}</dd></div><div><dt>Policy</dt><dd>lazy / pinned</dd></div></dl></div>{!!trace.length && <div className="runtime-section trace-list"><p>RECENT TRACE</p>{trace.slice(-6).map((event) => <div key={event.id}><i/><span>{event.kind}</span><small>#{event.sequence}</small></div>)}</div>}<div className="runtime-section plugin-list"><p>PLUGIN GRAPH</p>{plugins.slice(0,6).map((item) => <div key={item.id}><i className={item.state}/><span>{item.id.replace('core.','').replace('.v1','')}</span><small>{item.version}</small></div>)}</div><div className="runtime-foot"><span>STATE</span><b>LOCAL / ENCRYPTED</b></div></aside>;
 }
 
 function PluginCenter({ onClose }: { onClose: () => void }) {

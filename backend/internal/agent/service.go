@@ -32,6 +32,9 @@ func (s *Service) List(ctx context.Context, userID string) ([]domain.Conversatio
 func (s *Service) Get(ctx context.Context, userID, id string) (domain.ConversationDetail, error) {
 	return s.store.Conversation(ctx, userID, id)
 }
+func (s *Service) Trace(ctx context.Context, userID, id string) ([]domain.TraceEvent, error) {
+	return s.store.TraceEvents(ctx, userID, id)
+}
 func (s *Service) Create(ctx context.Context, userID, title, providerID string) (domain.Conversation, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
@@ -58,24 +61,31 @@ func (s *Service) Turn(ctx context.Context, userID, conversationID, content stri
 	if err != nil {
 		return domain.Message{}, err
 	}
-	catalog, _ := json.Marshal(s.forge.Capabilities(userID))
-	messages := []provider.ChatMessage{{Role: "system", Content: systemPrompt + "\n\nCurrently active plugin capabilities:\n" + string(catalog)}}
-	for _, m := range detail.Messages {
-		messages = append(messages, provider.ChatMessage{Role: m.Role, Content: m.Content})
-	}
+	messages, omitted := buildContext(detail)
+	scope := newTurnScope(s, userID)
+	defer scope.Close()
+	trace := newTraceRecorder(ctx, s.store, userID, conversationID)
+	trace.emit("turn.started", map[string]any{"messageCount": len(detail.Messages), "omittedMessages": omitted, "pinnedTools": len(scope.tools), "pinnedSkills": len(scope.skills)})
 	var reply string
-	for step := 0; step < 8; step++ {
-		completion, completeErr := s.providers.CompleteWithTools(ctx, userID, detail.ProviderID, messages, agentTools())
+	for step := 0; step < 12; step++ {
+		definitions := scope.definitions()
+		trace.emit("model.requested", map[string]any{"step": step + 1, "messageCount": len(messages), "toolDefinitionCount": len(definitions)})
+		completion, completeErr := s.providers.CompleteWithTools(ctx, userID, detail.ProviderID, messages, definitions)
 		if completeErr != nil {
+			trace.emit("model.failed", map[string]any{"step": step + 1, "error": completeErr.Error()})
 			return domain.Message{}, completeErr
 		}
+		trace.emit("model.completed", map[string]any{"step": step + 1, "toolCallCount": len(completion.ToolCalls), "contentBytes": len(completion.Content)})
 		if len(completion.ToolCalls) == 0 {
 			reply = strings.TrimSpace(completion.Content)
 			break
 		}
 		messages = append(messages, provider.ChatMessage{Role: "assistant", Content: completion.Content, ToolCalls: completion.ToolCalls})
 		for _, call := range completion.ToolCalls {
-			result := s.runTool(ctx, userID, call.Function.Name, json.RawMessage(call.Function.Arguments))
+			started := time.Now()
+			trace.emit("tool.started", map[string]any{"step": step + 1, "toolCallId": call.ID, "name": call.Function.Name, "argumentBytes": len(call.Function.Arguments)})
+			result := scope.execute(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments))
+			trace.emit("tool.completed", map[string]any{"step": step + 1, "toolCallId": call.ID, "name": call.Function.Name, "resultBytes": len(result), "durationMillis": time.Since(started).Milliseconds(), "ok": toolResultOK(result)})
 			messages = append(messages, provider.ChatMessage{Role: "tool", ToolCallID: call.ID, Content: string(result)})
 		}
 	}
@@ -83,23 +93,9 @@ func (s *Service) Turn(ctx context.Context, userID, conversationID, content stri
 		reply = "I reached the tool execution limit for this turn. The completed tool results are preserved in the current run; continue the mission to resume."
 	}
 	assistant := domain.Message{ID: id("msg"), ConversationID: conversationID, Role: "assistant", Content: reply, CreatedAt: time.Now().UTC()}
-	return assistant, s.store.AddMessage(ctx, userID, assistant)
-}
-
-func agentTools() []provider.ToolDefinition {
-	return []provider.ToolDefinition{
-		tool("axiom_capabilities_list", "List active user-installed plugin capabilities.", `{"type":"object","properties":{},"additionalProperties":false}`),
-		tool("axiom_capability_invoke", "Invoke one active plugin capability by exact capability ID.", `{"type":"object","required":["capabilityId","input"],"properties":{"capabilityId":{"type":"string"},"input":{"type":"object"}},"additionalProperties":false}`),
-		tool("axiom_plugin_projects", "List Plugin Forge projects and lifecycle state.", `{"type":"object","properties":{},"additionalProperties":false}`),
-		tool("axiom_plugin_propose", "Create a plugin proposal for a missing durable capability. This does not generate or install anything.", `{"type":"object","required":["name","description"],"properties":{"name":{"type":"string"},"description":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_generate", "Generate source for a proposed plugin project in its isolated Git repository.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_write_source", "Create or replace a text source file inside a generated plugin's own Git workspace. Allowed paths are plugin.json, backend Go module files, frontend HTML/CSS/JS/JSON, and README.md.", `{"type":"object","required":["projectId","path","content"],"properties":{"projectId":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_begin_revision", "Begin an update to an installed plugin while its current release keeps serving traffic.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_build", "Compile and test a generated plugin, producing an immutable release.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_request_approval", "Move a tested release to user permission review. Never represents that approval has occurred.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_install", "Install and activate a plugin only after the user has approved this exact release and permission hash.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_rollback", "Atomically roll an active plugin back to a previously approved release.", `{"type":"object","required":["projectId","releaseId"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"}},"additionalProperties":false}`),
-	}
+	err = s.store.AddMessage(ctx, userID, assistant)
+	trace.emit("turn.completed", map[string]any{"replyBytes": len(reply), "persisted": err == nil})
+	return assistant, err
 }
 
 func tool(name, description, schema string) provider.ToolDefinition {
@@ -110,7 +106,7 @@ func tool(name, description, schema string) provider.ToolDefinition {
 	return definition
 }
 
-func (s *Service) runTool(ctx context.Context, userID, name string, arguments json.RawMessage) json.RawMessage {
+func (s *Service) runCreatorTool(ctx context.Context, userID, name string, arguments json.RawMessage) json.RawMessage {
 	var input struct {
 		ProjectID    string          `json:"projectId"`
 		CapabilityID string          `json:"capabilityId"`
@@ -120,6 +116,7 @@ func (s *Service) runTool(ctx context.Context, userID, name string, arguments js
 		Path         string          `json:"path"`
 		Content      string          `json:"content"`
 		ReleaseID    string          `json:"releaseId"`
+		Shape        string          `json:"shape"`
 	}
 	if len(arguments) == 0 || json.Unmarshal(arguments, &input) != nil {
 		return toolError("invalid tool arguments")
@@ -127,14 +124,10 @@ func (s *Service) runTool(ctx context.Context, userID, name string, arguments js
 	var value any
 	var err error
 	switch name {
-	case "axiom_capabilities_list":
-		value = s.forge.Capabilities(userID)
-	case "axiom_capability_invoke":
-		value, err = s.forge.Invoke(ctx, userID, input.CapabilityID, input.Input)
 	case "axiom_plugin_projects":
 		value, err = s.forge.ListProjects(ctx, userID)
 	case "axiom_plugin_propose":
-		value, err = s.forge.Create(ctx, userID, pluginforge.CreateInput{Name: input.Name, Description: input.Description})
+		value, err = s.forge.Create(ctx, userID, pluginforge.CreateInput{Name: input.Name, Description: input.Description, Shape: input.Shape})
 	case "axiom_plugin_generate":
 		value, err = s.forge.Generate(ctx, userID, input.ProjectID)
 	case "axiom_plugin_write_source":
@@ -177,6 +170,12 @@ func (s *Service) runTool(ctx context.Context, userID, name string, arguments js
 func toolError(message string) json.RawMessage {
 	raw, _ := json.Marshal(map[string]any{"ok": false, "error": message})
 	return raw
+}
+func toolResultOK(raw json.RawMessage) bool {
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	return json.Unmarshal(raw, &result) == nil && result.OK
 }
 func id(prefix string) string {
 	raw := make([]byte, 12)

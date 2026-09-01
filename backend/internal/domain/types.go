@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 var (
 	ErrNotFound     = Error("not found")
@@ -52,4 +55,14 @@ type Message struct {
 type ConversationDetail struct {
 	Conversation
 	Messages []Message `json:"messages"`
+}
+
+type TraceEvent struct {
+	ID             string          `json:"id"`
+	ConversationID string          `json:"conversationId"`
+	TurnID         string          `json:"turnId"`
+	Sequence       int             `json:"sequence"`
+	Kind           string          `json:"kind"`
+	Details        json.RawMessage `json:"details"`
+	CreatedAt      time.Time       `json:"createdAt"`
 }

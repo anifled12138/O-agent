@@ -62,6 +62,14 @@ func TestSkillSurfaceIsRegisteredWithoutEnteringToolCatalog(t *testing.T) {
 	if len(supervisor.Skills("user")) != 1 || len(supervisor.Capabilities("user")) != 0 {
 		t.Fatal("skill must stay in the lazy skill registry, outside the tool catalog")
 	}
+	lease := supervisor.BeginTurn("user")
+	if err := supervisor.Deactivate(context.Background(), "user", "example.skill"); err != nil {
+		t.Fatal(err)
+	}
+	if len(lease.Skills()) != 1 {
+		t.Fatal("turn snapshot lost its pinned skill after hot deactivation")
+	}
+	lease.Close()
 }
 
 func TestShutdownDurationIsBounded(t *testing.T) {
