@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"axiom.local/agent/internal/domain"
+	"axiom.local/agent/internal/pluginmanifest"
 )
 
 type Runtime interface {
@@ -181,6 +182,13 @@ func (s *Service) BuildAndTest(ctx context.Context, userID, projectID string) (P
 	if err != nil {
 		return fail(err)
 	}
+	document, err := pluginmanifest.Decode(manifestRaw)
+	if err != nil {
+		return fail(fmt.Errorf("manifest compatibility validation failed: %w", err))
+	}
+	if document.SourceVersion != pluginmanifest.SourceV1 {
+		return fail(errors.New("axiom.plugin/v2 authoring requires the surface-aware build planner"))
+	}
 	var manifest Manifest
 	if err = json.Unmarshal(manifestRaw, &manifest); err != nil {
 		return fail(err)
@@ -224,7 +232,7 @@ func (s *Service) BuildAndTest(ctx context.Context, userID, projectID string) (P
 		return fail(err)
 	}
 	report, _ := json.Marshal(map[string]any{"passed": true, "goTest": strings.TrimSpace(testOutput), "build": strings.TrimSpace(buildOutput), "durationMillis": time.Since(testStarted).Milliseconds(), "checkedAt": time.Now().UTC()})
-	release := Release{ID: "rel_" + digest[:24], ProjectID: p.ID, PluginID: manifest.ID, Version: manifest.Version, Digest: digest, BundleDir: bundleDir, Manifest: manifest, TestReport: report, PermissionHash: PermissionHash(manifest.Permissions), CreatedAt: time.Now().UTC()}
+	release := Release{ID: "rel_" + digest[:24], ProjectID: p.ID, PluginID: manifest.ID, Version: manifest.Version, Digest: digest, BundleDir: bundleDir, Manifest: manifest, TestReport: report, PermissionHash: pluginmanifest.GrantDigest(document.Manifest), CreatedAt: time.Now().UTC()}
 	if err = s.repo.CreateRelease(ctx, release); err != nil && !strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return fail(err)
 	}

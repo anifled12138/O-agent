@@ -3,6 +3,8 @@ package pluginforge
 import (
 	"encoding/json"
 	"testing"
+
+	"axiom.local/agent/internal/pluginmanifest"
 )
 
 func TestLifecycleRequiresApproval(t *testing.T) {
@@ -58,5 +60,20 @@ func TestSourceEditsStayInsidePluginWorkspace(t *testing.T) {
 		if allowedSourcePath(path) {
 			t.Fatalf("expected %q to be rejected", path)
 		}
+	}
+}
+
+func TestReferenceManifestPassesV2CompatibilityProjection(t *testing.T) {
+	legacy := referenceManifest(Project{Name: "Inspector", Slug: "inspector", Description: "Inspect workspace"})
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := pluginmanifest.Decode(raw)
+	if err != nil {
+		t.Fatalf("reference manifest compatibility failed: %v", err)
+	}
+	if document.SourceVersion != pluginmanifest.SourceV1 || len(document.Manifest.Exports.Tools) != 1 {
+		t.Fatalf("unexpected compatibility projection: %#v", document)
 	}
 }
