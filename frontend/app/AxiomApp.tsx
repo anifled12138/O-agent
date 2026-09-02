@@ -9,11 +9,11 @@ type Message = { id: string; role: 'user' | 'assistant'; content: string; create
 type ConversationDetail = Conversation & { messages: Message[] };
 type Plugin = { id: string; version: string; description: string; state: string; capabilities: string[] };
 type PermissionSet = { filesystem?: { read?: string[]; write?: string[] }; network?: string[]; secrets?: string[]; process?: boolean; background?: boolean };
-type Release = { id: string; projectId: string; pluginId: string; version: string; digest: string; manifest: { name: string; description: string; permissions: PermissionSet; ui?: { entry: string; slots?: string[] }; exports?: { tools?: Capability[]; services?: unknown[]; skills?: unknown[] } } };
+type Release = { id: string; projectId: string; pluginId: string; version: string; digest: string; permissionHash: string; sourceVersion: 'v1' | 'v2'; manifest: { name: string; description: string; permissions: PermissionSet; ui?: { entry: string; slots?: string[] }; exports?: { tools?: Capability[]; services?: unknown[]; skills?: unknown[] } } };
 type ForgeProject = { id: string; name: string; slug: string; description: string; state: string; lastError?: string; updatedAt: string; latestRelease?: Release; releases: Release[] };
 type Installation = { id: string; pluginId: string; projectId: string; activeReleaseId: string; status: string };
 type Capability = { id: string; summary: string; risk: string; pluginId?: string; releaseId?: string; version?: string };
-type SurfaceState = { pluginId: string; releaseId: string; kind: string; surfaceId: string; status: string };
+type SurfaceState = { pluginId: string; releaseId: string; kind: string; surfaceId: string; status: string; registryEpoch: number };
 type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; details: Record<string, unknown>; createdAt: string };
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8080/api/v1';
@@ -161,14 +161,21 @@ function PluginCenter({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     async function bridge(event: MessageEvent) {
-      if (event.source !== iframeRef.current?.contentWindow || event.origin !== ASSET_ORIGIN || !selected?.latestRelease) return;
-      const data = event.data as { type?: string; id?: string; operation?: string; input?: unknown };
-      if (data.type !== 'axiom.ui.call' || !data.id || !data.operation) return;
+      if (event.source !== iframeRef.current?.contentWindow || (event.origin !== 'null' && event.origin !== ASSET_ORIGIN) || !selected?.latestRelease) return;
+      const data = event.data as { type?: string; id?: string; operation?: string; serviceId?: string; capabilitySuffix?: string; input?: unknown };
+      const legacy = data.type === 'axiom.plugin.invoke';
+      if (!data.id || (legacy ? !data.capabilitySuffix : data.type !== 'axiom.ui.call' || (!data.operation && !data.serviceId))) return;
       try {
-        const result = await request<{ output: unknown }>(`/plugin-runtime/ui/${encodeURIComponent(selected.latestRelease.pluginId)}/call`, { method: 'POST', body: JSON.stringify({ operation: data.operation, input: data.input ?? {} }) });
-        iframeRef.current?.contentWindow?.postMessage({ type: 'axiom.ui.result', id: data.id, output: result.output }, ASSET_ORIGIN);
+        const endpoint = legacy
+          ? `/plugin-runtime/ui/${encodeURIComponent(selected.latestRelease.pluginId)}/legacy-invoke`
+          : data.serviceId
+            ? `/plugin-runtime/ui/${encodeURIComponent(selected.latestRelease.pluginId)}/services/${encodeURIComponent(data.serviceId)}/call`
+            : `/plugin-runtime/ui/${encodeURIComponent(selected.latestRelease.pluginId)}/call`;
+        const body = legacy ? { capabilitySuffix: data.capabilitySuffix, input: data.input ?? {} } : data.serviceId ? { input: data.input ?? {} } : { operation: data.operation, input: data.input ?? {} };
+        const result = await request<{ output: unknown }>(endpoint, { method: 'POST', body: JSON.stringify(body) });
+        iframeRef.current?.contentWindow?.postMessage({ type: legacy ? 'axiom.plugin.result' : 'axiom.ui.result', id: data.id, output: result.output }, '*');
       } catch (reason) {
-        iframeRef.current?.contentWindow?.postMessage({ type: 'axiom.ui.result', id: data.id, error: reason instanceof Error ? reason.message : 'UI call failed' }, ASSET_ORIGIN);
+        iframeRef.current?.contentWindow?.postMessage({ type: legacy ? 'axiom.plugin.result' : 'axiom.ui.result', id: data.id, error: reason instanceof Error ? reason.message : 'UI call failed' }, '*');
       }
     }
     window.addEventListener('message', bridge);
@@ -205,16 +212,17 @@ function PluginCenter({ onClose }: { onClose: () => void }) {
 
   const nextAction = selected ? forgeAction(selected.state) : null;
   const permissions = selected?.latestRelease?.manifest.permissions;
-  const selectedSurfaces = surfaces.filter((surface) => surface.pluginId === selected?.latestRelease?.pluginId && surface.status === 'active');
+  const selectedSurfaces = surfaces.filter((surface) => surface.pluginId === selected?.latestRelease?.pluginId && surface.releaseId === installation?.activeReleaseId);
+  const permissionChanged = !!selected?.releases?.[1] && selected.releases[0].permissionHash !== selected.releases[1].permissionHash;
   return <div className="modal-backdrop forge-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="forge-modal">
     <header className="forge-header"><div><span className="eyebrow">SYSTEM / PLUGIN FORGE</span><h2>Build capabilities, safely.</h2><p>Each plugin is generated as its own Git project, verified, approved by you, then mounted as an isolated release.</p></div><button onClick={onClose}>×</button></header>
     <div className="forge-layout"><aside className="forge-rail"><form onSubmit={create} className="forge-create"><label>PLUGIN NAME<input name="name" placeholder="Workspace Inspector" required /></label><label>PLUGIN SHAPE<select name="shape" defaultValue="hybrid"><option value="hybrid">Full stack + Agent tool</option><option value="agent-tool">Agent tool</option><option value="ui">UI extension</option><option value="service">Backend service</option><option value="skill">Lazy Agent skill</option></select></label><label>WHAT SHOULD IT DO?<textarea name="description" placeholder="Describe one concrete capability…" required /></label><button disabled={busy === 'create'}>{busy === 'create' ? 'Creating…' : 'Create proposal'} <span>＋</span></button></form><div className="forge-projects"><p className="eyebrow">PROJECTS</p>{projects.length === 0 ? <div className="forge-empty">No plugin projects yet.</div> : projects.map((project) => <button key={project.id} className={project.id === selected?.id ? 'active' : ''} onClick={() => setSelectedId(project.id)}><i className={`state-${project.state}`}/><span><b>{project.name}</b><small>{project.state.replaceAll('_', ' ')}</small></span><em>›</em></button>)}</div></aside>
       <div className="forge-stage">{selected ? <><div className="forge-title"><div><span className="eyebrow">{selected.latestRelease?.pluginId ?? `DRAFT / ${selected.slug}`}</span><h3>{selected.name}</h3><p>{selected.description}</p></div><span className={`forge-state state-${selected.state}`}>{selected.state.replaceAll('_', ' ')}</span></div>
         <div className="forge-pipeline">{['proposed','generated','tested','approved','active'].map((state, index) => <div key={state} className={pipelineReached(selected.state, state) ? 'reached' : ''}><span>{index + 1}</span><b>{state}</b></div>)}</div>
-        {!!selectedSurfaces.length && <section className="surface-strip"><span className="eyebrow">ACTIVE SURFACES</span><div>{selectedSurfaces.map((surface) => <em key={`${surface.kind}:${surface.surfaceId}`}>{surface.kind}</em>)}</div></section>}
+        {!!selectedSurfaces.length && <section className="surface-strip"><span><b className="eyebrow">OBSERVED SURFACES</b><small>desired {installation?.activeReleaseId.slice(0, 12)} · epoch {Math.max(...selectedSurfaces.map((item) => item.registryEpoch))}</small></span><div>{selectedSurfaces.map((surface) => <em className={`surface-${surface.status}`} title={`${surface.surfaceId} · ${surfacePrincipal(surface.kind)} authority`} key={`${surface.kind}:${surface.surfaceId}`}>{surface.kind} · {surface.status}</em>)}</div></section>}
         {selected.lastError && <div className="forge-error"><b>Last run failed</b><span>{selected.lastError}</span></div>}
-        {permissions && <section className="permission-card"><div><span className="eyebrow">PERMISSION CONTRACT</span><h4>Release-bound access</h4></div><div className="permission-grid"><Permission label="Workspace read" enabled={permissions.filesystem?.read?.includes('${workspace}') ?? false}/><Permission label="Plugin data write" enabled={permissions.filesystem?.write?.includes('${pluginData}') ?? false}/><Permission label="Background jobs" enabled={permissions.background ?? false}/><Permission label={`Network ${permissions.network?.length ? permissions.network.join(', ') : 'blocked'}`} enabled={(permissions.network?.length ?? 0) > 0}/><Permission label={`Secrets ${permissions.secrets?.length ? permissions.secrets.join(', ') : 'none'}`} enabled={(permissions.secrets?.length ?? 0) > 0}/></div></section>}
-        {selected.state === 'active' && selected.releases?.length > 1 && <section className="release-history"><span className="eyebrow">IMMUTABLE RELEASES</span>{selected.releases.map((release) => <div key={release.id}><span><b>{release.version}</b><small>{release.digest.slice(0, 12)}</small></span>{installation?.activeReleaseId === release.id ? <em>ACTIVE</em> : <button onClick={() => rollback(selected, release.id)} disabled={busy !== ''}>Roll back</button>}</div>)}</section>}
+        {permissions && <section className="permission-card"><div><span><b className="eyebrow">PERMISSION CONTRACT</b><small>{selected.latestRelease?.permissionHash.slice(0, 16)} · {permissionChanged ? 'changed from previous release' : 'release-bound'}</small></span><h4>User principal approval</h4></div><div className="permission-grid"><Permission label="Workspace read" enabled={permissions.filesystem?.read?.includes('${workspace}') ?? false}/><Permission label="Plugin data write" enabled={permissions.filesystem?.write?.includes('${pluginData}') ?? false}/><Permission label="Background jobs" enabled={permissions.background ?? false}/><Permission label={`Network ${permissions.network?.length ? permissions.network.join(', ') : 'blocked'}`} enabled={(permissions.network?.length ?? 0) > 0}/><Permission label={`Secrets ${permissions.secrets?.length ? permissions.secrets.join(', ') : 'none'}`} enabled={(permissions.secrets?.length ?? 0) > 0}/></div></section>}
+        {selected.state === 'active' && selected.releases?.length > 1 && <section className="release-history"><span className="eyebrow">IMMUTABLE RELEASES</span>{selected.releases.map((release) => <div key={release.id}><span><b>{release.version} · {release.sourceVersion}</b><small>{release.digest.slice(0, 12)}</small></span>{installation?.activeReleaseId === release.id ? <em>ACTIVE</em> : <button onClick={() => rollback(selected, release.id)} disabled={busy !== ''}>Roll back</button>}</div>)}</section>}
         {installation && selected.latestRelease?.manifest.ui ? <section className="plugin-preview"><div className="preview-bar"><span><i/> LIVE · {selected.latestRelease.version}</span><small>Sandboxed frontend · pinned release</small></div><iframe ref={iframeRef} title={`${selected.name} plugin`} sandbox="allow-scripts" src={`${API}/plugin-assets/${installation.activeReleaseId}/${selected.latestRelease.manifest.ui.entry.split('/').pop()}`} /></section> : <section className="forge-wait"><span>{selected.state === 'proposed' ? '◇' : '◌'}</span><h4>{forgeGuidance(selected.state).title}</h4><p>{selected.state === 'active' && !selected.latestRelease?.manifest.ui ? `Mounted without UI. Active surfaces: ${selectedSurfaces.map((item) => item.kind).join(', ') || 'none'}.` : forgeGuidance(selected.state).body}</p></section>}
         <div className="forge-actions"><div><span className="eyebrow">NEXT CONTROLLED STEP</span><small>Nothing installs or expands permissions without approval.</small></div><div className="forge-action-buttons">{selected.state === 'active' && <button className="secondary" onClick={() => act(selected, 'revise')} disabled={busy !== ''}>Create update</button>}{nextAction && <button onClick={() => act(selected, nextAction.action)} disabled={busy !== ''}>{busy.startsWith(selected.id) ? 'Working…' : nextAction.label}<span>→</span></button>}</div></div>
       </> : <div className="forge-wait"><span>◇</span><h4>Define the first capability</h4><p>Create a proposal. Generation will only begin when you explicitly start it.</p></div>}</div>
@@ -223,6 +231,7 @@ function PluginCenter({ onClose }: { onClose: () => void }) {
 }
 
 function Permission({ label, enabled }: { label: string; enabled: boolean }) { return <div className={enabled ? 'enabled' : ''}><i>{enabled ? '✓' : '—'}</i><span>{label}</span></div>; }
+function surfacePrincipal(kind: string) { return kind === 'ui' ? 'UI principal' : kind === 'tool' || kind === 'skill' ? 'Agent principal' : 'Host principal'; }
 function forgeAction(state: string): { action: string; label: string } | null {
   if (state === 'proposed' || state === 'generation_failed') return { action: 'generate', label: 'Generate source' };
   if (state === 'generated' || state === 'build_failed') return { action: 'build', label: 'Build & test' };

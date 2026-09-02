@@ -99,7 +99,7 @@ func (s *Service) executeV2Build(ctx context.Context, project Project, manifest 
 			return buildResult{}, err
 		}
 		backendDir := filepath.Join(project.SourceDir, "backend")
-		if err = validateBackendPolicy(backendDir); err != nil {
+		if err = validateBackendPolicyV2(backendDir); err != nil {
 			return buildResult{}, err
 		}
 		testOutput, err := runCommand(ctx, backendDir, goExe, "test", "./...")
@@ -134,6 +134,9 @@ func (s *Service) executeV2Build(ctx context.Context, project Project, manifest 
 		}
 		for logical, source := range uiArtifacts {
 			artifacts[logical] = source
+		}
+		if err := validateUIArtifacts(uiArtifacts); err != nil {
+			return buildResult{}, err
 		}
 		steps = append(steps, buildStep{Surface: "ui", Action: "verify asset graph", Passed: true, Output: fmt.Sprintf("%d assets", len(uiArtifacts))})
 	}
@@ -184,6 +187,9 @@ func collectUIArtifacts(sourceRoot string, ui pluginmanifest.UI) (map[string]str
 			if item.IsDir() {
 				return nil
 			}
+			if item.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("UI asset %q is a symbolic link", current)
+			}
 			relative, err := filepath.Rel(sourceRoot, current)
 			if err != nil {
 				return err
@@ -227,7 +233,15 @@ func sourceArtifact(sourceRoot, logical string) (string, error) {
 	if info.IsDir() {
 		return "", fmt.Errorf("artifact %q is a directory", logical)
 	}
-	return target, nil
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil || !pathWithin(resolvedRoot, resolvedTarget) {
+		return "", fmt.Errorf("artifact %q resolves outside source root", logical)
+	}
+	return resolvedTarget, nil
 }
 
 func sourceArtifactDirectory(sourceRoot, logical string) (string, error) {
@@ -246,7 +260,53 @@ func sourceArtifactDirectory(sourceRoot, logical string) (string, error) {
 	if !info.IsDir() {
 		return "", fmt.Errorf("asset root %q is not a directory", logical)
 	}
-	return target, nil
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil || !pathWithin(resolvedRoot, resolvedTarget) {
+		return "", fmt.Errorf("asset root %q resolves outside source root", logical)
+	}
+	return resolvedTarget, nil
+}
+
+func validateUIArtifacts(artifacts map[string]string) error {
+	for logical, source := range artifacts {
+		extension := strings.ToLower(filepath.Ext(logical))
+		if extension != ".html" && extension != ".js" && extension != ".css" {
+			continue
+		}
+		file, err := os.Open(source)
+		if err != nil {
+			return err
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(file, 1<<20+1))
+		closeErr := file.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if len(raw) > 1<<20 {
+			return fmt.Errorf("UI asset %q exceeds 1 MiB", logical)
+		}
+		if forbidden := uiPolicyViolation(raw); forbidden != "" {
+			return fmt.Errorf("UI asset %q violates strict sandbox policy (%s)", logical, forbidden)
+		}
+	}
+	return nil
+}
+
+func uiPolicyViolation(raw []byte) string {
+	lower := strings.ToLower(string(raw))
+	for _, forbidden := range []string{"<base ", "javascript:", "http://", "https://", "ws://", "wss://", "serviceworker.register", "new function("} {
+		if strings.Contains(lower, forbidden) {
+			return forbidden
+		}
+	}
+	return ""
 }
 
 func digestArtifactSet(manifest []byte, artifacts map[string]string) (string, error) {

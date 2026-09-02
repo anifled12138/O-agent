@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,16 +29,21 @@ type Supervisor struct {
 	workspaceRoot string
 	plugins       map[string]*mountedRelease
 	capabilities  map[string]*binding
-	services      map[string]pluginforge.ServiceBinding
+	services      map[string]*serviceBinding
 	skills        map[string]pluginforge.SkillBinding
 	uis           map[string]pluginforge.UIBinding
 	hooks         map[string]surfaceBinding
 	jobs          map[string]surfaceBinding
+	epoch         atomic.Uint64
+	observer      func(pluginforge.RuntimeEvent)
+	broker        *ResourceBroker
+	hostTools     map[string]BrokerCommand
 }
 
 type mountedRelease struct {
 	release pluginforge.Release
 	process *process
+	epoch   uint64
 }
 
 type surfaceBinding struct {
@@ -56,21 +63,67 @@ type turnLease struct {
 type binding struct {
 	capability pluginforge.CapabilityBinding
 	process    *process
+	host       BrokerCommand
+	method     string
+	release    pluginforge.Release
+}
+
+type serviceBinding struct {
+	binding pluginforge.ServiceBinding
+	process *process
+	release pluginforge.Release
 }
 
 type process struct {
-	release pluginforge.Release
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  *bufio.Reader
-	stderr  bytes.Buffer
+	release     pluginforge.Release
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stdout      *bufio.Reader
+	stderr      cappedBuffer
+	containment *processContainment
 
 	callMu   sync.Mutex
 	request  atomic.Uint64
 	inFlight sync.WaitGroup
 	draining atomic.Bool
 	stopped  atomic.Bool
+	stopping atomic.Bool
+	done     chan struct{}
+	waitMu   sync.Mutex
+	waitErr  error
+	userID   string
+	broker   *ResourceBroker
 }
+
+const (
+	maxRPCFrameBytes     = 1 << 20
+	maxPluginInputBytes  = 256 << 10
+	maxPluginStderrBytes = 64 << 10
+)
+
+type cappedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (b *cappedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit == 0 {
+		b.limit = maxPluginStderrBytes
+	}
+	remaining := b.limit - b.buffer.Len()
+	if remaining > 0 {
+		if remaining > len(value) {
+			remaining = len(value)
+		}
+		_, _ = b.buffer.Write(value[:remaining])
+	}
+	return len(value), nil
+}
+
+func (b *cappedBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.buffer.String() }
 
 type rpcRequest struct {
 	ID     string          `json:"id"`
@@ -85,6 +138,10 @@ type rpcResponse struct {
 }
 
 func New(workspaceRoot string) (*Supervisor, error) {
+	return NewWithData(workspaceRoot, filepath.Join(workspaceRoot, "data"))
+}
+
+func NewWithData(workspaceRoot, dataRoot string) (*Supervisor, error) {
 	root, err := filepath.Abs(workspaceRoot)
 	if err != nil {
 		return nil, err
@@ -93,10 +150,17 @@ func New(workspaceRoot string) (*Supervisor, error) {
 	if err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("plugin workspace root is unavailable: %s", root)
 	}
+	broker, err := NewResourceBroker(root, dataRoot, nil, nil)
+	if err != nil {
+		return nil, err
+	}
 	return &Supervisor{
 		workspaceRoot: root, plugins: map[string]*mountedRelease{}, capabilities: map[string]*binding{},
-		services: map[string]pluginforge.ServiceBinding{}, skills: map[string]pluginforge.SkillBinding{},
-		uis: map[string]pluginforge.UIBinding{}, hooks: map[string]surfaceBinding{}, jobs: map[string]surfaceBinding{},
+		services: map[string]*serviceBinding{}, skills: map[string]pluginforge.SkillBinding{},
+		uis: map[string]pluginforge.UIBinding{}, hooks: map[string]surfaceBinding{}, jobs: map[string]surfaceBinding{}, broker: broker,
+		hostTools: map[string]BrokerCommand{"host.workspace.describe": func(context.Context, json.RawMessage) (json.RawMessage, error) {
+			return json.RawMessage(`{"mounted":true,"resourceAccess":"brokered"}`), nil
+		}},
 	}, nil
 }
 
@@ -107,7 +171,7 @@ func (s *Supervisor) Activate(ctx context.Context, userID string, release plugin
 	var candidate *process
 	if release.Manifest.Runtime != nil && release.Manifest.Runtime.Backend != nil {
 		var startErr error
-		candidate, startErr = startProcess(ctx, release)
+		candidate, startErr = startProcess(ctx, userID, release, s.broker, func(current *process, exitErr error) { s.processExited(userID, release, current, exitErr) })
 		if startErr != nil {
 			return startErr
 		}
@@ -117,23 +181,48 @@ func (s *Supervisor) Activate(ctx context.Context, userID string, release plugin
 	mount := &mountedRelease{release: release, process: candidate}
 	newBindings := make(map[string]*binding, len(release.Manifest.Exports.Tools))
 	for _, capability := range release.Manifest.Exports.Tools {
-		if capability.Executor.Kind != "backend" {
+		next := &binding{process: candidate, method: capability.Executor.Target, release: release}
+		switch capability.Executor.Kind {
+		case "backend":
+			if candidate == nil {
+				return fmt.Errorf("tool %q requires a backend process", capability.ID)
+			}
+		case "service":
+			if candidate == nil {
+				return fmt.Errorf("tool %q requires its service backend", capability.ID)
+			}
+			next.method = "service.call"
+		case "host":
+			next.process = nil
+			next.host = s.hostTools[capability.Executor.Target]
+			if next.host == nil {
+				if candidate != nil {
+					_ = candidate.forceStop()
+				}
+				return fmt.Errorf("tool %q references unregistered Host target %q", capability.ID, capability.Executor.Target)
+			}
+		default:
 			if candidate != nil {
 				_ = candidate.forceStop()
 			}
 			return fmt.Errorf("tool %q uses unsupported executor kind %q", capability.ID, capability.Executor.Kind)
 		}
 		capabilityKey := key(userID, capability.ID)
-		newBindings[capabilityKey] = &binding{process: candidate, capability: pluginforge.CapabilityBinding{
+		next.capability = pluginforge.CapabilityBinding{
 			ToolExport: capability,
 			PluginID:   release.PluginID,
 			ReleaseID:  release.ID,
 			Version:    release.Version,
-		}}
+		}
+		newBindings[capabilityKey] = next
 	}
-	newServices := make(map[string]pluginforge.ServiceBinding, len(release.Manifest.Exports.Services))
+	newServices := make(map[string]*serviceBinding, len(release.Manifest.Exports.Services))
 	for _, service := range release.Manifest.Exports.Services {
-		newServices[key(userID, service.ID)] = pluginforge.ServiceBinding{PluginID: release.PluginID, ReleaseID: release.ID, Version: release.Version, Service: service}
+		newServices[key(userID, service.ID)] = &serviceBinding{
+			binding: pluginforge.ServiceBinding{PluginID: release.PluginID, ReleaseID: release.ID, Version: release.Version, Service: service},
+			process: candidate,
+			release: release,
+		}
 	}
 	newSkills := make(map[string]pluginforge.SkillBinding, len(release.Manifest.Exports.Skills))
 	for _, skill := range release.Manifest.Exports.Skills {
@@ -155,12 +244,39 @@ func (s *Supervisor) Activate(ctx context.Context, userID string, release plugin
 
 	s.mu.Lock()
 	old := s.plugins[pluginKey]
+	if dependencyErr := s.activationDependencyError(userID, release); dependencyErr != "" {
+		s.mu.Unlock()
+		if candidate != nil {
+			_ = candidate.forceStop()
+		}
+		return errors.New(dependencyErr)
+	}
+	if candidate != nil && candidate.stopped.Load() {
+		s.mu.Unlock()
+		return errors.New("plugin backend exited during activation preparation")
+	}
 	if conflict := s.registrationConflict(userID, release.PluginID, newBindings, newServices, newSkills, newHooks, newJobs); conflict != "" {
 		s.mu.Unlock()
 		if candidate != nil {
 			_ = candidate.forceStop()
 		}
 		return errors.New(conflict)
+	}
+	nextEpoch := s.epoch.Add(1)
+	mount.epoch = nextEpoch
+	for _, item := range newBindings {
+		item.capability.RegistryEpoch = nextEpoch
+	}
+	for id, item := range newServices {
+		item.binding.RegistryEpoch = nextEpoch
+		newServices[id] = item
+	}
+	for id, item := range newSkills {
+		item.RegistryEpoch = nextEpoch
+		newSkills[id] = item
+	}
+	if nextUI != nil {
+		nextUI.RegistryEpoch = nextEpoch
 	}
 	s.removePluginBindings(userID, release.PluginID)
 	s.plugins[pluginKey] = mount
@@ -191,6 +307,55 @@ func (s *Supervisor) Activate(ctx context.Context, userID string, release plugin
 	return nil
 }
 
+func (s *Supervisor) SetObserver(observer func(pluginforge.RuntimeEvent)) {
+	s.mu.Lock()
+	s.observer = observer
+	s.mu.Unlock()
+}
+
+func (s *Supervisor) processExited(userID string, release pluginforge.Release, exited *process, exitErr error) {
+	if exited.stopping.Load() {
+		return
+	}
+	s.mu.Lock()
+	mounted := s.plugins[key(userID, release.PluginID)]
+	if mounted == nil || mounted.process != exited || mounted.release.ID != release.ID {
+		s.mu.Unlock()
+		return
+	}
+	mounted.process = nil
+	prefix := userID + "\x00"
+	for id, item := range s.capabilities {
+		if strings.HasPrefix(id, prefix) && item.process == exited {
+			delete(s.capabilities, id)
+		}
+	}
+	for id, item := range s.services {
+		if strings.HasPrefix(id, prefix) && item.process == exited {
+			delete(s.services, id)
+		}
+	}
+	for id, item := range s.hooks {
+		if strings.HasPrefix(id, prefix) && item.PluginID == release.PluginID {
+			delete(s.hooks, id)
+		}
+	}
+	for id, item := range s.jobs {
+		if strings.HasPrefix(id, prefix) && item.PluginID == release.PluginID {
+			delete(s.jobs, id)
+		}
+	}
+	observer := s.observer
+	s.mu.Unlock()
+	message := "plugin backend exited"
+	if exitErr != nil {
+		message += ": " + exitErr.Error()
+	}
+	if observer != nil {
+		observer(pluginforge.RuntimeEvent{UserID: userID, PluginID: release.PluginID, ReleaseID: release.ID, Kind: "backend.crashed", Error: message, At: time.Now().UTC()})
+	}
+}
+
 func (s *Supervisor) Deactivate(_ context.Context, userID, pluginID string) error {
 	pluginKey := key(userID, pluginID)
 	s.mu.Lock()
@@ -219,8 +384,10 @@ func (s *Supervisor) InvokePinned(ctx context.Context, userID, capabilityID, rel
 func (s *Supervisor) invoke(ctx context.Context, userID, capabilityID, releaseID string, input json.RawMessage) (json.RawMessage, error) {
 	s.mu.RLock()
 	selected := s.capabilities[key(userID, capabilityID)]
-	if selected != nil && (releaseID == "" || selected.capability.ReleaseID == releaseID) && !selected.process.draining.Load() {
-		selected.process.inFlight.Add(1)
+	if selected != nil && (releaseID == "" || selected.capability.ReleaseID == releaseID) && (selected.process == nil || !selected.process.draining.Load()) {
+		if selected.process != nil {
+			selected.process.inFlight.Add(1)
+		}
 	} else {
 		selected = nil
 	}
@@ -228,11 +395,16 @@ func (s *Supervisor) invoke(ctx context.Context, userID, capabilityID, releaseID
 	if selected == nil {
 		return nil, fmt.Errorf("capability %q is not active", capabilityID)
 	}
-	defer selected.process.inFlight.Done()
+	if selected.process != nil {
+		defer selected.process.inFlight.Done()
+	}
 	return s.invokeBinding(ctx, selected, capabilityID, input)
 }
 
 func (s *Supervisor) invokeBinding(ctx context.Context, selected *binding, capabilityID string, input json.RawMessage) (json.RawMessage, error) {
+	if len(input) > maxPluginInputBytes {
+		return nil, errors.New("capability input exceeds 256 KiB")
+	}
 	params := map[string]any{}
 	if len(input) > 0 {
 		if err := json.Unmarshal(input, &params); err != nil {
@@ -243,14 +415,31 @@ func (s *Supervisor) invokeBinding(ctx context.Context, selected *binding, capab
 		return nil, fmt.Errorf("capability input contract: %w", err)
 	}
 	params["_axiomCapabilityId"] = capabilityID
+	if selected.capability.Executor.Kind == "service" {
+		params["_axiomServiceId"] = selected.capability.Executor.Target
+	}
+	if selected.host != nil {
+		raw, _ := json.Marshal(params)
+		result, err := selected.host(ctx, raw)
+		if err != nil {
+			return nil, err
+		}
+		if !json.Valid(result) {
+			return nil, errors.New("Host tool returned invalid JSON")
+		}
+		if err := validateSchema(result, selected.capability.OutputSchema); err != nil {
+			return nil, fmt.Errorf("capability output contract: %w", err)
+		}
+		return result, nil
+	}
 	// The host, not plugin UI or model output, chooses the filesystem boundary.
-	if hasPermission(selected.process.release.Manifest.Permissions.Filesystem.Read, "${workspace}") {
+	if hasPermission(selected.release.Manifest.Permissions.Filesystem.Read, "${workspace}") {
 		params["root"] = s.workspaceRoot
 	} else {
 		delete(params, "root")
 	}
 	raw, _ := json.Marshal(params)
-	result, err := selected.process.call(ctx, "capability.invoke", raw)
+	result, err := selected.process.call(ctx, selected.method, raw)
 	if err != nil {
 		return nil, err
 	}
@@ -268,6 +457,9 @@ func (s *Supervisor) invokeBinding(ctx context.Context, selected *binding, capab
 func (s *Supervisor) UICall(ctx context.Context, userID, pluginID, operation string, input json.RawMessage) (json.RawMessage, error) {
 	if operation == "" || len(operation) > 128 || strings.ContainsAny(operation, " \t\r\n") {
 		return nil, errors.New("invalid UI operation")
+	}
+	if len(input) > maxPluginInputBytes {
+		return nil, errors.New("UI call input exceeds 256 KiB")
 	}
 	s.mu.RLock()
 	mounted := s.plugins[key(userID, pluginID)]
@@ -303,6 +495,64 @@ func (s *Supervisor) UICall(ctx context.Context, userID, pluginID, operation str
 	return result, nil
 }
 
+// UIServiceCall lets a sandboxed UI consume only services declared in the
+// calling release's dependency contract. The service remains outside the
+// Agent capability index and executes under the UI principal.
+func (s *Supervisor) UIServiceCall(ctx context.Context, userID, callerPluginID, serviceID string, input json.RawMessage) (json.RawMessage, error) {
+	if len(input) > maxPluginInputBytes {
+		return nil, errors.New("UI service input exceeds 256 KiB")
+	}
+	var value any = map[string]any{}
+	if len(input) > 0 {
+		if err := json.Unmarshal(input, &value); err != nil {
+			return nil, fmt.Errorf("invalid UI service input: %w", err)
+		}
+	}
+
+	s.mu.RLock()
+	caller := s.plugins[key(userID, callerPluginID)]
+	_, hasUI := s.uis[key(userID, callerPluginID)]
+	selected := s.services[key(userID, serviceID)]
+	contract := ""
+	if caller != nil && hasUI {
+		for _, dependency := range caller.release.Manifest.Dependencies.Services {
+			if dependency.ID == serviceID {
+				contract = dependency.Contract
+				break
+			}
+		}
+	}
+	if caller == nil || !hasUI || selected == nil || selected.process == nil || selected.process.draining.Load() || selected.process.stopped.Load() || contract == "" || contract != selected.binding.Service.Contract {
+		selected = nil
+	} else {
+		selected.process.inFlight.Add(1)
+	}
+	s.mu.RUnlock()
+	if selected == nil {
+		return nil, fmt.Errorf("service %q is not an active dependency of UI plugin %q", serviceID, callerPluginID)
+	}
+	defer selected.process.inFlight.Done()
+
+	method := selected.binding.Service.Handler
+	if method == "" {
+		method = "service.call"
+	}
+	params, _ := json.Marshal(map[string]any{
+		"_axiomServiceId": serviceID,
+		"principal":       "ui",
+		"callerPluginId":  callerPluginID,
+		"input":           value,
+	})
+	result, err := selected.process.call(ctx, method, params)
+	if err != nil {
+		return nil, err
+	}
+	if !json.Valid(result) {
+		return nil, errors.New("service returned invalid JSON")
+	}
+	return result, nil
+}
+
 func (s *Supervisor) Capabilities(userID string) []pluginforge.CapabilityBinding {
 	prefix := userID + "\x00"
 	s.mu.RLock()
@@ -317,38 +567,51 @@ func (s *Supervisor) Capabilities(userID string) []pluginforge.CapabilityBinding
 }
 
 func (s *Supervisor) SurfaceStates(userID, pluginID string) []pluginforge.SurfaceState {
+	pluginKey := key(userID, pluginID)
+	prefix := userID + "\x00"
 	s.mu.RLock()
-	mounted := s.plugins[key(userID, pluginID)]
-	s.mu.RUnlock()
+	mounted := s.plugins[pluginKey]
 	if mounted == nil {
+		s.mu.RUnlock()
 		return nil
 	}
 	now := time.Now().UTC()
 	result := make([]pluginforge.SurfaceState, 0)
 	add := func(kind, id string) {
-		result = append(result, pluginforge.SurfaceState{UserID: userID, PluginID: pluginID, ReleaseID: mounted.release.ID, Kind: kind, SurfaceID: id, Status: "active", UpdatedAt: now})
+		result = append(result, pluginforge.SurfaceState{UserID: userID, PluginID: pluginID, ReleaseID: mounted.release.ID, Kind: kind, SurfaceID: id, Status: "active", RegistryEpoch: mounted.epoch, UpdatedAt: now})
 	}
-	if mounted.release.Manifest.Runtime != nil {
+	if mounted.process != nil {
 		add("runtime", "backend")
 	}
-	if mounted.release.Manifest.UI != nil {
-		add("ui", mounted.release.Manifest.UI.Entry)
+	if ui, ok := s.uis[pluginKey]; ok {
+		add("ui", ui.UI.Entry)
 	}
-	for _, item := range mounted.release.Manifest.Exports.Services {
-		add("service", item.ID)
+	for id, item := range s.services {
+		if strings.HasPrefix(id, prefix) && item.binding.PluginID == pluginID {
+			add("service", item.binding.Service.ID)
+		}
 	}
-	for _, item := range mounted.release.Manifest.Exports.Tools {
-		add("tool", item.ID)
+	for id, item := range s.capabilities {
+		if strings.HasPrefix(id, prefix) && item.capability.PluginID == pluginID {
+			add("tool", item.capability.ID)
+		}
 	}
-	for _, item := range mounted.release.Manifest.Exports.Skills {
-		add("skill", item.ID)
+	for id, item := range s.skills {
+		if strings.HasPrefix(id, prefix) && item.PluginID == pluginID {
+			add("skill", item.Skill.ID)
+		}
 	}
-	for _, item := range mounted.release.Manifest.Exports.Hooks {
-		add("hook", item.ID)
+	for id, item := range s.hooks {
+		if strings.HasPrefix(id, prefix) && item.PluginID == pluginID {
+			add("hook", item.ID)
+		}
 	}
-	for _, item := range mounted.release.Manifest.Exports.Jobs {
-		add("job", item.ID)
+	for id, item := range s.jobs {
+		if strings.HasPrefix(id, prefix) && item.PluginID == pluginID {
+			add("job", item.ID)
+		}
 	}
+	s.mu.RUnlock()
 	return result
 }
 
@@ -357,6 +620,19 @@ func (s *Supervisor) UI(userID, pluginID string) (pluginforge.UIBinding, bool) {
 	value, ok := s.uis[key(userID, pluginID)]
 	s.mu.RUnlock()
 	return value, ok
+}
+
+func (s *Supervisor) UIs(userID string) []pluginforge.UIBinding {
+	prefix := userID + "\x00"
+	s.mu.RLock()
+	result := []pluginforge.UIBinding{}
+	for id, item := range s.uis {
+		if strings.HasPrefix(id, prefix) {
+			result = append(result, item)
+		}
+	}
+	s.mu.RUnlock()
+	return result
 }
 
 func (s *Supervisor) Skills(userID string) []pluginforge.SkillBinding {
@@ -378,11 +654,11 @@ func (s *Supervisor) BeginTurn(userID string) pluginforge.TurnLease {
 	lease := &turnLease{supervisor: s, tools: map[string]*binding{}}
 	seen := map[*process]bool{}
 	for id, item := range s.capabilities {
-		if !strings.HasPrefix(id, prefix) || item.process.draining.Load() {
+		if !strings.HasPrefix(id, prefix) || item.process != nil && item.process.draining.Load() {
 			continue
 		}
 		lease.tools[item.capability.ID] = item
-		if !seen[item.process] {
+		if item.process != nil && !seen[item.process] {
 			item.process.inFlight.Add(1)
 			seen[item.process] = true
 			lease.processes = append(lease.processes, item.process)
@@ -440,7 +716,7 @@ func (s *Supervisor) Close() error {
 	}
 	s.plugins = map[string]*mountedRelease{}
 	s.capabilities = map[string]*binding{}
-	s.services = map[string]pluginforge.ServiceBinding{}
+	s.services = map[string]*serviceBinding{}
 	s.skills = map[string]pluginforge.SkillBinding{}
 	s.uis = map[string]pluginforge.UIBinding{}
 	s.hooks = map[string]surfaceBinding{}
@@ -452,14 +728,14 @@ func (s *Supervisor) Close() error {
 	return nil
 }
 
-func (s *Supervisor) registrationConflict(userID, pluginID string, tools map[string]*binding, services map[string]pluginforge.ServiceBinding, skills map[string]pluginforge.SkillBinding, hooks, jobs map[string]surfaceBinding) string {
+func (s *Supervisor) registrationConflict(userID, pluginID string, tools map[string]*binding, services map[string]*serviceBinding, skills map[string]pluginforge.SkillBinding, hooks, jobs map[string]surfaceBinding) string {
 	for id := range tools {
 		if current := s.capabilities[id]; current != nil && current.capability.PluginID != pluginID {
 			return fmt.Sprintf("tool export %q is already registered", strings.TrimPrefix(id, userID+"\x00"))
 		}
 	}
 	for id := range services {
-		if current, ok := s.services[id]; ok && current.PluginID != pluginID {
+		if current, ok := s.services[id]; ok && current.binding.PluginID != pluginID {
 			return fmt.Sprintf("service export %q is already registered", strings.TrimPrefix(id, userID+"\x00"))
 		}
 	}
@@ -481,6 +757,87 @@ func (s *Supervisor) registrationConflict(userID, pluginID string, tools map[str
 	return ""
 }
 
+func (s *Supervisor) activationDependencyError(userID string, release pluginforge.Release) string {
+	for _, dependency := range release.Manifest.Dependencies.Plugins {
+		mounted := s.plugins[key(userID, dependency.ID)]
+		if mounted == nil || !versionSatisfies(mounted.release.Version, dependency.Version) {
+			return fmt.Sprintf("plugin dependency %s %s is not active", dependency.ID, dependency.Version)
+		}
+	}
+	for _, dependency := range release.Manifest.Dependencies.Services {
+		service, ok := s.services[key(userID, dependency.ID)]
+		if !ok || service.binding.Service.Contract != dependency.Contract {
+			return fmt.Sprintf("service dependency %s (%s) is not active", dependency.ID, dependency.Contract)
+		}
+	}
+	return ""
+}
+
+func versionSatisfies(current, constraint string) bool {
+	if constraint == "*" || current == constraint {
+		return true
+	}
+	prefix := ""
+	for _, candidate := range []string{"^", "~", ">="} {
+		if strings.HasPrefix(constraint, candidate) {
+			prefix = candidate
+			constraint = strings.TrimPrefix(constraint, candidate)
+			break
+		}
+	}
+	currentParts, currentOK := numericVersion(current)
+	wantedParts, wantedOK := numericVersion(constraint)
+	if !currentOK || !wantedOK {
+		return false
+	}
+	compare := 0
+	for index := 0; index < 3; index++ {
+		if currentParts[index] < wantedParts[index] {
+			compare = -1
+			break
+		}
+		if currentParts[index] > wantedParts[index] {
+			compare = 1
+			break
+		}
+	}
+	switch prefix {
+	case ">=":
+		return compare >= 0
+	case "^":
+		if compare < 0 || currentParts[0] != wantedParts[0] {
+			return false
+		}
+		if wantedParts[0] > 0 {
+			return true
+		}
+		if currentParts[1] != wantedParts[1] {
+			return false
+		}
+		return wantedParts[1] > 0 || currentParts[2] == wantedParts[2]
+	case "~":
+		return currentParts[0] == wantedParts[0] && currentParts[1] == wantedParts[1] && compare >= 0
+	}
+	return false
+}
+
+func numericVersion(value string) ([3]int, bool) {
+	var result [3]int
+	core := strings.SplitN(value, "-", 2)[0]
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return result, false
+	}
+	for index, part := range parts {
+		parsed, err := strconv.Atoi(part)
+		if err != nil {
+			return result, false
+		}
+		result[index] = parsed
+	}
+	return result, true
+}
+
 func (s *Supervisor) removePluginBindings(userID, pluginID string) {
 	pluginKey := key(userID, pluginID)
 	delete(s.plugins, pluginKey)
@@ -491,7 +848,7 @@ func (s *Supervisor) removePluginBindings(userID, pluginID string) {
 		}
 	}
 	for id, item := range s.services {
-		if item.PluginID == pluginID && strings.HasPrefix(id, userID+"\x00") {
+		if item.binding.PluginID == pluginID && strings.HasPrefix(id, userID+"\x00") {
 			delete(s.services, id)
 		}
 	}
@@ -512,7 +869,7 @@ func (s *Supervisor) removePluginBindings(userID, pluginID string) {
 	}
 }
 
-func startProcess(ctx context.Context, release pluginforge.Release) (*process, error) {
+func startProcess(ctx context.Context, userID string, release pluginforge.Release, broker *ResourceBroker, onExit func(*process, error)) (*process, error) {
 	bundleRoot, err := filepath.Abs(release.BundleDir)
 	if err != nil {
 		return nil, err
@@ -543,19 +900,38 @@ func startProcess(ctx context.Context, release pluginforge.Release) (*process, e
 	if err != nil {
 		return nil, err
 	}
-	current := &process{release: release, cmd: command, stdin: stdin, stdout: bufio.NewReaderSize(stdout, 1<<20)}
+	current := &process{release: release, userID: userID, broker: broker, cmd: command, stdin: stdin, stdout: bufio.NewReaderSize(stdout, maxRPCFrameBytes), done: make(chan struct{})}
 	command.Stderr = &current.stderr
 	if err = command.Start(); err != nil {
 		return nil, err
 	}
-	hello, err := current.call(ctx, "plugin.hello", json.RawMessage(`{"host":"axiom","protocol":"axiom.rpc/v1"}`))
+	current.containment, err = containProcess(command)
+	if err != nil {
+		_ = current.forceStop()
+		return nil, fmt.Errorf("apply plugin process containment: %w", err)
+	}
+	go func() {
+		waitErr := command.Wait()
+		current.waitMu.Lock()
+		current.waitErr = waitErr
+		current.waitMu.Unlock()
+		current.stopped.Store(true)
+		_ = current.containment.Close()
+		close(current.done)
+		if onExit != nil {
+			onExit(current, waitErr)
+		}
+	}()
+	protocol := release.Manifest.Runtime.Backend.Protocol
+	helloInput, _ := json.Marshal(map[string]any{"host": "axiom", "protocol": protocol, "brokers": []string{"filesystem", "network", "secret", "process"}})
+	hello, err := current.call(ctx, "plugin.hello", helloInput)
 	if err == nil {
 		var status struct {
 			Protocol string `json:"protocol"`
 			Status   string `json:"status"`
 		}
 		err = json.Unmarshal(hello, &status)
-		if err == nil && (status.Protocol != "axiom.rpc/v1" || status.Status != "ready") {
+		if err == nil && (status.Protocol != protocol || status.Status != "ready") {
 			err = fmt.Errorf("plugin rejected protocol handshake")
 		}
 	}
@@ -581,41 +957,146 @@ func (p *process) call(ctx context.Context, method string, params json.RawMessag
 	defer p.callMu.Unlock()
 	requestID := fmt.Sprintf("req_%d", p.request.Add(1))
 	raw, _ := json.Marshal(rpcRequest{ID: requestID, Method: method, Params: params})
+	if len(raw) > maxRPCFrameBytes {
+		return nil, errors.New("plugin RPC request exceeds 1 MiB")
+	}
 	if _, err := p.stdin.Write(append(raw, '\n')); err != nil {
 		return nil, err
 	}
-	type outcome struct {
-		line []byte
-		err  error
+	return p.awaitResponse(ctx, requestID)
+}
+
+func (p *process) awaitResponse(ctx context.Context, requestID string) (json.RawMessage, error) {
+	for {
+		type outcome struct {
+			line []byte
+			err  error
+		}
+		done := make(chan outcome, 1)
+		go func() {
+			line, err := p.stdout.ReadSlice('\n')
+			if errors.Is(err, bufio.ErrBufferFull) {
+				err = errors.New("plugin RPC response exceeds 1 MiB")
+			}
+			done <- outcome{line: line, err: err}
+		}()
+		select {
+		case <-ctx.Done():
+			_ = p.forceStop()
+			return nil, ctx.Err()
+		case received := <-done:
+			if received.err != nil {
+				_ = p.forceStop()
+				return nil, received.err
+			}
+			var brokerRequest rpcRequest
+			if json.Unmarshal(received.line, &brokerRequest) == nil && brokerRequest.Method != "" {
+				if brokerRequest.ID == "" || !strings.HasPrefix(brokerRequest.Method, "host.") {
+					_ = p.forceStop()
+					return nil, errors.New("plugin emitted an invalid Host broker request")
+				}
+				result, brokerErr := p.handleBroker(ctx, brokerRequest.Method, brokerRequest.Params)
+				response := rpcResponse{ID: brokerRequest.ID, Result: result}
+				if brokerErr != nil {
+					response.Result = nil
+					response.Error = brokerErr.Error()
+				}
+				raw, _ := json.Marshal(response)
+				if len(raw) > maxRPCFrameBytes {
+					return nil, errors.New("Host broker response exceeds 1 MiB")
+				}
+				if _, err := p.stdin.Write(append(raw, '\n')); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			var response rpcResponse
+			if err := json.Unmarshal(received.line, &response); err != nil {
+				return nil, fmt.Errorf("invalid plugin response: %w", err)
+			}
+			if response.ID != requestID {
+				return nil, fmt.Errorf("plugin response id mismatch")
+			}
+			if response.Error != "" {
+				return nil, errors.New(response.Error)
+			}
+			return response.Result, nil
+		}
 	}
-	done := make(chan outcome, 1)
-	go func() {
-		line, err := p.stdout.ReadBytes('\n')
-		done <- outcome{line: line, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		_ = p.forceStop()
-		return nil, ctx.Err()
-	case received := <-done:
-		if received.err != nil {
-			return nil, received.err
+}
+
+func (p *process) handleBroker(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	if p.broker == nil || p.release.Manifest.Runtime == nil || p.release.Manifest.Runtime.Backend == nil || p.release.Manifest.Runtime.Backend.Protocol != "axiom.rpc/v2" {
+		return nil, errors.New("Host broker requires axiom.rpc/v2")
+	}
+	switch method {
+	case "host.fs.read":
+		var input struct{ Scope, Path string }
+		if json.Unmarshal(params, &input) != nil {
+			return nil, errors.New("invalid filesystem broker request")
 		}
-		var response rpcResponse
-		if err := json.Unmarshal(received.line, &response); err != nil {
-			return nil, fmt.Errorf("invalid plugin response: %w", err)
+		value, err := p.broker.ReadFile(p.release, input.Scope, input.Path)
+		if err != nil {
+			return nil, err
 		}
-		if response.ID != requestID {
-			return nil, fmt.Errorf("plugin response id mismatch")
+		return json.Marshal(map[string]any{"content": string(value)})
+	case "host.fs.list":
+		var input struct{ Scope, Path string }
+		if json.Unmarshal(params, &input) != nil {
+			return nil, errors.New("invalid filesystem broker request")
 		}
-		if response.Error != "" {
-			return nil, errors.New(response.Error)
+		value, err := p.broker.ListDir(p.release, input.Scope, input.Path)
+		if err != nil {
+			return nil, err
 		}
-		return response.Result, nil
+		return json.Marshal(map[string]any{"entries": value})
+	case "host.fs.write":
+		var input struct{ Scope, Path, Content string }
+		if json.Unmarshal(params, &input) != nil {
+			return nil, errors.New("invalid filesystem broker request")
+		}
+		return json.RawMessage(`{"written":true}`), p.broker.WriteFile(p.release, input.Scope, input.Path, []byte(input.Content))
+	case "host.secret.get":
+		var input struct{ Name string }
+		if json.Unmarshal(params, &input) != nil {
+			return nil, errors.New("invalid secret broker request")
+		}
+		value, err := p.broker.Secret(ctx, p.userID, p.release, input.Name)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]any{"valueBase64": base64.StdEncoding.EncodeToString(value)})
+	case "host.process.run":
+		var input struct {
+			Name  string
+			Input json.RawMessage
+		}
+		if json.Unmarshal(params, &input) != nil {
+			return nil, errors.New("invalid process broker request")
+		}
+		return p.broker.Run(ctx, p.release, input.Name, input.Input)
+	case "host.net.fetch":
+		var input struct{ Method, URL, Body string }
+		if json.Unmarshal(params, &input) != nil {
+			return nil, errors.New("invalid network broker request")
+		}
+		response, err := p.broker.Fetch(ctx, p.release, input.Method, input.URL, strings.NewReader(input.Body))
+		if err != nil {
+			return nil, err
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil || len(body) > maxBrokerHTTPBytes {
+			return nil, errors.New("brokered HTTP response exceeds 2 MiB")
+		}
+		return json.Marshal(map[string]any{"status": response.StatusCode, "bodyBase64": base64.StdEncoding.EncodeToString(body), "contentType": response.Header.Get("Content-Type")})
+	default:
+		return nil, fmt.Errorf("unknown Host broker method %q", method)
 	}
 }
 
 func (p *process) stop(timeout time.Duration) {
+	p.stopping.Store(true)
 	drained := make(chan struct{})
 	go func() { p.inFlight.Wait(); close(drained) }()
 	select {
@@ -627,11 +1108,10 @@ func (p *process) stop(timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	_, _ = p.call(ctx, "plugin.shutdown", json.RawMessage(`{}`))
-	finished := make(chan error, 1)
-	go func() { finished <- p.cmd.Wait() }()
 	select {
-	case <-finished:
+	case <-p.done:
 		p.stopped.Store(true)
+		_ = p.containment.Close()
 	case <-ctx.Done():
 		_ = p.forceStop()
 	}
@@ -642,6 +1122,7 @@ func (p *process) forceStop() error {
 		return nil
 	}
 	_ = p.stdin.Close()
+	_ = p.containment.Close()
 	if p.cmd.Process != nil {
 		return p.cmd.Process.Kill()
 	}

@@ -1,6 +1,9 @@
 # ADR 0002: Plugin surfaces and agent visibility
 
-Status: Proposed
+Status: Accepted and implemented (2026-09-02)
+
+Implementation notes and verification evidence are summarized in
+[`../plugin-runtime-implementation.md`](../plugin-runtime-implementation.md).
 
 ## Context
 

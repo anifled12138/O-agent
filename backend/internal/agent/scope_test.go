@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"axiom.local/agent/internal/domain"
+	"axiom.local/agent/internal/pluginforge"
+	"axiom.local/agent/internal/pluginmanifest"
+	"axiom.local/agent/internal/provider"
 )
 
 func TestSearchUsesCompactTerms(t *testing.T) {
@@ -14,6 +18,21 @@ func TestSearchUsesCompactTerms(t *testing.T) {
 	}
 	if got := relevance(terms, "calendar weather"); got != 0 {
 		t.Fatalf("irrelevant capability scored %d", got)
+	}
+}
+
+func TestSearchCardsExcludeHiddenCapabilitiesAndFullSchemas(t *testing.T) {
+	scope := &turnScope{tools: map[string]pluginforge.CapabilityBinding{
+		"visible.tool": {ToolExport: pluginmanifest.ToolExport{ID: "visible.tool", Summary: "Inspect workspace", Visibility: "discoverable", InputSchema: json.RawMessage(`{"type":"object","properties":{"secret":{"type":"string"}}}`)}, ReleaseID: "rel_visible"},
+		"hidden.tool":  {ToolExport: pluginmanifest.ToolExport{ID: "hidden.tool", Summary: "Inspect workspace secretly", Visibility: "none"}, ReleaseID: "rel_hidden"},
+	}, skills: map[string]pluginforge.SkillBinding{}, creator: map[string]provider.ToolDefinition{}}
+	results := scope.search("workspace inspect", 10)
+	if len(results) != 1 || results[0].ID != "visible.tool" {
+		t.Fatalf("unexpected search projection: %#v", results)
+	}
+	raw, _ := json.Marshal(results)
+	if strings.Contains(string(raw), "inputSchema") || strings.Contains(string(raw), "secret") {
+		t.Fatalf("search card leaked a full schema: %s", raw)
 	}
 }
 

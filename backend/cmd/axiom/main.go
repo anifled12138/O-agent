@@ -97,7 +97,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		forgeRuntime, err = pluginruntime.New(cfg.WorkspaceRoot)
+		forgeRuntime, err = pluginruntime.NewWithData(cfg.WorkspaceRoot, cfg.DataDir)
 		if err != nil {
 			_ = forgeRepo.Close()
 			return err

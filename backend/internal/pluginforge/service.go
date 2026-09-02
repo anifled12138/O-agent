@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
@@ -29,11 +30,14 @@ type Runtime interface {
 	Invoke(context.Context, string, string, json.RawMessage) (json.RawMessage, error)
 	InvokePinned(context.Context, string, string, string, json.RawMessage) (json.RawMessage, error)
 	UICall(context.Context, string, string, string, json.RawMessage) (json.RawMessage, error)
+	UIServiceCall(context.Context, string, string, string, json.RawMessage) (json.RawMessage, error)
 	Capabilities(string) []CapabilityBinding
 	SurfaceStates(string, string) []SurfaceState
 	UI(string, string) (UIBinding, bool)
+	UIs(string) []UIBinding
 	Skills(string) []SkillBinding
 	BeginTurn(string) TurnLease
+	SetObserver(func(RuntimeEvent))
 }
 
 type Service struct {
@@ -55,7 +59,15 @@ type SourceFileInput struct {
 }
 
 func NewService(repo *Repository, runtime Runtime, dataDir, workspaceRoot string) *Service {
-	return &Service{repo: repo, runtime: runtime, dataDir: dataDir, workspaceRoot: workspaceRoot}
+	service := &Service{repo: repo, runtime: runtime, dataDir: dataDir, workspaceRoot: workspaceRoot}
+	runtime.SetObserver(service.handleRuntimeEvent)
+	return service
+}
+
+func (s *Service) handleRuntimeEvent(event RuntimeEvent) {
+	_ = s.repo.MarkRuntimeFailure(context.Background(), event.UserID, event.PluginID, event.ReleaseID, event.Error)
+	raw, _ := json.Marshal(map[string]any{"releaseId": event.ReleaseID, "kind": event.Kind, "error": event.Error})
+	_ = s.repo.Audit(context.Background(), AuditEvent{ID: newID("evt"), UserID: event.UserID, PluginID: event.PluginID, Action: "runtime.crashed", Details: raw, CreatedAt: event.At})
 }
 
 func (s *Service) ListProjects(ctx context.Context, userID string) ([]ProjectView, error) {
@@ -101,11 +113,25 @@ func (s *Service) Capabilities(userID string) []CapabilityBinding {
 func (s *Service) SurfaceStates(ctx context.Context, userID string) ([]SurfaceState, error) {
 	return s.repo.SurfaceStates(ctx, userID)
 }
+func (s *Service) MigrationStatus(ctx context.Context) (map[string]any, error) {
+	activeV1, err := s.repo.ActiveV1Installations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"generatedSpec":         pluginmanifest.SpecV2,
+		"activeV1Installations": activeV1,
+		"v1Compatibility":       true,
+		"v1RouteRemovalReady":   activeV1 == 0,
+		"v1CreationEnabled":     false,
+	}, nil
+}
 func (s *Service) UIBinding(userID, pluginID string) (UIBinding, bool) {
 	return s.runtime.UI(userID, pluginID)
 }
-func (s *Service) Skills(userID string) []SkillBinding { return s.runtime.Skills(userID) }
-func (s *Service) BeginTurn(userID string) TurnLease   { return s.runtime.BeginTurn(userID) }
+func (s *Service) UIBindings(userID string) []UIBinding { return s.runtime.UIs(userID) }
+func (s *Service) Skills(userID string) []SkillBinding  { return s.runtime.Skills(userID) }
+func (s *Service) BeginTurn(userID string) TurnLease    { return s.runtime.BeginTurn(userID) }
 
 func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Project, error) {
 	in.Name = strings.TrimSpace(in.Name)
@@ -218,6 +244,7 @@ func (s *Service) BuildAndTest(ctx context.Context, userID, projectID string) (P
 		TestReport:     result.report,
 		PermissionHash: pluginmanifest.GrantDigest(document.Manifest),
 		CreatedAt:      time.Now().UTC(),
+		SourceVersion:  document.SourceVersion,
 	}
 	if err = s.repo.CreateRelease(ctx, release); err != nil && !strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return fail(err)
@@ -444,6 +471,40 @@ func (s *Service) UICall(ctx context.Context, userID, pluginID, operation string
 	return s.runtime.UICall(ctx, userID, pluginID, operation, input)
 }
 
+func (s *Service) UIServiceCall(ctx context.Context, userID, pluginID, serviceID string, input json.RawMessage) (json.RawMessage, error) {
+	if s.runtime == nil {
+		return nil, errors.New("plugin runtime is unavailable")
+	}
+	return s.runtime.UIServiceCall(ctx, userID, pluginID, serviceID, input)
+}
+
+func (s *Service) LegacyUICall(ctx context.Context, userID, pluginID, suffix string, input json.RawMessage) (json.RawMessage, error) {
+	ui, ok := s.runtime.UI(userID, pluginID)
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	release, err := s.repo.Release(ctx, ui.ReleaseID)
+	if err != nil {
+		return nil, err
+	}
+	if release.SourceVersion != pluginmanifest.SourceV1 {
+		return nil, errors.New("legacy UI invocation is restricted to V1 releases")
+	}
+	var selected string
+	for _, capability := range s.runtime.Capabilities(userID) {
+		if capability.PluginID == pluginID && strings.HasSuffix(capability.ID, suffix) {
+			if selected != "" {
+				return nil, errors.New("legacy capability suffix is ambiguous")
+			}
+			selected = capability.ID
+		}
+	}
+	if selected == "" {
+		return nil, errors.New("legacy capability is not active")
+	}
+	return s.runtime.InvokePinned(ctx, userID, selected, release.ID, input)
+}
+
 func (s *Service) Restore(ctx context.Context) error {
 	installations, err := s.repo.ActiveInstallations(ctx)
 	if err != nil {
@@ -653,6 +714,44 @@ func validateBackendPolicy(backendDir string) error {
 					}
 					return fmt.Errorf("plugin policy rejects import %q (%s); use a host-brokered capability", path, reason)
 				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateBackendPolicyV2(backendDir string) error {
+	if err := validateBackendPolicy(backendDir); err != nil {
+		return err
+	}
+	set := token.NewFileSet()
+	packages, err := parser.ParseDir(set, backendDir, func(info os.FileInfo) bool { return strings.HasSuffix(info.Name(), ".go") }, 0)
+	if err != nil {
+		return fmt.Errorf("parse plugin source: %w", err)
+	}
+	for _, pkg := range packages {
+		for _, file := range pkg.Files {
+			for _, imported := range file.Imports {
+				path, _ := strconv.Unquote(imported.Path.Value)
+				if path == "path/filepath" {
+					return errors.New("plugin policy rejects direct filesystem traversal; use host.fs brokers")
+				}
+			}
+			var violation error
+			ast.Inspect(file, func(node ast.Node) bool {
+				selector, ok := node.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				identifier, ok := selector.X.(*ast.Ident)
+				if ok && identifier.Name == "os" && selector.Sel.Name != "Stdin" && selector.Sel.Name != "Stdout" {
+					violation = fmt.Errorf("plugin policy rejects os.%s; use a Host resource broker", selector.Sel.Name)
+					return false
+				}
+				return true
+			})
+			if violation != nil {
+				return violation
 			}
 		}
 	}

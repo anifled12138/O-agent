@@ -86,6 +86,17 @@ func TestReferenceV2ShapesDeclareOnlyRequestedSurfaces(t *testing.T) {
 	}
 }
 
+func TestStrictUISandboxRejectsRemoteAndActiveEscapePatterns(t *testing.T) {
+	for _, source := range []string{`<script src="https://evil.example/x.js"></script>`, `<a href="javascript:steal()">x</a>`, `navigator.serviceWorker.register('/worker.js')`, `new Function('return secret')`} {
+		if uiPolicyViolation([]byte(source)) == "" {
+			t.Fatalf("unsafe UI source was accepted: %s", source)
+		}
+	}
+	if violation := uiPolicyViolation([]byte(`<script>parent.postMessage({type:'axiom.ui.ready'}, '*')</script>`)); violation != "" {
+		t.Fatalf("reference bridge rejected: %s", violation)
+	}
+}
+
 func TestReferenceManifestPassesV2CompatibilityProjection(t *testing.T) {
 	legacy := referenceManifest(Project{Name: "Inspector", Slug: "inspector", Description: "Inspect workspace"})
 	raw, err := json.Marshal(legacy)

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"axiom.local/agent/internal/domain"
@@ -66,13 +68,18 @@ CREATE TABLE IF NOT EXISTS plugin_audit_events (
 );
 CREATE TABLE IF NOT EXISTS plugin_surface_states (
  user_id TEXT NOT NULL REFERENCES users(id), plugin_id TEXT NOT NULL, release_id TEXT NOT NULL REFERENCES plugin_releases(id),
- kind TEXT NOT NULL, surface_id TEXT NOT NULL, status TEXT NOT NULL, updated_at DATETIME NOT NULL,
+ kind TEXT NOT NULL, surface_id TEXT NOT NULL, status TEXT NOT NULL, registry_epoch INTEGER NOT NULL DEFAULT 0, updated_at DATETIME NOT NULL,
  PRIMARY KEY(user_id, plugin_id, kind, surface_id)
 );
 CREATE INDEX IF NOT EXISTS idx_plugin_surface_states_release ON plugin_surface_states(user_id, release_id);
 `
-	_, err := r.db.ExecContext(ctx, schema)
-	return err
+	if _, err := r.db.ExecContext(ctx, schema); err != nil {
+		return err
+	}
+	if _, err := r.db.ExecContext(ctx, `ALTER TABLE plugin_surface_states ADD COLUMN registry_epoch INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	return nil
 }
 
 func (r *Repository) CreateProject(ctx context.Context, p Project) error {
@@ -159,10 +166,40 @@ func scanRelease(row interface{ Scan(...any) error }) (Release, error) {
 		document, err = pluginmanifest.Decode(manifest)
 		if err == nil {
 			release.Manifest = document.Manifest
+			release.SourceVersion = document.SourceVersion
+			if bundleManifest, readErr := os.ReadFile(filepath.Join(release.BundleDir, "manifest.json")); readErr == nil {
+				if bundleDocument, decodeErr := pluginmanifest.Decode(bundleManifest); decodeErr == nil {
+					release.SourceVersion = bundleDocument.SourceVersion
+				}
+			}
 		}
 		release.TestReport = json.RawMessage(test)
 	}
 	return release, err
+}
+
+func (r *Repository) ActiveV1Installations(ctx context.Context) (int, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT r.bundle_dir FROM plugin_installations i JOIN plugin_releases r ON r.id=i.active_release_id WHERE i.status='active'`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var bundle string
+		if err := rows.Scan(&bundle); err != nil {
+			return 0, err
+		}
+		raw, readErr := os.ReadFile(filepath.Join(bundle, "manifest.json"))
+		if readErr != nil {
+			continue
+		}
+		document, decodeErr := pluginmanifest.Decode(raw)
+		if decodeErr == nil && document.SourceVersion == pluginmanifest.SourceV1 {
+			count++
+		}
+	}
+	return count, rows.Err()
 }
 func (r *Repository) Release(ctx context.Context, id string) (Release, error) {
 	release, err := scanRelease(r.db.QueryRowContext(ctx, `SELECT id,project_id,plugin_id,version,digest,bundle_dir,manifest_json,test_report_json,permission_hash,created_at FROM plugin_releases WHERE id=?`, id))
@@ -228,7 +265,7 @@ func (r *Repository) ActivateWithSurfaces(ctx context.Context, userID string, re
 		return installation, err
 	}
 	for _, surface := range surfaces {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO plugin_surface_states(user_id,plugin_id,release_id,kind,surface_id,status,updated_at) VALUES(?,?,?,?,?,'active',?) ON CONFLICT(user_id,plugin_id,kind,surface_id) DO UPDATE SET release_id=excluded.release_id,status='active',updated_at=excluded.updated_at`, userID, release.PluginID, release.ID, surface.Kind, surface.SurfaceID, now); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO plugin_surface_states(user_id,plugin_id,release_id,kind,surface_id,status,registry_epoch,updated_at) VALUES(?,?,?,?,?,'active',?,?) ON CONFLICT(user_id,plugin_id,kind,surface_id) DO UPDATE SET release_id=excluded.release_id,status='active',registry_epoch=excluded.registry_epoch,updated_at=excluded.updated_at`, userID, release.PluginID, release.ID, surface.Kind, surface.SurfaceID, surface.RegistryEpoch, now); err != nil {
 			return installation, err
 		}
 	}
@@ -257,7 +294,7 @@ func (r *Repository) SetInstallationStatus(ctx context.Context, userID, pluginID
 }
 
 func (r *Repository) SurfaceStates(ctx context.Context, userID string) ([]SurfaceState, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT user_id,plugin_id,release_id,kind,surface_id,status,updated_at FROM plugin_surface_states WHERE user_id=? ORDER BY plugin_id,kind,surface_id`, userID)
+	rows, err := r.db.QueryContext(ctx, `SELECT user_id,plugin_id,release_id,kind,surface_id,status,registry_epoch,updated_at FROM plugin_surface_states WHERE user_id=? ORDER BY plugin_id,kind,surface_id`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -265,12 +302,28 @@ func (r *Repository) SurfaceStates(ctx context.Context, userID string) ([]Surfac
 	result := []SurfaceState{}
 	for rows.Next() {
 		var item SurfaceState
-		if err := rows.Scan(&item.UserID, &item.PluginID, &item.ReleaseID, &item.Kind, &item.SurfaceID, &item.Status, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.UserID, &item.PluginID, &item.ReleaseID, &item.Kind, &item.SurfaceID, &item.Status, &item.RegistryEpoch, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+func (r *Repository) MarkRuntimeFailure(ctx context.Context, userID, pluginID, releaseID, message string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	if _, err = tx.ExecContext(ctx, `UPDATE plugin_surface_states SET status='failed',updated_at=? WHERE user_id=? AND plugin_id=? AND release_id=? AND kind IN ('runtime','service','tool','hook','job')`, now, userID, pluginID, releaseID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE plugin_projects SET last_error=?,updated_at=? WHERE id=(SELECT project_id FROM plugin_releases WHERE id=?)`, message, now, releaseID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (r *Repository) ListInstallations(ctx context.Context, userID string) ([]Installation, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT id,user_id,plugin_id,project_id,active_release_id,status,installed_at,updated_at FROM plugin_installations WHERE user_id=? ORDER BY updated_at DESC`, userID)

@@ -118,16 +118,17 @@ type ProjectView struct {
 }
 
 type Release struct {
-	ID             string                  `json:"id"`
-	ProjectID      string                  `json:"projectId"`
-	PluginID       string                  `json:"pluginId"`
-	Version        string                  `json:"version"`
-	Digest         string                  `json:"digest"`
-	BundleDir      string                  `json:"-"`
-	Manifest       pluginmanifest.Manifest `json:"manifest"`
-	TestReport     json.RawMessage         `json:"testReport"`
-	PermissionHash string                  `json:"permissionHash"`
-	CreatedAt      time.Time               `json:"createdAt"`
+	ID             string                       `json:"id"`
+	ProjectID      string                       `json:"projectId"`
+	PluginID       string                       `json:"pluginId"`
+	Version        string                       `json:"version"`
+	Digest         string                       `json:"digest"`
+	BundleDir      string                       `json:"-"`
+	Manifest       pluginmanifest.Manifest      `json:"manifest"`
+	TestReport     json.RawMessage              `json:"testReport"`
+	PermissionHash string                       `json:"permissionHash"`
+	CreatedAt      time.Time                    `json:"createdAt"`
+	SourceVersion  pluginmanifest.SourceVersion `json:"sourceVersion"`
 }
 
 type Installation struct {
@@ -142,35 +143,39 @@ type Installation struct {
 }
 
 type SurfaceState struct {
-	UserID    string    `json:"-"`
-	PluginID  string    `json:"pluginId"`
-	ReleaseID string    `json:"releaseId"`
-	Kind      string    `json:"kind"`
-	SurfaceID string    `json:"surfaceId"`
-	Status    string    `json:"status"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	UserID        string    `json:"-"`
+	PluginID      string    `json:"pluginId"`
+	ReleaseID     string    `json:"releaseId"`
+	Kind          string    `json:"kind"`
+	SurfaceID     string    `json:"surfaceId"`
+	Status        string    `json:"status"`
+	RegistryEpoch uint64    `json:"registryEpoch"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 type UIBinding struct {
-	PluginID  string            `json:"pluginId"`
-	ReleaseID string            `json:"releaseId"`
-	Version   string            `json:"version"`
-	UI        pluginmanifest.UI `json:"ui"`
+	PluginID      string            `json:"pluginId"`
+	ReleaseID     string            `json:"releaseId"`
+	Version       string            `json:"version"`
+	RegistryEpoch uint64            `json:"registryEpoch"`
+	UI            pluginmanifest.UI `json:"ui"`
 }
 
 type ServiceBinding struct {
-	PluginID  string                       `json:"pluginId"`
-	ReleaseID string                       `json:"releaseId"`
-	Version   string                       `json:"version"`
-	Service   pluginmanifest.ServiceExport `json:"service"`
+	PluginID      string                       `json:"pluginId"`
+	ReleaseID     string                       `json:"releaseId"`
+	Version       string                       `json:"version"`
+	RegistryEpoch uint64                       `json:"registryEpoch"`
+	Service       pluginmanifest.ServiceExport `json:"service"`
 }
 
 type SkillBinding struct {
-	PluginID  string                     `json:"pluginId"`
-	ReleaseID string                     `json:"releaseId"`
-	Version   string                     `json:"version"`
-	BundleDir string                     `json:"-"`
-	Skill     pluginmanifest.SkillExport `json:"skill"`
+	PluginID      string                     `json:"pluginId"`
+	ReleaseID     string                     `json:"releaseId"`
+	Version       string                     `json:"version"`
+	RegistryEpoch uint64                     `json:"registryEpoch"`
+	BundleDir     string                     `json:"-"`
+	Skill         pluginmanifest.SkillExport `json:"skill"`
 }
 
 type TurnLease interface {
@@ -180,11 +185,21 @@ type TurnLease interface {
 	Close()
 }
 
+type RuntimeEvent struct {
+	UserID    string
+	PluginID  string
+	ReleaseID string
+	Kind      string
+	Error     string
+	At        time.Time
+}
+
 type CapabilityBinding struct {
 	pluginmanifest.ToolExport
-	PluginID  string `json:"pluginId"`
-	ReleaseID string `json:"releaseId"`
-	Version   string `json:"version"`
+	PluginID      string `json:"pluginId"`
+	ReleaseID     string `json:"releaseId"`
+	Version       string `json:"version"`
+	RegistryEpoch uint64 `json:"registryEpoch"`
 }
 
 type AuditEvent struct {

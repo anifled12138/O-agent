@@ -64,7 +64,7 @@ func referenceManifestV2(p Project, shape string) pluginmanifest.Manifest {
 		Upgrade:     pluginmanifest.Upgrade{Strategy: "drain", PinActiveCalls: true, StateVersion: 1},
 	}
 	if shape == ShapeHybrid || shape == ShapeAgentTool || shape == ShapeService {
-		manifest.Runtime = &pluginmanifest.Runtime{Backend: &pluginmanifest.Backend{Artifact: "backend/plugin.exe", Protocol: "axiom.rpc/v1", ShutdownMillis: 10000}}
+		manifest.Runtime = &pluginmanifest.Runtime{Backend: &pluginmanifest.Backend{Artifact: "backend/plugin.exe", Protocol: "axiom.rpc/v2", ShutdownMillis: 10000}}
 	}
 	if shape == ShapeHybrid || shape == ShapeUI {
 		manifest.UI = &pluginmanifest.UI{Entry: "frontend/index.html", Assets: "frontend/**", Slots: []string{"workspace.main", "plugins.preview"}, Sandbox: "strict"}
@@ -101,7 +101,7 @@ func writeProjectV2(p Project, manifest pluginmanifest.Manifest, shape string) e
 			return err
 		}
 		files[filepath.Join(backendDir, "go.mod")] = []byte("module axiom.generated/" + p.Slug + "\n\ngo 1.27.0\n")
-		files[filepath.Join(backendDir, "main.go")] = []byte(referenceBackendSource)
+		files[filepath.Join(backendDir, "main.go")] = []byte(referenceBrokeredBackendSource)
 		files[filepath.Join(backendDir, "main_test.go")] = []byte(referenceBackendTest)
 	}
 	if manifest.UI != nil {
@@ -184,6 +184,73 @@ func runGit(dir string, args ...string) {
 	command.Dir = dir
 	_ = command.Run()
 }
+
+const referenceBrokeredBackendSource = `package main
+
+import (
+ "bufio"
+ "encoding/json"
+ "fmt"
+ "os"
+ "path"
+ "strings"
+)
+
+type request struct { ID string ` + "`json:\"id\"`" + `; Method string ` + "`json:\"method\"`" + `; Params json.RawMessage ` + "`json:\"params,omitempty\"`" + ` }
+type response struct { ID string ` + "`json:\"id\"`" + `; Result any ` + "`json:\"result,omitempty\"`" + `; Error string ` + "`json:\"error,omitempty\"`" + ` }
+type wireResponse struct { ID string ` + "`json:\"id\"`" + `; Result json.RawMessage ` + "`json:\"result\"`" + `; Error string ` + "`json:\"error\"`" + ` }
+type todo struct { File string ` + "`json:\"file\"`" + `; Line int ` + "`json:\"line\"`" + `; Text string ` + "`json:\"text\"`" + `; Kind string ` + "`json:\"kind\"`" + ` }
+type dirEntry struct { Name string ` + "`json:\"name\"`" + `; Directory bool ` + "`json:\"directory\"`" + `; Size int64 ` + "`json:\"size\"`" + ` }
+
+func main() {
+ scanner:=bufio.NewScanner(os.Stdin);scanner.Buffer(make([]byte,64<<10),1<<20)
+ encoder:=json.NewEncoder(os.Stdout)
+ for scanner.Scan(){
+  var req request
+  if err:=json.Unmarshal(scanner.Bytes(),&req);err!=nil{_ = encoder.Encode(response{Error:err.Error()});continue}
+  result,err:=handle(req,scanner,encoder);out:=response{ID:req.ID,Result:result}
+  if err!=nil{out.Result=nil;out.Error=err.Error()};_ = encoder.Encode(out)
+  if req.Method=="plugin.shutdown"{return}
+ }
+}
+
+func handle(req request,scanner *bufio.Scanner,encoder *json.Encoder)(any,error){
+ switch req.Method{
+ case "plugin.hello":return map[string]any{"protocol":"axiom.rpc/v2","status":"ready"},nil
+ case "plugin.health":return map[string]any{"status":"healthy","resources":"host-brokered"},nil
+ case "capabilities.list":return []string{"workspace.scan"},nil
+ case "plugin.shutdown":return map[string]any{"status":"stopping"},nil
+ case "ui.call":
+  var input struct{Operation string ` + "`json:\"operation\"`" + `};if err:=json.Unmarshal(req.Params,&input);err!=nil{return nil,err};if input.Operation!="scan"{return nil,fmt.Errorf("unknown UI operation %s",input.Operation)}
+  items,err:=scanTodos(scanner,encoder);return map[string]any{"count":len(items),"items":items},err
+ case "service.call":
+  var input struct{ServiceID string ` + "`json:\"_axiomServiceId\"`" + `; Principal string ` + "`json:\"principal\"`" + `; CallerPluginID string ` + "`json:\"callerPluginId\"`" + `; Input any ` + "`json:\"input\"`" + `};if err:=json.Unmarshal(req.Params,&input);err!=nil{return nil,err}
+  return map[string]any{"serviceId":input.ServiceID,"principal":input.Principal,"callerPluginId":input.CallerPluginID,"input":input.Input,"ready":true},nil
+ case "capability.invoke":items,err:=scanTodos(scanner,encoder);return map[string]any{"count":len(items),"items":items},err
+ default:return nil,fmt.Errorf("unknown method %s",req.Method)
+ }
+}
+
+func brokerCall(scanner *bufio.Scanner,encoder *json.Encoder,id,method string,input any,output any)error{
+ raw,_:=json.Marshal(input);if err:=encoder.Encode(request{ID:id,Method:method,Params:raw});err!=nil{return err}
+ if !scanner.Scan(){return fmt.Errorf("host broker closed")};var result wireResponse;if err:=json.Unmarshal(scanner.Bytes(),&result);err!=nil{return err};if result.ID!=id{return fmt.Errorf("host broker response mismatch")};if result.Error!=""{return fmt.Errorf("%s",result.Error)};return json.Unmarshal(result.Result,output)
+}
+
+func scanTodos(host *bufio.Scanner,encoder *json.Encoder)([]todo,error){
+ result:=[]todo{};requestID:=0
+ var walk func(string)error
+ walk=func(directory string)error{
+  requestID++;var listing struct{Entries []dirEntry ` + "`json:\"entries\"`" + `};if err:=brokerCall(host,encoder,fmt.Sprintf("fs_%d",requestID),"host.fs.list",map[string]any{"scope":"${workspace}","path":directory},&listing);err!=nil{return err}
+  for _,entry:=range listing.Entries{relative:=entry.Name;if directory!="."{relative=path.Join(directory,entry.Name)};if entry.Directory{if !ignoredDir(entry.Name){if err:=walk(relative);err!=nil{return err}};continue};if entry.Size>1<<20||!textExtension(path.Ext(relative)){continue}
+   requestID++;var file struct{Content string ` + "`json:\"content\"`" + `};if err:=brokerCall(host,encoder,fmt.Sprintf("fs_%d",requestID),"host.fs.read",map[string]any{"scope":"${workspace}","path":relative},&file);err!=nil{continue};scanner:=bufio.NewScanner(strings.NewReader(file.Content));line:=0
+   for scanner.Scan(){line++;text:=scanner.Text();upper:=strings.ToUpper(text);kind:="";if strings.Contains(upper,"TODO"){kind="TODO"}else if strings.Contains(upper,"FIXME"){kind="FIXME"};if kind!=""{result=append(result,todo{File:relative,Line:line,Text:strings.TrimSpace(text),Kind:kind});if len(result)>=500{return nil}}}
+  };return nil
+ }
+ if err:=walk(".");err!=nil{return nil,err};return result,nil
+}
+func textExtension(extension string)bool{switch strings.ToLower(extension){case ".go",".ts",".tsx",".js",".md",".py",".rs":return true};return false}
+func ignoredDir(name string)bool{switch strings.ToLower(name){case ".git","node_modules","data","dist",".next",".npm-cache","plugin-store","work":return true};return false}
+`
 
 const referenceBackendSource = `package main
 

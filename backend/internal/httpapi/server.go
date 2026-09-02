@@ -65,10 +65,18 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/plugin-runtime/installations", s.requireUser(http.HandlerFunc(s.runtimeInstallationList)))
 	mux.Handle("GET /api/v1/plugin-runtime/capabilities", s.requireUser(http.HandlerFunc(s.runtimeCapabilityList)))
 	mux.Handle("GET /api/v1/plugin-runtime/surfaces", s.requireUser(http.HandlerFunc(s.runtimeSurfaceList)))
+	mux.Handle("GET /api/v1/plugin-runtime/migration", s.requireUser(http.HandlerFunc(s.runtimeMigrationStatus)))
 	mux.Handle("GET /api/v1/plugin-runtime/ui/{plugin}", s.requireUser(http.HandlerFunc(s.runtimeUIGet)))
 	mux.Handle("POST /api/v1/plugin-runtime/ui/{plugin}/call", s.requireUser(http.HandlerFunc(s.runtimeUICall)))
+	mux.Handle("POST /api/v1/plugin-runtime/ui/{plugin}/services/{service}/call", s.requireUser(http.HandlerFunc(s.runtimeUIServiceCall)))
+	mux.Handle("POST /api/v1/plugin-runtime/ui/{plugin}/legacy-invoke", s.requireUser(http.HandlerFunc(s.runtimeLegacyUIInvoke)))
 	mux.Handle("POST /api/v1/plugin-runtime/capabilities/{id}/invoke", s.requireUser(http.HandlerFunc(s.runtimeInvoke)))
 	mux.Handle("GET /api/v1/plugin-assets/{release}/{path...}", s.requireUser(http.HandlerFunc(s.pluginAsset)))
+	mux.Handle("GET /api/v2/ui/slots", s.requireUser(http.HandlerFunc(s.runtimeUISlots)))
+	mux.Handle("POST /api/v2/ui/plugins/{plugin}/call", s.requireUser(http.HandlerFunc(s.runtimeUICall)))
+	mux.Handle("POST /api/v2/ui/plugins/{plugin}/services/{service}/call", s.requireUser(http.HandlerFunc(s.runtimeUIServiceCall)))
+	mux.Handle("GET /api/v2/plugin-assets/{release}/{path...}", s.requireUser(http.HandlerFunc(s.pluginAsset)))
+	mux.Handle("GET /api/v2/agent/runs/{id}/trace", s.requireUser(http.HandlerFunc(s.conversationTrace)))
 	return s.recoverer(s.cors(s.logging(mux)))
 }
 
@@ -320,6 +328,15 @@ func (s *Server) runtimeSurfaceList(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, items)
 }
 
+func (s *Server) runtimeMigrationStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := s.forge.MigrationStatus(r.Context())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, status)
+}
+
 func (s *Server) runtimeUIGet(w http.ResponseWriter, r *http.Request) {
 	binding, ok := s.forge.UIBinding(currentUser(r).ID, r.PathValue("plugin"))
 	if !ok {
@@ -327,6 +344,10 @@ func (s *Server) runtimeUIGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusOK, binding)
+}
+
+func (s *Server) runtimeUISlots(w http.ResponseWriter, r *http.Request) {
+	write(w, http.StatusOK, s.forge.UIBindings(currentUser(r).ID))
 }
 
 func (s *Server) runtimeUICall(w http.ResponseWriter, r *http.Request) {
@@ -338,6 +359,37 @@ func (s *Server) runtimeUICall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := s.forge.UICall(r.Context(), currentUser(r).ID, r.PathValue("plugin"), in.Operation, in.Input)
+	if err != nil {
+		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"output": result})
+}
+
+func (s *Server) runtimeUIServiceCall(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	result, err := s.forge.UIServiceCall(r.Context(), currentUser(r).ID, r.PathValue("plugin"), r.PathValue("service"), in.Input)
+	if err != nil {
+		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"output": result})
+}
+
+func (s *Server) runtimeLegacyUIInvoke(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		CapabilitySuffix string          `json:"capabilitySuffix"`
+		Input            json.RawMessage `json:"input"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	result, err := s.forge.LegacyUICall(r.Context(), currentUser(r).ID, r.PathValue("plugin"), in.CapabilitySuffix, in.Input)
 	if err != nil {
 		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
