@@ -4,6 +4,12 @@
 
 日期：2026-09-05
 
+> 产品方向更新：本文的桌面客户端、Plugin Runtime、权限和存储设计继续作为
+> 基础架构参考；其中固定以 `react.v1` 为中心、以 Plugin Forge 为自举终点的
+> 产品假设，已由
+> [`prd-recursive-bootstrap-agent-v0.1.md`](prd-recursive-bootstrap-agent-v0.1.md)
+> 中的版本化 Agent Generation、递归自举和 Eval Harness 方向取代。
+
 本文定义 Axiom 下一阶段的产品目标、系统边界和工程路线。它不是对当前
 实现的描述，而是后续实现应收敛到的目标架构。已有 Plugin Runtime V2
 继续保留，并作为新架构的能力底座之一。
