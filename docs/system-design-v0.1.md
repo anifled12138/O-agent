@@ -196,37 +196,38 @@ Plugin UI 通过受类型约束的 Client Bridge 调用已授权 Service。需�
 
 ## 6. Agent 推理内核
 
-### 6.1 核心不是固定 ReAct 循环
+### 6.1 V1 默认核心：可替换的 ReAct 式 AgentLoop
 
-当前“模型调用—Tool 调用—继续模型调用”的循环只能作为最小执行模式。
-目标内核采用 **Adaptive Deliberation Graph（ADG，自适应推理执行图）**。
+V1 不自创未经验证的推理范式。默认采用经过广泛实践的 ReAct 式循环：模型
+读取当前上下文，决定回答或调用 Tool，Host 执行 Tool 并把观察结果追加到会话，
+模型继续推理，直到完成、取消、需要批准或达到预算。
 
-ADG 不要求每个任务都先生成一份大计划，也不要求所有任务使用相同循环。
-Host 根据任务风险、长度、未知程度和模型能力选择执行深度：
+ReAct 在这里是执行模式，不是外部框架依赖。Host 自己持有会话事实、权限、
+预算、取消、重试和 Tool 调度；具体 AgentLoop 通过稳定接口替换：
 
 ```text
-用户输入
-   │
-   ▼
-Intent Compiler ──► Scope & Risk Classifier
-   │                         │
-   ▼                         ▼
-Fast Path              Deliberative Path
-直接回答/单工具        建图/探索/执行/验证
-   │                         │
-   └────────────┬────────────┘
-                ▼
-          Evidence Gate
-                │
-          Commit / Recover
-                │
-                ▼
-             用户结果
+Prompt Inbox -> Context Compile -> Model Stream
+                                  |          |
+                                  | answer   | tool calls
+                                  v          v
+                              Complete <- Guarded Tool Dispatch
+                                              |
+                                              v
+                                      Append Observation
+                                              |
+                                              +----> next model step
 ```
 
-### 6.2 ADG 节点
+首个实现命名为 `react.v1`。AgentLoop 只决定“下一步做什么”，不能绕过
+Capability Registry、Policy、Approval、Resource Broker 和 Event Store。
 
-一个 Run 由 Host 管理的节点组成：
+### 6.2 未来候选：ADG 节点
+
+Adaptive Deliberation Graph（ADG，自适应推理执行图）保留为复杂长任务的
+研究草案，不是 V1 前置条件，也不默认进入生产路径。只有在核心运行稳定并且
+证据表明 ReAct 式循环无法满足任务需求后，才通过新的 AgentLoop 实现引入。
+
+若未来启用 ADG，一个 Run 可由 Host 管理的节点组成：
 
 ```go
 type Node struct {
@@ -256,7 +257,7 @@ type Node struct {
 - `checkpoint`：提交可恢复状态；
 - `recover`：处理失败和重新规划。
 
-### 6.3 决策协议
+### 6.3 ADG 候选的决策协议
 
 模型不直接控制调度器。每轮模型输出结构化 `DecisionEnvelope`：
 
@@ -275,7 +276,7 @@ Host 校验节点、依赖、预算、权限和 Capability 合约后才提交到
 不支持可靠结构化输出的模型，由 Provider Adapter 使用受限 Tool Calling
 协议转换，而不是解析任意 Markdown。
 
-### 6.4 自适应推理深度
+### 6.4 ADG 候选的自适应推理深度
 
 Run Engine 计算 `DeliberationProfile`：
 
@@ -769,7 +770,7 @@ Broker、UI 隔离和供应链验证都是必需项，不能依赖静态代码�
 | 领域 | 当前状态 | 目标状态 |
 | --- | --- | --- |
 | 客户端 | 浏览器单页 | 安装型桌面客户端、托盘、通知、长期任务 |
-| Agent | 固定 12 步 Tool Loop | ADG、节点状态机、预算、验证和恢复 |
+| Agent | 固定 12 步 Tool Loop | 可恢复的 `react.v1`、稳定 AgentLoop 接口、预算和取消 |
 | 上下文 | 最近消息字符截断 | Context Plan、Artifact、来源和结构化压缩 |
 | Provider | OpenAI-compatible | 多协议 Adapter、能力协商和路由 |
 | MCP | 尚未成为一等 Surface | 延迟启动、发现、Resource 和 Tool Bridge |
@@ -791,13 +792,13 @@ Broker、UI 隔离和供应链验证都是必需项，不能依赖静态代码�
 
 验收：关闭窗口后长期 Run 继续；重新打开可恢复完整状态。
 
-### Phase B：Event Store 与 Run Graph
+### Phase B：Event Store 与 Run Runtime
 
-- 定义 Run、Node、Effect、Artifact、Evidence 和 Checkpoint；
+- 定义 Run、Step、Effect、Artifact、Evidence 和 Checkpoint；
 - 建立追加 Event 与 Projection；
 - 将现有 Turn Trace 迁移到 Run Event；
-- 实现取消、暂停、恢复和节点级重试；
-- 保留兼容 Fast Path。
+- 实现 `react.v1`、取消、暂停、恢复和步骤级重试；
+- 提供稳定 AgentLoop 接口，但首阶段不实现图调度器。
 
 验收：任意步骤杀死 Host，重启后从最后安全 Checkpoint 恢复。
 
@@ -849,11 +850,11 @@ Broker、UI 隔离和供应链验证都是必需项，不能依赖静态代码�
 
 1. 新建桌面 Shell 并复用现有 UI；
 2. 将对话请求改为流式 Run Event；
-3. 建立 Run 和 Node 数据模型；
-4. 实现 Fast Path、Standard Path 两种 DeliberationProfile；
-5. 将 Tool 调用包装为 Node，并增加确定性 Verify Node；
+3. 建立 Run、Step 和追加事件模型；
+4. 实现可替换的 `react.v1` AgentLoop；
+5. 将 Tool 调用包装为可审计 Step，并保存结果证据；
 6. 支持暂停、取消、Host 重启恢复；
-7. 在客户端展示执行图和证据；
+7. 在客户端展示执行时间线和证据；
 8. 保持现有 Plugin Runtime 和延迟 Capability 兼容。
 
 完成这一里程碑后，Axiom 才从“能调用 Plugin 的聊天应用”进入“可靠运行
@@ -869,6 +870,8 @@ Broker、UI 隔离和供应链验证都是必需项，不能依赖静态代码�
 - WASM 是否作为 Sidecar 之外的第二种 backend runtime；
 - 用户永久记忆默认关闭还是首次引导时选择；
 - 高风险 Tool 是否支持组织级 Policy 和远程审批。
+- TODO（核心稳定后）：用同一任务集比较 `react.v1`、Eino ReAct 和图式
+  Planner；在有证据前，不把 ADG 或多 Agent 编排设为默认内核。
 
 这些选择不改变核心不变量：Host 持有状态和权限、执行以证据提交、能力按需
 进入上下文、扩展通过不可变 Plugin Release 安装。
