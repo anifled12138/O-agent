@@ -22,6 +22,8 @@ storage, authentication, model providers, the agent loop, and transports.
 The current plugin architecture is documented in
 [`docs/plugin-runtime-implementation.md`](docs/plugin-runtime-implementation.md)
 and designed in [`docs/adr/0002-plugin-surfaces-and-agent-visibility.md`](docs/adr/0002-plugin-surfaces-and-agent-visibility.md).
+The target desktop product and Agent runtime architecture is drafted in
+[`docs/system-design-v0.1.md`](docs/system-design-v0.1.md).
 
 ## Run locally
 
