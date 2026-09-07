@@ -13,8 +13,11 @@ import (
 
 	"axiom.local/agent/internal/agent"
 	"axiom.local/agent/internal/auth"
+	"axiom.local/agent/internal/bootstrap"
 	"axiom.local/agent/internal/config"
 	"axiom.local/agent/internal/core"
+	"axiom.local/agent/internal/evalharness"
+	"axiom.local/agent/internal/evolution"
 	"axiom.local/agent/internal/httpapi"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/pluginruntime"
@@ -43,6 +46,7 @@ func run() error {
 	var store *storage.Store
 	var forgeRepo *pluginforge.Repository
 	var forgeRuntime *pluginruntime.Supervisor
+	var evalService *evalharness.Service
 	register(plugins, &core.Component{Info: core.Manifest{ID: "core.storage.sqlite", Version: "0.1.0", Description: "Local transactional state", Capabilities: []string{"storage.sql", "storage.migrations"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		var err error
 		store, err = storage.Open(cfg.DataDir)
@@ -76,7 +80,14 @@ func run() error {
 		}
 		return h.Provide("providers", provider.New(st, vault))
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.agent.v1", Version: "0.1.0", Description: "Persistent provider-neutral reasoning loop", Requires: []string{"core.storage.sqlite", "provider.openai-compatible", "runtime.plugin-forge.v1"}, Capabilities: []string{"agent.conversation", "agent.turn", "agent.tools"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.evolution.v1", Version: "0.1.0", Description: "Versioned Agent Definitions and generations", Requires: []string{"core.storage.sqlite"}, Capabilities: []string{"agent.definition", "agent.generation", "frontier.challenge"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+		st, err := core.Service[*storage.Store](h, "storage")
+		if err != nil {
+			return err
+		}
+		return h.Provide("evolution", evolution.New(st))
+	}})
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.agent.v1", Version: "0.2.0", Description: "Generation-pinned provider-neutral Agent runtime", Requires: []string{"core.storage.sqlite", "provider.openai-compatible", "runtime.plugin-forge.v1", "runtime.evolution.v1"}, Capabilities: []string{"agent.conversation", "agent.turn", "agent.tools", "agent.definition-runtime"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		st, err := core.Service[*storage.Store](h, "storage")
 		if err != nil {
 			return err
@@ -89,7 +100,11 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		return h.Provide("agent", agent.New(st, providers, forge))
+		evolutionService, err := core.Service[*evolution.Service](h, "evolution")
+		if err != nil {
+			return err
+		}
+		return h.Provide("agent", agent.New(st, providers, forge, evolutionService))
 	}})
 	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.plugin-forge.v1", Version: "0.1.0", Description: "User-controlled full-stack plugin forge and sidecar runtime", Requires: []string{"core.storage.sqlite"}, Capabilities: []string{"plugin.generate", "plugin.build", "plugin.approve", "plugin.install", "plugin.invoke"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		var err error
@@ -110,7 +125,37 @@ func run() error {
 	}, StopFn: func(context.Context) error {
 		return errors.Join(forgeRuntime.Close(), forgeRepo.Close())
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "transport.http.v1", Version: "0.1.0", Description: "Local product API", Requires: []string{"core.auth.local", "runtime.agent.v1", "runtime.plugin-forge.v1"}, Capabilities: []string{"transport.http"}}})
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.eval-harness.v1", Version: "0.1.0", Description: "Paired A/B evaluation gate for Agent generations", Requires: []string{"core.storage.sqlite", "runtime.agent.v1", "runtime.evolution.v1"}, Capabilities: []string{"eval.paired", "eval.report", "agent.promotion-gate"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+		st, err := core.Service[*storage.Store](h, "storage")
+		if err != nil {
+			return err
+		}
+		evolutionService, err := core.Service[*evolution.Service](h, "evolution")
+		if err != nil {
+			return err
+		}
+		agentService, err := core.Service[*agent.Service](h, "agent")
+		if err != nil {
+			return err
+		}
+		evalService = evalharness.New(st, evolutionService, agentService)
+		return h.Provide("eval-harness", evalService)
+	}, StopFn: func(context.Context) error {
+		evalService.Close()
+		return nil
+	}})
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.bootstrap.v1", Version: "0.1.0", Description: "Model-assisted bounded Agent Definition candidate generation", Requires: []string{"provider.openai-compatible", "runtime.evolution.v1"}, Capabilities: []string{"agent.self-bootstrap", "agent.candidate-generation"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+		evolutionService, err := core.Service[*evolution.Service](h, "evolution")
+		if err != nil {
+			return err
+		}
+		providers, err := core.Service[*provider.Service](h, "providers")
+		if err != nil {
+			return err
+		}
+		return h.Provide("bootstrap", bootstrap.New(evolutionService, providers))
+	}})
+	register(plugins, &core.Component{Info: core.Manifest{ID: "transport.http.v1", Version: "0.2.0", Description: "Local product API", Requires: []string{"core.auth.local", "runtime.agent.v1", "runtime.plugin-forge.v1", "runtime.eval-harness.v1", "runtime.bootstrap.v1"}, Capabilities: []string{"transport.http"}}})
 	if err := plugins.StartAll(ctx); err != nil {
 		return err
 	}
@@ -124,8 +169,11 @@ func run() error {
 	authService, _ := core.Service[*auth.Service](host, "auth")
 	providerService, _ := core.Service[*provider.Service](host, "providers")
 	agentService, _ := core.Service[*agent.Service](host, "agent")
+	evolutionService, _ := core.Service[*evolution.Service](host, "evolution")
+	evalHarnessService, _ := core.Service[*evalharness.Service](host, "eval-harness")
+	bootstrapService, _ := core.Service[*bootstrap.Service](host, "bootstrap")
 	forgeService, _ := core.Service[*pluginforge.Service](host, "plugin-forge")
-	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(authService, providerService, agentService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(authService, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErrors := make(chan error, 1)
 	go func() {
 		slog.Info("axiom ready", "address", "http://"+cfg.Addr, "data", absoluteData)

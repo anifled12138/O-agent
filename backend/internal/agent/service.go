@@ -10,21 +10,21 @@ import (
 	"time"
 
 	"axiom.local/agent/internal/domain"
+	"axiom.local/agent/internal/evolution"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/storage"
 )
 
-const systemPrompt = `You are Axiom, a local-first engineering agent. Be direct, evidence-driven, and explicit about uncertainty. Use tools when they materially improve the result. Never claim a tool ran unless its result is present. You may propose, generate, and test plugins when a durable capability is missing. Permission approval is reserved for the user; installation only succeeds for an already-approved immutable release.`
-
 type Service struct {
 	store     *storage.Store
 	providers *provider.Service
 	forge     *pluginforge.Service
+	evolution *evolution.Service
 }
 
-func New(store *storage.Store, providers *provider.Service, forge *pluginforge.Service) *Service {
-	return &Service{store: store, providers: providers, forge: forge}
+func New(store *storage.Store, providers *provider.Service, forge *pluginforge.Service, evolutionService *evolution.Service) *Service {
+	return &Service{store: store, providers: providers, forge: forge, evolution: evolutionService}
 }
 func (s *Service) List(ctx context.Context, userID string) ([]domain.Conversation, error) {
 	return s.store.ListConversations(ctx, userID)
@@ -45,7 +45,16 @@ func (s *Service) Create(ctx context.Context, userID, title, providerID string) 
 	}
 	now := time.Now().UTC()
 	c := domain.Conversation{ID: id("run"), UserID: userID, Title: title, ProviderID: providerID, CreatedAt: now, UpdatedAt: now}
-	return c, s.store.CreateConversation(ctx, c)
+	generation, err := s.evolution.Stable(ctx, userID)
+	if err != nil {
+		return domain.Conversation{}, err
+	}
+	if err := s.store.CreateConversationWithGeneration(ctx, c, generation); err != nil {
+		return domain.Conversation{}, err
+	}
+	c.AgentGenerationID = generation.ID
+	c.AgentDefinitionDigest = generation.DefinitionDigest
+	return c, nil
 }
 func (s *Service) Turn(ctx context.Context, userID, conversationID, content string) (domain.Message, error) {
 	content = strings.TrimSpace(content)
@@ -61,41 +70,41 @@ func (s *Service) Turn(ctx context.Context, userID, conversationID, content stri
 	if err != nil {
 		return domain.Message{}, err
 	}
-	messages, omitted := buildContext(detail)
+	generation, err := s.evolution.ConversationGeneration(ctx, userID, conversationID)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	messages, omitted := buildContext(detail, generation)
 	scope := newTurnScope(s, userID)
 	defer scope.Close()
 	trace := newTraceRecorder(ctx, s.store, userID, conversationID)
-	trace.emit("turn.started", map[string]any{"messageCount": len(detail.Messages), "omittedMessages": omitted, "pinnedTools": len(scope.tools), "pinnedSkills": len(scope.skills)})
-	var reply string
-	for step := 0; step < 12; step++ {
-		definitions := scope.definitions()
-		trace.emit("model.requested", map[string]any{"step": step + 1, "messageCount": len(messages), "toolDefinitionCount": len(definitions)})
-		completion, completeErr := s.providers.CompleteWithTools(ctx, userID, detail.ProviderID, messages, definitions)
-		if completeErr != nil {
-			trace.emit("model.failed", map[string]any{"step": step + 1, "error": completeErr.Error()})
-			return domain.Message{}, completeErr
-		}
-		trace.emit("model.completed", map[string]any{"step": step + 1, "toolCallCount": len(completion.ToolCalls), "contentBytes": len(completion.Content)})
-		if len(completion.ToolCalls) == 0 {
-			reply = strings.TrimSpace(completion.Content)
-			break
-		}
-		messages = append(messages, provider.ChatMessage{Role: "assistant", Content: completion.Content, ToolCalls: completion.ToolCalls})
-		for _, call := range completion.ToolCalls {
-			started := time.Now()
-			trace.emit("tool.started", map[string]any{"step": step + 1, "toolCallId": call.ID, "name": call.Function.Name, "argumentBytes": len(call.Function.Arguments)})
-			result := scope.execute(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments))
-			trace.emit("tool.completed", map[string]any{"step": step + 1, "toolCallId": call.ID, "name": call.Function.Name, "resultBytes": len(result), "durationMillis": time.Since(started).Milliseconds(), "ok": toolResultOK(result)})
-			messages = append(messages, provider.ChatMessage{Role: "tool", ToolCallID: call.ID, Content: string(result)})
-		}
+	trace.emit("turn.started", map[string]any{"messageCount": len(detail.Messages), "omittedMessages": omitted, "pinnedTools": len(scope.tools), "pinnedSkills": len(scope.skills), "generationId": generation.ID, "definitionDigest": generation.DefinitionDigest, "strategy": generation.Definition.Spec.Strategy})
+	result, err := executeLoop(ctx, s.providers, loopRequest{UserID: userID, ProviderID: detail.ProviderID, Generation: generation, Messages: messages, Scope: scope, Emit: trace.emit})
+	if err != nil {
+		return domain.Message{}, err
 	}
-	if reply == "" {
-		reply = "I reached the tool execution limit for this turn. The completed tool results are preserved in the current run; continue the mission to resume."
-	}
-	assistant := domain.Message{ID: id("msg"), ConversationID: conversationID, Role: "assistant", Content: reply, CreatedAt: time.Now().UTC()}
+	assistant := domain.Message{ID: id("msg"), ConversationID: conversationID, Role: "assistant", Content: result.Reply, CreatedAt: time.Now().UTC()}
 	err = s.store.AddMessage(ctx, userID, assistant)
-	trace.emit("turn.completed", map[string]any{"replyBytes": len(reply), "persisted": err == nil})
+	trace.emit("turn.completed", map[string]any{"replyBytes": len(result.Reply), "persisted": err == nil, "metrics": result.Metrics, "generationId": generation.ID})
 	return assistant, err
+}
+
+// RunEvaluation executes one immutable generation without writing conversation
+// messages. The evaluation scope excludes creator actions and any capability
+// that is not declared workspace-readonly.
+func (s *Service) RunEvaluation(ctx context.Context, userID, providerID string, generation domain.AgentGeneration, prompt string) (string, domain.RunMetrics, error) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "", domain.RunMetrics{}, domain.ErrInvalid
+	}
+	scope := newEvaluationScope(s, userID)
+	defer scope.Close()
+	messages := []provider.ChatMessage{
+		{Role: "system", Content: generation.Definition.Spec.SystemPrompt + "\n\nEvaluation mode: work only through the exposed read-only capabilities. Return the actual task result, not a description of this evaluation."},
+		{Role: "user", Content: prompt},
+	}
+	result, err := executeLoop(ctx, s.providers, loopRequest{UserID: userID, ProviderID: providerID, Generation: generation, Messages: messages, Scope: scope})
+	return result.Reply, result.Metrics, err
 }
 
 func tool(name, description, schema string) provider.ToolDefinition {

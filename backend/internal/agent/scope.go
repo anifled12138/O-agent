@@ -41,9 +41,24 @@ type turnScope struct {
 }
 
 func newTurnScope(owner *Service, userID string) *turnScope {
+	return newScopedTurn(owner, userID, false)
+}
+
+func newEvaluationScope(owner *Service, userID string) *turnScope {
+	return newScopedTurn(owner, userID, true)
+}
+
+func newScopedTurn(owner *Service, userID string, evaluation bool) *turnScope {
 	lease := owner.forge.BeginTurn(userID)
-	scope := &turnScope{owner: owner, userID: userID, lease: lease, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creatorTools(), loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}}
+	creator := creatorTools()
+	if evaluation {
+		creator = map[string]provider.ToolDefinition{}
+	}
+	scope := &turnScope{owner: owner, userID: userID, lease: lease, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}}
 	for _, binding := range lease.Capabilities() {
+		if evaluation && binding.Risk != "workspace-readonly" {
+			continue
+		}
 		scope.tools[binding.ID] = binding
 		if binding.Visibility == "always" {
 			scope.loadPluginTool(binding)

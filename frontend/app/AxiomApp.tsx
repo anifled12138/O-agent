@@ -1,10 +1,11 @@
 'use client';
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import EvolutionCenter from './EvolutionCenter';
 
 type User = { id: string; email: string; displayName: string };
-type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; hasApiKey: boolean };
-type Conversation = { id: string; title: string; providerId: string; updatedAt: string };
+export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; hasApiKey: boolean };
+type Conversation = { id: string; title: string; providerId: string; agentGenerationId?: string; agentDefinitionDigest?: string; updatedAt: string };
 type Message = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string };
 type ConversationDetail = Conversation & { messages: Message[] };
 type Plugin = { id: string; version: string; description: string; state: string; capabilities: string[] };
@@ -19,7 +20,7 @@ type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8080/api/v1';
 const ASSET_ORIGIN = new URL(API).origin;
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, { ...init, credentials: 'include', headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
@@ -38,6 +39,7 @@ export default function AxiomApp() {
   const [active, setActive] = useState<ConversationDetail | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [pluginsOpen, setPluginsOpen] = useState(false);
+  const [evolutionOpen, setEvolutionOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState('');
   const [trace, setTrace] = useState<TraceEvent[]>([]);
@@ -91,11 +93,12 @@ export default function AxiomApp() {
   if (loading) return <Splash />;
   if (!user) return <AuthScreen onAuthenticated={async (next) => { setUser(next); await hydrate(); }} />;
   return <main className="app-shell">
-    <Sidebar user={user} conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} onLogout={async () => { await request('/auth/logout', { method: 'POST' }); setUser(null); }} />
+    <Sidebar user={user} conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onEvolution={() => setEvolutionOpen(true)} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} onLogout={async () => { await request('/auth/logout', { method: 'POST' }); setUser(null); }} />
     <section className="workspace"><header className="workspace-header"><div><span className="eyebrow">LOCAL AGENT / MISSION</span><h1>{active?.title ?? 'Untitled workspace'}</h1></div><div className="header-actions"><span className="status-pill"><i /> runtime online</span><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Open settings">⌘</button></div></header>
       <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} onSend={send} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} trace={trace} /></div>
     </section>
     {settingsOpen && <Settings providers={providers} onClose={() => setSettingsOpen(false)} onSaved={(next) => { setProviders((items) => items.some((item) => item.id === next.id) ? items.map((item) => item.id === next.id ? next : item) : [next, ...items]); setNotice('Provider saved'); }} />}
+    {evolutionOpen && <EvolutionCenter providers={providers} onClose={() => setEvolutionOpen(false)} />}
     {pluginsOpen && <PluginCenter onClose={() => setPluginsOpen(false)} />}
   </main>;
 }
@@ -113,8 +116,8 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: User) => Prom
     <section className="auth-panel"><div className="auth-box"><span className="step-label">01 / IDENTITY</span><h2>{mode === 'register' ? 'Create your local operator' : 'Welcome back'}</h2><p>{mode === 'register' ? 'This account exists only in your Axiom instance.' : 'Continue your local missions.'}</p><form onSubmit={submit}>{mode === 'register' && <label>DISPLAY NAME<input name="displayName" placeholder="Operator" required /></label>}<label>EMAIL<input name="email" type="email" placeholder="you@example.com" required /></label><label>PASSWORD<input name="password" type="password" minLength={10} placeholder="10+ characters" required /></label>{error && <div className="form-error">{error}</div>}<button className="primary-button" disabled={busy}>{busy ? 'Working…' : mode === 'register' ? 'Initialize workspace' : 'Enter workspace'}<span>→</span></button></form><button className="text-button" onClick={() => { setMode(mode === 'register' ? 'login' : 'register'); setError(''); }}>{mode === 'register' ? 'Already initialized? Sign in' : 'Need a local account? Create one'}</button></div></section></main>;
 }
 
-function Sidebar({ user, conversations, activeId, onNew, onOpen, onPlugins, onSettings, onLogout }: { user: User; conversations: Conversation[]; activeId?: string; onNew: () => void; onOpen: (id: string) => void; onPlugins: () => void; onSettings: () => void; onLogout: () => void }) {
-  return <aside className="sidebar"><div className="brand"><div className="brand-mark">A</div><span>AXIOM</span><small>0.1</small></div><button className="new-button" onClick={onNew}><span>＋</span> New mission <kbd>⌘ N</kbd></button><nav><p>MISSIONS</p>{conversations.length === 0 ? <div className="empty-nav">No missions yet.<br/>Start with an objective.</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onPlugins}><i>◇</i><span>Plugin Forge</span></button><button onClick={onSettings}><i>⚙</i><span>Provider settings</span></button><div className="operator"><span>{user.displayName.slice(0,2).toUpperCase()}</span><div><b>{user.displayName}</b><small>{user.email}</small></div><button onClick={onLogout} title="Sign out">↗</button></div></div></aside>;
+function Sidebar({ user, conversations, activeId, onNew, onOpen, onEvolution, onPlugins, onSettings, onLogout }: { user: User; conversations: Conversation[]; activeId?: string; onNew: () => void; onOpen: (id: string) => void; onEvolution: () => void; onPlugins: () => void; onSettings: () => void; onLogout: () => void }) {
+  return <aside className="sidebar"><div className="brand"><div className="brand-mark">A</div><span>AXIOM</span><small>0.2</small></div><button className="new-button" onClick={onNew}><span>＋</span> New mission <kbd>⌘ N</kbd></button><nav><p>MISSIONS</p>{conversations.length === 0 ? <div className="empty-nav">No missions yet.<br/>Start with an objective.</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onEvolution}><i>⌁</i><span>Evolution Lab</span></button><button onClick={onPlugins}><i>◇</i><span>Plugin Forge</span></button><button onClick={onSettings}><i>⚙</i><span>Provider settings</span></button><div className="operator"><span>{user.displayName.slice(0,2).toUpperCase()}</span><div><b>{user.displayName}</b><small>{user.email}</small></div><button onClick={onLogout} title="Sign out">↗</button></div></div></aside>;
 }
 
 function Chat({ active, providers, sending, notice, onSend, onConfigure }: { active: ConversationDetail | null; providers: Provider[]; sending: boolean; notice: string; onSend: (content: string) => void; onConfigure: () => void }) {

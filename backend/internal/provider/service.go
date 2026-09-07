@@ -51,6 +51,13 @@ type ToolDefinition struct {
 type Completion struct {
 	Content   string
 	ToolCalls []ToolCall
+	Model     string
+	Usage     Usage
+}
+type Usage struct {
+	PromptTokens     int `json:"promptTokens"`
+	CompletionTokens int `json:"completionTokens"`
+	TotalTokens      int `json:"totalTokens"`
 }
 type Service struct {
 	store  *storage.Store
@@ -210,6 +217,12 @@ func (s *Service) CompleteWithTools(ctx context.Context, userID, id string, mess
 		return Completion{}, fmt.Errorf("provider returned non-JSON content from %s (%s); check the API base URL", endpoint, responseType(resp))
 	}
 	var result struct {
+		Model string `json:"model"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 		Choices []struct {
 			Message struct {
 				Content   string     `json:"content"`
@@ -233,7 +246,7 @@ func (s *Service) CompleteWithTools(ctx context.Context, userID, id string, mess
 	if strings.TrimSpace(message.Content) == "" && len(message.ToolCalls) == 0 {
 		return Completion{}, errors.New("provider returned neither content nor tool calls")
 	}
-	return Completion{Content: message.Content, ToolCalls: message.ToolCalls}, nil
+	return Completion{Content: message.Content, ToolCalls: message.ToolCalls, Model: result.Model, Usage: Usage{PromptTokens: result.Usage.PromptTokens, CompletionTokens: result.Usage.CompletionTokens, TotalTokens: result.Usage.TotalTokens}}, nil
 }
 
 func (s *Service) secret(ctx context.Context, userID, id string) (domain.Provider, string, error) {

@@ -18,6 +18,10 @@ storage, authentication, model providers, the agent loop, and transports.
 - Separate sandboxed UI bridge and Agent authority
 - Dependency-checked UI-to-Service bridge with an explicit caller principal
 - Host resource brokers and Windows Job Object containment
+- Immutable Agent Definitions and generation-pinned conversations
+- Frontier Challenges with model-assisted bounded candidate generation
+- Paired Baseline/Candidate A/B evaluation and user-gated promotion
+- Evolution Lab for lineage, evidence, metrics, and promotion control
 
 The current plugin architecture is documented in
 [`docs/plugin-runtime-implementation.md`](docs/plugin-runtime-implementation.md)
@@ -27,6 +31,8 @@ The target desktop product and Agent runtime architecture is drafted in
 direction—recursive Agent bootstrapping with generation-level A/B evaluation—is
 defined in
 [`docs/prd-recursive-bootstrap-agent-v0.1.md`](docs/prd-recursive-bootstrap-agent-v0.1.md).
+The implemented M0/M1 vertical slice is documented in
+[`docs/evolution-runtime-implementation.md`](docs/evolution-runtime-implementation.md).
 
 ## Run locally
 

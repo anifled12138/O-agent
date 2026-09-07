@@ -9,7 +9,7 @@ import (
 
 const contextCharacterBudget = 48000
 
-func buildContext(detail domain.ConversationDetail) ([]provider.ChatMessage, int) {
+func buildContext(detail domain.ConversationDetail, generation domain.AgentGeneration) ([]provider.ChatMessage, int) {
 	selected := make([]domain.Message, 0, len(detail.Messages))
 	used := 0
 	for index := len(detail.Messages) - 1; index >= 0; index-- {
@@ -22,7 +22,7 @@ func buildContext(detail domain.ConversationDetail) ([]provider.ChatMessage, int
 		used += cost
 	}
 	omitted := len(detail.Messages) - len(selected)
-	system := systemPrompt + "\n\nCapability policy: no plugin catalog is preloaded. Search compact metadata with axiom_capability_search, then load only the exact tool or skill needed. A loaded tool is pinned to this turn's release snapshot. Plugin creation actions are creator-only and must also be searched and loaded."
+	system := generation.Definition.Spec.SystemPrompt + "\n\nYou are running immutable Agent Generation " + generation.ID + " (definition " + generation.DefinitionDigest + ", strategy " + generation.Definition.Spec.Strategy + "). Capability policy: no plugin catalog is preloaded. Search compact metadata with axiom_capability_search, then load only the exact tool or skill needed. A loaded tool is pinned to this turn's release snapshot. Plugin creation actions are creator-only and must also be searched and loaded."
 	if omitted > 0 {
 		system += fmt.Sprintf("\n\nContext window note: %d older persisted messages were omitted from this request; do not invent their contents.", omitted)
 	}

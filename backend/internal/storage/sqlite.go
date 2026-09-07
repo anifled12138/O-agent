@@ -68,6 +68,48 @@ CREATE TABLE IF NOT EXISTS agent_trace_events (
  UNIQUE(turn_id, sequence)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_trace_conversation ON agent_trace_events(conversation_id, created_at);
+CREATE TABLE IF NOT EXISTS agent_definitions (
+ user_id TEXT NOT NULL REFERENCES users(id), digest TEXT NOT NULL,
+ api_version TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL,
+ parent_digest TEXT NOT NULL DEFAULT '', spec_json BLOB NOT NULL, created_at DATETIME NOT NULL,
+ PRIMARY KEY(user_id, digest)
+);
+CREATE TABLE IF NOT EXISTS agent_generations (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), generation_number INTEGER NOT NULL,
+ scope TEXT NOT NULL, scope_key TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+ definition_digest TEXT NOT NULL, evidence_json BLOB NOT NULL DEFAULT '{}',
+ created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+ UNIQUE(user_id, generation_number),
+ FOREIGN KEY(user_id, definition_digest) REFERENCES agent_definitions(user_id, digest)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_generations_user ON agent_generations(user_id, status, generation_number DESC);
+CREATE TABLE IF NOT EXISTS conversation_agent_bindings (
+ conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+ user_id TEXT NOT NULL REFERENCES users(id), generation_id TEXT NOT NULL REFERENCES agent_generations(id),
+ definition_digest TEXT NOT NULL, bound_at DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS frontier_challenges (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), title TEXT NOT NULL,
+ objective TEXT NOT NULL, failure_evidence TEXT NOT NULL DEFAULT '', success_criteria TEXT NOT NULL,
+ gap_hypotheses_json BLOB NOT NULL DEFAULT '[]', baseline_generation_id TEXT NOT NULL REFERENCES agent_generations(id),
+ status TEXT NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_frontier_challenges_user ON frontier_challenges(user_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS eval_experiments (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), challenge_id TEXT NOT NULL REFERENCES frontier_challenges(id),
+ baseline_generation_id TEXT NOT NULL REFERENCES agent_generations(id),
+ candidate_generation_id TEXT NOT NULL REFERENCES agent_generations(id), provider_id TEXT NOT NULL REFERENCES providers(id),
+ status TEXT NOT NULL, cases_json BLOB NOT NULL, repetitions INTEGER NOT NULL,
+ report_json BLOB, last_error TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_experiments_user ON eval_experiments(user_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS eval_trials (
+ id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES eval_experiments(id), case_id TEXT NOT NULL,
+ side TEXT NOT NULL, repetition INTEGER NOT NULL, success INTEGER NOT NULL,
+ response TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', metrics_json BLOB NOT NULL,
+ created_at DATETIME NOT NULL, UNIQUE(experiment_id, case_id, side, repetition)
+);
+CREATE INDEX IF NOT EXISTS idx_eval_trials_experiment ON eval_trials(experiment_id, created_at);
 `
 	_, err := s.db.ExecContext(ctx, schema)
 	return err
@@ -172,8 +214,33 @@ func (s *Store) CreateConversation(ctx context.Context, c domain.Conversation) e
 	return err
 }
 
+func (s *Store) CreateConversationWithGeneration(ctx context.Context, c domain.Conversation, generation domain.AgentGeneration) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,created_at,updated_at) VALUES(?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.CreatedAt, c.UpdatedAt)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "foreign key") {
+			return domain.ErrInvalid
+		}
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO conversation_agent_bindings(conversation_id,user_id,generation_id,definition_digest,bound_at)
+SELECT ?,?,?,?,? FROM agent_generations WHERE id=? AND user_id=? AND definition_digest=?`, c.ID, c.UserID, generation.ID, generation.DefinitionDigest, time.Now().UTC(), generation.ID, c.UserID, generation.DefinitionDigest)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return domain.ErrInvalid
+	}
+	return tx.Commit()
+}
+
 func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.Conversation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,title,provider_id,created_at,updated_at FROM conversations WHERE user_id=? ORDER BY updated_at DESC`, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.user_id=? ORDER BY c.updated_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +248,7 @@ func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.
 	result := []domain.Conversation{}
 	for rows.Next() {
 		var c domain.Conversation
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Title, &c.ProviderID, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Title, &c.ProviderID, &c.AgentGenerationID, &c.AgentDefinitionDigest, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -191,7 +258,7 @@ func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.
 
 func (s *Store) Conversation(ctx context.Context, userID, id string) (domain.ConversationDetail, error) {
 	var d domain.ConversationDetail
-	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,title,provider_id,created_at,updated_at FROM conversations WHERE id=? AND user_id=?`, id, userID).Scan(&d.ID, &d.UserID, &d.Title, &d.ProviderID, &d.CreatedAt, &d.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.id=? AND c.user_id=?`, id, userID).Scan(&d.ID, &d.UserID, &d.Title, &d.ProviderID, &d.AgentGenerationID, &d.AgentDefinitionDigest, &d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, domain.ErrNotFound
 	}

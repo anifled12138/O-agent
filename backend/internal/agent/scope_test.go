@@ -41,7 +41,8 @@ func TestContextWindowKeepsNewestMessages(t *testing.T) {
 	for index := 0; index < 10; index++ {
 		detail.Messages = append(detail.Messages, domain.Message{Role: "user", Content: strings.Repeat(string(rune('a'+index)), 7000)})
 	}
-	messages, omitted := buildContext(detail)
+	generation := domain.AgentGeneration{ID: "gen_test", DefinitionDigest: "sha256:test", Definition: domain.AgentDefinition{Spec: domain.AgentSpec{Strategy: "react.v1", SystemPrompt: "test system"}}}
+	messages, omitted := buildContext(detail, generation)
 	if omitted == 0 {
 		t.Fatal("expected older context to be omitted")
 	}

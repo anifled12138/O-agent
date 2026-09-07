@@ -14,8 +14,11 @@ import (
 
 	"axiom.local/agent/internal/agent"
 	"axiom.local/agent/internal/auth"
+	"axiom.local/agent/internal/bootstrap"
 	"axiom.local/agent/internal/core"
 	"axiom.local/agent/internal/domain"
+	"axiom.local/agent/internal/evalharness"
+	"axiom.local/agent/internal/evolution"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/storage"
@@ -31,6 +34,9 @@ type Server struct {
 	auth           *auth.Service
 	providers      *provider.Service
 	agent          *agent.Service
+	evolution      *evolution.Service
+	evals          *evalharness.Service
+	bootstrap      *bootstrap.Service
 	forge          *pluginforge.Service
 	store          *storage.Store
 	plugins        *core.Manager
@@ -38,8 +44,8 @@ type Server struct {
 	secureCookies  bool
 }
 
-func New(authService *auth.Service, providerService *provider.Service, agentService *agent.Service, forgeService *pluginforge.Service, store *storage.Store, plugins *core.Manager, origin string) *Server {
-	return &Server{auth: authService, providers: providerService, agent: agentService, forge: forgeService, store: store, plugins: plugins, frontendOrigin: strings.TrimRight(origin, "/"), secureCookies: strings.HasPrefix(origin, "https://")}
+func New(authService *auth.Service, providerService *provider.Service, agentService *agent.Service, evolutionService *evolution.Service, evalService *evalharness.Service, bootstrapService *bootstrap.Service, forgeService *pluginforge.Service, store *storage.Store, plugins *core.Manager, origin string) *Server {
+	return &Server{auth: authService, providers: providerService, agent: agentService, evolution: evolutionService, evals: evalService, bootstrap: bootstrapService, forge: forgeService, store: store, plugins: plugins, frontendOrigin: strings.TrimRight(origin, "/"), secureCookies: strings.HasPrefix(origin, "https://")}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -59,6 +65,15 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/conversations/{id}", s.requireUser(http.HandlerFunc(s.conversationGet)))
 	mux.Handle("GET /api/v1/conversations/{id}/trace", s.requireUser(http.HandlerFunc(s.conversationTrace)))
 	mux.Handle("POST /api/v1/conversations/{id}/messages", s.requireUser(http.HandlerFunc(s.messageCreate)))
+	mux.Handle("GET /api/v1/evolution/generations", s.requireUser(http.HandlerFunc(s.generationList)))
+	mux.Handle("POST /api/v1/evolution/generations/candidates", s.requireUser(http.HandlerFunc(s.generationCreateCandidate)))
+	mux.Handle("POST /api/v1/evolution/generations/{id}/promote", s.requireUser(http.HandlerFunc(s.generationPromote)))
+	mux.Handle("GET /api/v1/evolution/challenges", s.requireUser(http.HandlerFunc(s.challengeList)))
+	mux.Handle("POST /api/v1/evolution/challenges", s.requireUser(http.HandlerFunc(s.challengeCreate)))
+	mux.Handle("POST /api/v1/evolution/challenges/{id}/bootstrap", s.requireUser(http.HandlerFunc(s.challengeBootstrap)))
+	mux.Handle("GET /api/v1/evolution/experiments", s.requireUser(http.HandlerFunc(s.experimentList)))
+	mux.Handle("POST /api/v1/evolution/experiments", s.requireUser(http.HandlerFunc(s.experimentStart)))
+	mux.Handle("GET /api/v1/evolution/experiments/{id}", s.requireUser(http.HandlerFunc(s.experimentGet)))
 	mux.Handle("GET /api/v1/plugin-forge/projects", s.requireUser(http.HandlerFunc(s.forgeProjectList)))
 	mux.Handle("POST /api/v1/plugin-forge/projects", s.requireUser(http.HandlerFunc(s.forgeProjectCreate)))
 	mux.Handle("POST /api/v1/plugin-forge/projects/{id}/{action}", s.requireUser(http.HandlerFunc(s.forgeProjectAction)))
