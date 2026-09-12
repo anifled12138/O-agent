@@ -39,11 +39,9 @@ CREATE TABLE IF NOT EXISTS users (
  id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL,
  password_hash TEXT NOT NULL, created_at DATETIME NOT NULL
 );
-CREATE TABLE IF NOT EXISTS auth_sessions (
- token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
- expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL
+CREATE TABLE IF NOT EXISTS runtime_settings (
+ key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
 CREATE TABLE IF NOT EXISTS providers (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL,
  kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
@@ -148,33 +146,38 @@ func (s *Store) CreateUser(ctx context.Context, u domain.User, passwordHash stri
 	return err
 }
 
-func (s *Store) UserByEmail(ctx context.Context, email string) (domain.User, string, error) {
-	var u domain.User
-	var hash string
-	err := s.db.QueryRowContext(ctx, `SELECT id,email,display_name,password_hash,created_at FROM users WHERE email=?`, strings.ToLower(email)).Scan(&u.ID, &u.Email, &u.DisplayName, &hash, &u.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return u, "", domain.ErrNotFound
+// EnsureLocalWorkspaceOwner resolves the durable owner used by the single-user
+// local runtime. Existing installations keep the first account they created so
+// providers, conversations, plugins, and evaluation history remain visible.
+func (s *Store) EnsureLocalWorkspaceOwner(ctx context.Context) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
 	}
-	return u, hash, err
-}
+	defer tx.Rollback()
 
-func (s *Store) CreateAuthSession(ctx context.Context, tokenHash, userID string, expires time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO auth_sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)`, tokenHash, userID, expires, time.Now().UTC())
-	return err
-}
-
-func (s *Store) UserBySession(ctx context.Context, tokenHash string) (domain.User, error) {
-	var u domain.User
-	err := s.db.QueryRowContext(ctx, `SELECT u.id,u.email,u.display_name,u.created_at FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?`, tokenHash, time.Now().UTC()).Scan(&u.ID, &u.Email, &u.DisplayName, &u.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return u, domain.ErrUnauthorized
+	var ownerID string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key='local_workspace_owner'`).Scan(&ownerID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
 	}
-	return u, err
-}
-
-func (s *Store) RevokeAuthSession(ctx context.Context, tokenHash string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE auth_sessions SET expires_at=? WHERE token_hash=?`, time.Now().UTC(), tokenHash)
-	return err
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRowContext(ctx, `SELECT id FROM users ORDER BY created_at ASC LIMIT 1`).Scan(&ownerID)
+		if errors.Is(err, sql.ErrNoRows) {
+			ownerID = "local-workspace"
+			_, err = tx.ExecContext(ctx, `INSERT INTO users(id,email,display_name,password_hash,created_at) VALUES(?,?,?,?,?)`, ownerID, "local@axiom.invalid", "Local workspace", "", time.Now().UTC())
+		}
+		if err != nil {
+			return "", err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO runtime_settings(key,value) VALUES('local_workspace_owner',?)`, ownerID); err != nil {
+			return "", err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return ownerID, nil
 }
 
 func (s *Store) UpsertProvider(ctx context.Context, p domain.Provider, cipher, nonce []byte) error {

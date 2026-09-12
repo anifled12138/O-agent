@@ -47,7 +47,7 @@
 
 - 开发 Web UI；
 - Electron Main/Preload/Renderer；
-- local socket、事件续传、登录、设置、会话和 Tool 展示；
+- local socket、事件续传、设置、会话和 Tool 展示；
 - Plugin UI Slot 与 release-bound bridge。
 
 验收：关闭窗口不终止授权的长期 Run；重新打开从 cursor 恢复；Renderer 无 Node

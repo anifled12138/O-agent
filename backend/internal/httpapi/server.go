@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"axiom.local/agent/internal/agent"
-	"axiom.local/agent/internal/auth"
 	"axiom.local/agent/internal/bootstrap"
 	"axiom.local/agent/internal/core"
 	"axiom.local/agent/internal/domain"
@@ -26,14 +24,8 @@ import (
 	"axiom.local/agent/internal/storage"
 )
 
-const cookieName = "axiom_session"
-
-type contextKey string
-
-const userKey contextKey = "user"
-
 type Server struct {
-	auth           *auth.Service
+	workspaceID    string
 	providers      *provider.Service
 	agent          *agent.Service
 	evolution      *evolution.Service
@@ -43,62 +35,57 @@ type Server struct {
 	store          *storage.Store
 	plugins        *core.Manager
 	frontendOrigin string
-	secureCookies  bool
 }
 
-func New(authService *auth.Service, providerService *provider.Service, agentService *agent.Service, evolutionService *evolution.Service, evalService *evalharness.Service, bootstrapService *bootstrap.Service, forgeService *pluginforge.Service, store *storage.Store, plugins *core.Manager, origin string) *Server {
-	return &Server{auth: authService, providers: providerService, agent: agentService, evolution: evolutionService, evals: evalService, bootstrap: bootstrapService, forge: forgeService, store: store, plugins: plugins, frontendOrigin: strings.TrimRight(origin, "/"), secureCookies: strings.HasPrefix(origin, "https://")}
+func New(workspaceID string, providerService *provider.Service, agentService *agent.Service, evolutionService *evolution.Service, evalService *evalharness.Service, bootstrapService *bootstrap.Service, forgeService *pluginforge.Service, store *storage.Store, plugins *core.Manager, origin string) *Server {
+	return &Server{workspaceID: workspaceID, providers: providerService, agent: agentService, evolution: evolutionService, evals: evalService, bootstrap: bootstrapService, forge: forgeService, store: store, plugins: plugins, frontendOrigin: strings.TrimRight(origin, "/")}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.health)
-	mux.HandleFunc("POST /api/v1/auth/register", s.register)
-	mux.HandleFunc("POST /api/v1/auth/login", s.login)
-	mux.Handle("POST /api/v1/auth/logout", s.requireUser(http.HandlerFunc(s.logout)))
-	mux.Handle("GET /api/v1/auth/me", s.requireUser(http.HandlerFunc(s.me)))
-	mux.Handle("GET /api/v1/system/plugins", s.requireUser(http.HandlerFunc(s.pluginList)))
-	mux.Handle("GET /api/v1/provider-kinds", s.requireUser(http.HandlerFunc(s.providerKinds)))
-	mux.Handle("GET /api/v1/providers", s.requireUser(http.HandlerFunc(s.providerList)))
-	mux.Handle("POST /api/v1/providers", s.requireUser(http.HandlerFunc(s.providerCreate)))
-	mux.Handle("PUT /api/v1/providers/{id}", s.requireUser(http.HandlerFunc(s.providerUpdate)))
-	mux.Handle("POST /api/v1/providers/{id}/test", s.requireUser(http.HandlerFunc(s.providerTest)))
-	mux.Handle("GET /api/v1/conversations", s.requireUser(http.HandlerFunc(s.conversationList)))
-	mux.Handle("POST /api/v1/conversations", s.requireUser(http.HandlerFunc(s.conversationCreate)))
-	mux.Handle("GET /api/v1/conversations/{id}", s.requireUser(http.HandlerFunc(s.conversationGet)))
-	mux.Handle("GET /api/v1/conversations/{id}/trace", s.requireUser(http.HandlerFunc(s.conversationTrace)))
-	mux.Handle("GET /api/v1/conversations/{id}/turns", s.requireUser(http.HandlerFunc(s.conversationTurns)))
-	mux.Handle("POST /api/v1/conversations/{id}/messages", s.requireUser(http.HandlerFunc(s.messageCreate)))
-	mux.Handle("POST /api/v1/agent/turns/{id}/cancel", s.requireUser(http.HandlerFunc(s.turnCancel)))
-	mux.Handle("GET /api/v1/evolution/generations", s.requireUser(http.HandlerFunc(s.generationList)))
-	mux.Handle("POST /api/v1/evolution/generations/candidates", s.requireUser(http.HandlerFunc(s.generationCreateCandidate)))
-	mux.Handle("POST /api/v1/evolution/generations/{id}/promote", s.requireUser(http.HandlerFunc(s.generationPromote)))
-	mux.Handle("GET /api/v1/evolution/challenges", s.requireUser(http.HandlerFunc(s.challengeList)))
-	mux.Handle("POST /api/v1/evolution/challenges", s.requireUser(http.HandlerFunc(s.challengeCreate)))
-	mux.Handle("POST /api/v1/evolution/challenges/{id}/bootstrap", s.requireUser(http.HandlerFunc(s.challengeBootstrap)))
-	mux.Handle("GET /api/v1/evolution/experiments", s.requireUser(http.HandlerFunc(s.experimentList)))
-	mux.Handle("POST /api/v1/evolution/experiments", s.requireUser(http.HandlerFunc(s.experimentStart)))
-	mux.Handle("GET /api/v1/evolution/experiments/{id}", s.requireUser(http.HandlerFunc(s.experimentGet)))
-	mux.Handle("GET /api/v1/plugin-forge/projects", s.requireUser(http.HandlerFunc(s.forgeProjectList)))
-	mux.Handle("POST /api/v1/plugin-forge/projects", s.requireUser(http.HandlerFunc(s.forgeProjectCreate)))
-	mux.Handle("POST /api/v1/plugin-forge/projects/{id}/{action}", s.requireUser(http.HandlerFunc(s.forgeProjectAction)))
-	mux.Handle("GET /api/v1/plugin-runtime/installations", s.requireUser(http.HandlerFunc(s.runtimeInstallationList)))
-	mux.Handle("GET /api/v1/plugin-runtime/capabilities", s.requireUser(http.HandlerFunc(s.runtimeCapabilityList)))
-	mux.Handle("GET /api/v1/plugin-runtime/surfaces", s.requireUser(http.HandlerFunc(s.runtimeSurfaceList)))
-	mux.Handle("GET /api/v1/plugin-runtime/migration", s.requireUser(http.HandlerFunc(s.runtimeMigrationStatus)))
-	mux.Handle("GET /api/v1/plugin-runtime/ui/{plugin}", s.requireUser(http.HandlerFunc(s.runtimeUIGet)))
-	mux.Handle("POST /api/v1/plugin-runtime/ui/{plugin}/call", s.requireUser(http.HandlerFunc(s.runtimeUICall)))
-	mux.Handle("POST /api/v1/plugin-runtime/ui/{plugin}/services/{service}/call", s.requireUser(http.HandlerFunc(s.runtimeUIServiceCall)))
-	mux.Handle("POST /api/v1/plugin-runtime/ui/{plugin}/legacy-invoke", s.requireUser(http.HandlerFunc(s.runtimeLegacyUIInvoke)))
-	mux.Handle("POST /api/v1/plugin-runtime/capabilities/{id}/invoke", s.requireUser(http.HandlerFunc(s.runtimeInvoke)))
-	mux.Handle("GET /api/v1/plugin-assets/{release}/{path...}", s.requireUser(http.HandlerFunc(s.pluginAsset)))
-	mux.Handle("GET /api/v2/ui/slots", s.requireUser(http.HandlerFunc(s.runtimeUISlots)))
-	mux.Handle("POST /api/v2/ui/plugins/{plugin}/call", s.requireUser(http.HandlerFunc(s.runtimeUICall)))
-	mux.Handle("POST /api/v2/ui/plugins/{plugin}/services/{service}/call", s.requireUser(http.HandlerFunc(s.runtimeUIServiceCall)))
-	mux.Handle("GET /api/v2/plugin-assets/{release}/{path...}", s.requireUser(http.HandlerFunc(s.pluginAsset)))
-	mux.Handle("GET /api/v2/agent/runs/{id}/trace", s.requireUser(http.HandlerFunc(s.conversationTrace)))
-	mux.Handle("POST /api/v2/agent/conversations/{id}/turns", s.requireUser(http.HandlerFunc(s.turnSubmit)))
-	mux.Handle("GET /api/v2/agent/turns/{id}/events", s.requireUser(http.HandlerFunc(s.turnEvents)))
+	mux.HandleFunc("GET /api/v1/system/plugins", s.pluginList)
+	mux.HandleFunc("GET /api/v1/provider-kinds", s.providerKinds)
+	mux.HandleFunc("GET /api/v1/providers", s.providerList)
+	mux.HandleFunc("POST /api/v1/providers", s.providerCreate)
+	mux.HandleFunc("PUT /api/v1/providers/{id}", s.providerUpdate)
+	mux.HandleFunc("POST /api/v1/providers/{id}/test", s.providerTest)
+	mux.HandleFunc("GET /api/v1/conversations", s.conversationList)
+	mux.HandleFunc("POST /api/v1/conversations", s.conversationCreate)
+	mux.HandleFunc("GET /api/v1/conversations/{id}", s.conversationGet)
+	mux.HandleFunc("GET /api/v1/conversations/{id}/trace", s.conversationTrace)
+	mux.HandleFunc("GET /api/v1/conversations/{id}/turns", s.conversationTurns)
+	mux.HandleFunc("POST /api/v1/conversations/{id}/messages", s.messageCreate)
+	mux.HandleFunc("POST /api/v1/agent/turns/{id}/cancel", s.turnCancel)
+	mux.HandleFunc("GET /api/v1/evolution/generations", s.generationList)
+	mux.HandleFunc("POST /api/v1/evolution/generations/candidates", s.generationCreateCandidate)
+	mux.HandleFunc("POST /api/v1/evolution/generations/{id}/promote", s.generationPromote)
+	mux.HandleFunc("GET /api/v1/evolution/challenges", s.challengeList)
+	mux.HandleFunc("POST /api/v1/evolution/challenges", s.challengeCreate)
+	mux.HandleFunc("POST /api/v1/evolution/challenges/{id}/bootstrap", s.challengeBootstrap)
+	mux.HandleFunc("GET /api/v1/evolution/experiments", s.experimentList)
+	mux.HandleFunc("POST /api/v1/evolution/experiments", s.experimentStart)
+	mux.HandleFunc("GET /api/v1/evolution/experiments/{id}", s.experimentGet)
+	mux.HandleFunc("GET /api/v1/plugin-forge/projects", s.forgeProjectList)
+	mux.HandleFunc("POST /api/v1/plugin-forge/projects", s.forgeProjectCreate)
+	mux.HandleFunc("POST /api/v1/plugin-forge/projects/{id}/{action}", s.forgeProjectAction)
+	mux.HandleFunc("GET /api/v1/plugin-runtime/installations", s.runtimeInstallationList)
+	mux.HandleFunc("GET /api/v1/plugin-runtime/capabilities", s.runtimeCapabilityList)
+	mux.HandleFunc("GET /api/v1/plugin-runtime/surfaces", s.runtimeSurfaceList)
+	mux.HandleFunc("GET /api/v1/plugin-runtime/migration", s.runtimeMigrationStatus)
+	mux.HandleFunc("GET /api/v1/plugin-runtime/ui/{plugin}", s.runtimeUIGet)
+	mux.HandleFunc("POST /api/v1/plugin-runtime/ui/{plugin}/call", s.runtimeUICall)
+	mux.HandleFunc("POST /api/v1/plugin-runtime/ui/{plugin}/services/{service}/call", s.runtimeUIServiceCall)
+	mux.HandleFunc("POST /api/v1/plugin-runtime/ui/{plugin}/legacy-invoke", s.runtimeLegacyUIInvoke)
+	mux.HandleFunc("POST /api/v1/plugin-runtime/capabilities/{id}/invoke", s.runtimeInvoke)
+	mux.HandleFunc("GET /api/v1/plugin-assets/{release}/{path...}", s.pluginAsset)
+	mux.HandleFunc("GET /api/v2/ui/slots", s.runtimeUISlots)
+	mux.HandleFunc("POST /api/v2/ui/plugins/{plugin}/call", s.runtimeUICall)
+	mux.HandleFunc("POST /api/v2/ui/plugins/{plugin}/services/{service}/call", s.runtimeUIServiceCall)
+	mux.HandleFunc("GET /api/v2/plugin-assets/{release}/{path...}", s.pluginAsset)
+	mux.HandleFunc("GET /api/v2/agent/runs/{id}/trace", s.conversationTrace)
+	mux.HandleFunc("POST /api/v2/agent/conversations/{id}/turns", s.turnSubmit)
+	mux.HandleFunc("GET /api/v2/agent/turns/{id}/events", s.turnEvents)
 	return s.recoverer(s.cors(s.logging(mux)))
 }
 
@@ -112,53 +99,12 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	write(w, code, map[string]any{"status": status, "plugins": s.plugins.Snapshots()})
 }
 
-type authInput struct {
-	Email       string `json:"email"`
-	Password    string `json:"password"`
-	DisplayName string `json:"displayName"`
-}
-
-func (s *Server) register(w http.ResponseWriter, r *http.Request) {
-	var in authInput
-	if !decode(w, r, &in) {
-		return
-	}
-	u, token, err := s.auth.Register(r.Context(), in.Email, in.Password, in.DisplayName)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	s.setCookie(w, token)
-	write(w, http.StatusCreated, u)
-}
-func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	var in authInput
-	if !decode(w, r, &in) {
-		return
-	}
-	u, token, err := s.auth.Login(r.Context(), in.Email, in.Password)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	s.setCookie(w, token)
-	write(w, http.StatusOK, u)
-}
-func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	cookie, _ := r.Cookie(cookieName)
-	if cookie != nil {
-		_ = s.auth.Logout(r.Context(), cookie.Value)
-	}
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.secureCookies, MaxAge: -1})
-	w.WriteHeader(http.StatusNoContent)
-}
-func (s *Server) me(w http.ResponseWriter, r *http.Request) { write(w, http.StatusOK, currentUser(r)) }
 func (s *Server) pluginList(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, s.plugins.Snapshots())
 }
 
 func (s *Server) providerList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.providers.List(r.Context(), currentUser(r).ID)
+	items, err := s.providers.List(r.Context(), s.workspaceID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -173,7 +119,7 @@ func (s *Server) providerCreate(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	p, err := s.providers.Create(r.Context(), currentUser(r).ID, in)
+	p, err := s.providers.Create(r.Context(), s.workspaceID, in)
 	if err != nil {
 		fail(w, err)
 		return
@@ -185,7 +131,7 @@ func (s *Server) providerUpdate(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	p, err := s.providers.Update(r.Context(), currentUser(r).ID, r.PathValue("id"), in)
+	p, err := s.providers.Update(r.Context(), s.workspaceID, r.PathValue("id"), in)
 	if err != nil {
 		fail(w, err)
 		return
@@ -193,7 +139,7 @@ func (s *Server) providerUpdate(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, p)
 }
 func (s *Server) providerTest(w http.ResponseWriter, r *http.Request) {
-	if err := s.providers.Test(r.Context(), currentUser(r).ID, r.PathValue("id")); err != nil {
+	if err := s.providers.Test(r.Context(), s.workspaceID, r.PathValue("id")); err != nil {
 		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
@@ -201,7 +147,7 @@ func (s *Server) providerTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) conversationList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.agent.List(r.Context(), currentUser(r).ID)
+	items, err := s.agent.List(r.Context(), s.workspaceID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -216,7 +162,7 @@ func (s *Server) conversationCreate(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	c, err := s.agent.Create(r.Context(), currentUser(r).ID, in.Title, in.ProviderID)
+	c, err := s.agent.Create(r.Context(), s.workspaceID, in.Title, in.ProviderID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -224,7 +170,7 @@ func (s *Server) conversationCreate(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusCreated, c)
 }
 func (s *Server) conversationGet(w http.ResponseWriter, r *http.Request) {
-	c, err := s.agent.Get(r.Context(), currentUser(r).ID, r.PathValue("id"))
+	c, err := s.agent.Get(r.Context(), s.workspaceID, r.PathValue("id"))
 	if err != nil {
 		fail(w, err)
 		return
@@ -233,7 +179,7 @@ func (s *Server) conversationGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) conversationTrace(w http.ResponseWriter, r *http.Request) {
-	events, err := s.agent.Trace(r.Context(), currentUser(r).ID, r.PathValue("id"))
+	events, err := s.agent.Trace(r.Context(), s.workspaceID, r.PathValue("id"))
 	if err != nil {
 		fail(w, err)
 		return
@@ -241,7 +187,7 @@ func (s *Server) conversationTrace(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, events)
 }
 func (s *Server) conversationTurns(w http.ResponseWriter, r *http.Request) {
-	turns, err := s.agent.Turns(r.Context(), currentUser(r).ID, r.PathValue("id"))
+	turns, err := s.agent.Turns(r.Context(), s.workspaceID, r.PathValue("id"))
 	if err != nil {
 		fail(w, err)
 		return
@@ -255,7 +201,7 @@ func (s *Server) turnCancel(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	if err := s.agent.Cancel(r.Context(), currentUser(r).ID, r.PathValue("id"), in.Reason); err != nil {
+	if err := s.agent.Cancel(r.Context(), s.workspaceID, r.PathValue("id"), in.Reason); err != nil {
 		fail(w, err)
 		return
 	}
@@ -268,7 +214,7 @@ func (s *Server) turnSubmit(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	receipt, err := s.agent.Submit(r.Context(), currentUser(r).ID, r.PathValue("id"), in.Content)
+	receipt, err := s.agent.Submit(r.Context(), s.workspaceID, r.PathValue("id"), in.Content)
 	if err != nil {
 		fail(w, err)
 		return
@@ -293,7 +239,7 @@ func (s *Server) turnEvents(w http.ResponseWriter, r *http.Request) {
 	turnID := r.PathValue("id")
 	wake, unsubscribe := s.agent.SubscribeTurn(turnID)
 	defer unsubscribe()
-	events, err := s.agent.TurnEvents(r.Context(), currentUser(r).ID, turnID, after)
+	events, err := s.agent.TurnEvents(r.Context(), s.workspaceID, turnID, after)
 	if err != nil {
 		fail(w, err)
 		return
@@ -332,7 +278,7 @@ func (s *Server) turnEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		case <-wake:
-			events, err := s.agent.TurnEvents(r.Context(), currentUser(r).ID, turnID, after)
+			events, err := s.agent.TurnEvents(r.Context(), s.workspaceID, turnID, after)
 			if err != nil || send(events) != nil || terminal {
 				return
 			}
@@ -346,7 +292,7 @@ func (s *Server) messageCreate(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	m, err := s.agent.Turn(r.Context(), currentUser(r).ID, r.PathValue("id"), in.Content)
+	m, err := s.agent.Turn(r.Context(), s.workspaceID, r.PathValue("id"), in.Content)
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalid) || errors.Is(err, domain.ErrConflict) || errors.Is(err, domain.ErrNotFound) {
 			fail(w, err)
@@ -359,7 +305,7 @@ func (s *Server) messageCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) forgeProjectList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.forge.ListProjects(r.Context(), currentUser(r).ID)
+	items, err := s.forge.ListProjects(r.Context(), s.workspaceID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -372,7 +318,7 @@ func (s *Server) forgeProjectCreate(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	project, err := s.forge.Create(r.Context(), currentUser(r).ID, in)
+	project, err := s.forge.Create(r.Context(), s.workspaceID, in)
 	if err != nil {
 		fail(w, err)
 		return
@@ -381,7 +327,7 @@ func (s *Server) forgeProjectCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) forgeProjectAction(w http.ResponseWriter, r *http.Request) {
-	userID := currentUser(r).ID
+	userID := s.workspaceID
 	projectID := r.PathValue("id")
 	switch r.PathValue("action") {
 	case "generate":
@@ -435,7 +381,7 @@ func (s *Server) writeForgeResult(w http.ResponseWriter, project pluginforge.Pro
 }
 
 func (s *Server) runtimeInstallationList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.forge.ListInstallations(r.Context(), currentUser(r).ID)
+	items, err := s.forge.ListInstallations(r.Context(), s.workspaceID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -444,11 +390,11 @@ func (s *Server) runtimeInstallationList(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) runtimeCapabilityList(w http.ResponseWriter, r *http.Request) {
-	write(w, http.StatusOK, s.forge.Capabilities(currentUser(r).ID))
+	write(w, http.StatusOK, s.forge.Capabilities(s.workspaceID))
 }
 
 func (s *Server) runtimeSurfaceList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.forge.SurfaceStates(r.Context(), currentUser(r).ID)
+	items, err := s.forge.SurfaceStates(r.Context(), s.workspaceID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -466,7 +412,7 @@ func (s *Server) runtimeMigrationStatus(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) runtimeUIGet(w http.ResponseWriter, r *http.Request) {
-	binding, ok := s.forge.UIBinding(currentUser(r).ID, r.PathValue("plugin"))
+	binding, ok := s.forge.UIBinding(s.workspaceID, r.PathValue("plugin"))
 	if !ok {
 		fail(w, domain.ErrNotFound)
 		return
@@ -475,7 +421,7 @@ func (s *Server) runtimeUIGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runtimeUISlots(w http.ResponseWriter, r *http.Request) {
-	write(w, http.StatusOK, s.forge.UIBindings(currentUser(r).ID))
+	write(w, http.StatusOK, s.forge.UIBindings(s.workspaceID))
 }
 
 func (s *Server) runtimeUICall(w http.ResponseWriter, r *http.Request) {
@@ -486,7 +432,7 @@ func (s *Server) runtimeUICall(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	result, err := s.forge.UICall(r.Context(), currentUser(r).ID, r.PathValue("plugin"), in.Operation, in.Input)
+	result, err := s.forge.UICall(r.Context(), s.workspaceID, r.PathValue("plugin"), in.Operation, in.Input)
 	if err != nil {
 		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -501,7 +447,7 @@ func (s *Server) runtimeUIServiceCall(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	result, err := s.forge.UIServiceCall(r.Context(), currentUser(r).ID, r.PathValue("plugin"), r.PathValue("service"), in.Input)
+	result, err := s.forge.UIServiceCall(r.Context(), s.workspaceID, r.PathValue("plugin"), r.PathValue("service"), in.Input)
 	if err != nil {
 		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -517,7 +463,7 @@ func (s *Server) runtimeLegacyUIInvoke(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	result, err := s.forge.LegacyUICall(r.Context(), currentUser(r).ID, r.PathValue("plugin"), in.CapabilitySuffix, in.Input)
+	result, err := s.forge.LegacyUICall(r.Context(), s.workspaceID, r.PathValue("plugin"), in.CapabilitySuffix, in.Input)
 	if err != nil {
 		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -532,7 +478,7 @@ func (s *Server) runtimeInvoke(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	result, err := s.forge.Invoke(r.Context(), currentUser(r).ID, r.PathValue("id"), in.Input)
+	result, err := s.forge.Invoke(r.Context(), s.workspaceID, r.PathValue("id"), in.Input)
 	if err != nil {
 		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -541,7 +487,7 @@ func (s *Server) runtimeInvoke(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pluginAsset(w http.ResponseWriter, r *http.Request) {
-	path, err := s.forge.Asset(r.Context(), currentUser(r).ID, r.PathValue("release"), r.PathValue("path"))
+	path, err := s.forge.Asset(r.Context(), s.workspaceID, r.PathValue("release"), r.PathValue("path"))
 	if err != nil {
 		fail(w, err)
 		return
@@ -565,26 +511,6 @@ func (s *Server) pluginAsset(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 }
 
-func (s *Server) requireUser(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie(cookieName)
-		if err != nil {
-			fail(w, domain.ErrUnauthorized)
-			return
-		}
-		u, err := s.auth.User(r.Context(), cookie.Value)
-		if err != nil {
-			fail(w, domain.ErrUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
-	})
-}
-func currentUser(r *http.Request) domain.User { return r.Context().Value(userKey).(domain.User) }
-func (s *Server) setCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.secureCookies, MaxAge: int((30 * 24 * time.Hour).Seconds())})
-}
-
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := strings.TrimRight(r.Header.Get("Origin"), "/")
@@ -594,7 +520,6 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		if origin == s.frontendOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {

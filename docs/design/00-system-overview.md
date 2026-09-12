@@ -27,7 +27,7 @@ axiomd（Go Host）
 
 ## 可信边界
 
-可信内核负责 Identity、Policy、Approval、Event Store、Artifact Store、Plugin
+可信内核负责 Workspace Scope、Policy、Approval、Event Store、Artifact Store、Plugin
 activation、Resource Broker 和 Process Supervisor。它不决定 LLM 的具体推理内容，
 但任何真实副作用都必须从内核获得 capability handle。
 
@@ -57,6 +57,5 @@ Agent Runtime 可以替换 Reasoning Driver、Context Policy、Provider route、
 
 ## 首个可交付产品闭环
 
-用户登录 -> 配置模型 -> 新建会话 -> 流式对话 -> 模型调用内置 Function -> 查看
+打开本地客户端 -> 配置模型 -> 新建会话 -> 流式对话 -> 模型调用内置 Function -> 查看
 Tool 过程 -> 安装/启用一个 Skill 或 MCP -> Agent 使用该能力 -> 重启后恢复会话。
-

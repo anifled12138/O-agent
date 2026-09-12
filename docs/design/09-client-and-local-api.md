@@ -12,7 +12,7 @@
 
 ## 客户端功能
 
-- 本地注册/登录；
+- 单用户本地工作区，启动后直接进入对话界面；
 - Provider 协议、模型、能力测试和费用提示；
 - 多会话、分支、取消、恢复；
 - 流式消息、reasoning summary、Tool 调用和用户输入卡；
@@ -58,7 +58,7 @@ API 的所有成功和错误响应都声明 Content-Type。反向代理 HTML、�
 
 - Renderer：`nodeIntegration=false`、`contextIsolation=true`、sandbox；
 - Preload 逐方法暴露 API，不暴露 `ipcRenderer.send`；
-- Main 验证 channel、参数、窗口 origin 和用户 session；
+- Main 验证 channel、参数、窗口 origin 和本地进程身份；
 - local socket 使用当前 OS 用户 ACL；
 - 自定义 Plugin scheme 不映射任意本机路径；
 - 浏览器 permission 默认拒绝；外链交给系统浏览器并检查 scheme。
@@ -79,7 +79,7 @@ Node、文件系统或其他 Plugin iframe。
 
 - API schema/错误 content-type；
 - SSE 断线续传与重复 event；
-- 登录过期；
+- 未携带 Cookie 时所有本地 API 仍可正常工作；
 - Renderer/Preload 权限；
 - Plugin iframe origin 和 MessagePort 伪造；
 - Host/客户端分别崩溃重启；
@@ -91,4 +91,5 @@ Web UI 使用 V2 async Turn Receipt；durable event 通过 SSE sequence cursor �
 持久化取消意图再触发执行上下文。当前流中已经包含 Turn、Model、Tool 和终态事件，
 打开已有活动 Turn 时客户端会自动重新订阅；切换会话只关闭旧 EventSource，不取消
 后台执行。Provider token delta 仍待实现。V1 同步接口暂时保留用于兼容，不作为客户端
-默认路径。
+默认路径。产品使用单用户本地工作区，不提供注册、登录、登出或 Cookie session；
+数据库中的 `user_id` 暂作为兼容性工作区作用域键，启动时绑定已有数据所有者。

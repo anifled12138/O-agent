@@ -4,7 +4,6 @@ import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useSta
 import EvolutionCenter from './EvolutionCenter';
 import { API, API_V2, ASSET_ORIGIN, request } from './api';
 
-type User = { id: string; email: string; displayName: string };
 export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; hasApiKey: boolean };
 type ProviderKind = { kind: string; label: string; description: string; defaultBaseUrl: string };
 type Conversation = { id: string; title: string; providerId: string; agentGenerationId?: string; agentDefinitionDigest?: string; updatedAt: string };
@@ -23,7 +22,6 @@ type TurnReceipt = { turnId: string; conversationId: string; inputMessageId: str
 
 export default function AxiomApp() {
   const [loading, setLoading] = useState(true);
-  const [user, setUser] = useState<User | null>(null);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [plugins, setPlugins] = useState<Plugin[]>([]);
@@ -39,24 +37,14 @@ export default function AxiomApp() {
 
   useEffect(() => () => observationRef.current?.controller.abort(), []);
 
-  const hydrate = useCallback(async () => {
-    const me = await request<User>('/auth/me');
-    setUser(me);
-    const [providerList, conversationList, pluginList] = await Promise.all([
-      request<Provider[]>('/providers'), request<Conversation[]>('/conversations'), request<Plugin[]>('/system/plugins'),
-    ]);
-    setProviders(providerList); setConversations(conversationList); setPlugins(pluginList);
-  }, []);
-
   useEffect(() => {
     void Promise.all([
-      request<User>('/auth/me'),
       request<Provider[]>('/providers'),
       request<Conversation[]>('/conversations'),
       request<Plugin[]>('/system/plugins'),
-    ]).then(([me, providerList, conversationList, pluginList]) => {
-      setUser(me); setProviders(providerList); setConversations(conversationList); setPlugins(pluginList);
-    }).catch(() => setUser(null)).finally(() => setLoading(false));
+    ]).then(([providerList, conversationList, pluginList]) => {
+      setProviders(providerList); setConversations(conversationList); setPlugins(pluginList);
+    }).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not connect to the local runtime')).finally(() => setLoading(false));
   }, []);
   function observeTurn(turnId: string, conversationId: string) {
     if (observationRef.current?.turnId === turnId) return observationRef.current.promise;
@@ -145,9 +133,8 @@ export default function AxiomApp() {
   }
 
   if (loading) return <Splash />;
-  if (!user) return <AuthScreen onAuthenticated={async (next) => { setUser(next); await hydrate(); }} />;
   return <main className="app-shell">
-    <Sidebar user={user} conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onEvolution={() => setEvolutionOpen(true)} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} onLogout={async () => { await request('/auth/logout', { method: 'POST' }); setUser(null); }} />
+    <Sidebar conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onEvolution={() => setEvolutionOpen(true)} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} />
     <section className="workspace"><header className="workspace-header"><div><span className="eyebrow">LOCAL AGENT / MISSION</span><h1>{active?.title ?? 'Untitled workspace'}</h1></div><div className="header-actions"><span className="status-pill"><i /> runtime online</span><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Open settings">⌘</button></div></header>
       <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} onSend={send} onCancel={cancelTurn} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} trace={trace} /></div>
     </section>
@@ -159,7 +146,7 @@ export default function AxiomApp() {
 
 function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const source = new EventSource(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/events`, { withCredentials: true });
+    const source = new EventSource(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/events`);
     signal?.addEventListener('abort', () => { source.close(); resolve(); }, { once: true });
     source.onmessage = (message) => {
       try {
@@ -182,19 +169,8 @@ function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void, signa
 
 function Splash() { return <div className="splash"><div className="brand-mark">A</div><span>Booting plugin runtime…</span></div>; }
 
-function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: User) => Promise<void> }) {
-  const [mode, setMode] = useState<'login' | 'register'>('register'); const [busy, setBusy] = useState(false); const [error, setError] = useState('');
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true); setError(''); const form = new FormData(event.currentTarget);
-    try { const result = await request<User>(`/auth/${mode}`, { method: 'POST', body: JSON.stringify({ email: form.get('email'), password: form.get('password'), displayName: form.get('displayName') }) }); await onAuthenticated(result); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : 'Authentication failed'); } finally { setBusy(false); }
-  }
-  return <main className="auth-page"><section className="auth-story"><div className="brand"><div className="brand-mark">A</div><span>AXIOM</span></div><div className="story-copy"><span className="eyebrow">LOCAL-FIRST AGENT HARNESS</span><h1>Make reasoning<br/><em>observable.</em></h1><p>A plugin-native workspace for agents that plan, act, verify, and remember — under your control.</p></div><div className="system-strip"><span><i/> GO RUNTIME</span><span><i/> LOCAL STATE</span><span><i/> API MODELS</span></div></section>
-    <section className="auth-panel"><div className="auth-box"><span className="step-label">01 / IDENTITY</span><h2>{mode === 'register' ? 'Create your local operator' : 'Welcome back'}</h2><p>{mode === 'register' ? 'This account exists only in your Axiom instance.' : 'Continue your local missions.'}</p><form onSubmit={submit}>{mode === 'register' && <label>DISPLAY NAME<input name="displayName" placeholder="Operator" required /></label>}<label>EMAIL<input name="email" type="email" placeholder="you@example.com" required /></label><label>PASSWORD<input name="password" type="password" minLength={10} placeholder="10+ characters" required /></label>{error && <div className="form-error">{error}</div>}<button className="primary-button" disabled={busy}>{busy ? 'Working…' : mode === 'register' ? 'Initialize workspace' : 'Enter workspace'}<span>→</span></button></form><button className="text-button" onClick={() => { setMode(mode === 'register' ? 'login' : 'register'); setError(''); }}>{mode === 'register' ? 'Already initialized? Sign in' : 'Need a local account? Create one'}</button></div></section></main>;
-}
-
-function Sidebar({ user, conversations, activeId, onNew, onOpen, onEvolution, onPlugins, onSettings, onLogout }: { user: User; conversations: Conversation[]; activeId?: string; onNew: () => void; onOpen: (id: string) => void; onEvolution: () => void; onPlugins: () => void; onSettings: () => void; onLogout: () => void }) {
-  return <aside className="sidebar"><div className="brand"><div className="brand-mark">A</div><span>AXIOM</span><small>0.2</small></div><button className="new-button" onClick={onNew}><span>＋</span> New mission <kbd>⌘ N</kbd></button><nav><p>MISSIONS</p>{conversations.length === 0 ? <div className="empty-nav">No missions yet.<br/>Start with an objective.</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onEvolution}><i>⌁</i><span>Evolution Lab</span></button><button onClick={onPlugins}><i>◇</i><span>Plugin Forge</span></button><button onClick={onSettings}><i>⚙</i><span>Provider settings</span></button><div className="operator"><span>{user.displayName.slice(0,2).toUpperCase()}</span><div><b>{user.displayName}</b><small>{user.email}</small></div><button onClick={onLogout} title="Sign out">↗</button></div></div></aside>;
+function Sidebar({ conversations, activeId, onNew, onOpen, onEvolution, onPlugins, onSettings }: { conversations: Conversation[]; activeId?: string; onNew: () => void; onOpen: (id: string) => void; onEvolution: () => void; onPlugins: () => void; onSettings: () => void }) {
+  return <aside className="sidebar"><div className="brand"><div className="brand-mark">A</div><span>AXIOM</span><small>0.2</small></div><button className="new-button" onClick={onNew}><span>＋</span> New mission <kbd>⌘ N</kbd></button><nav><p>MISSIONS</p>{conversations.length === 0 ? <div className="empty-nav">No missions yet.<br/>Start with an objective.</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onEvolution}><i>⌁</i><span>Evolution Lab</span></button><button onClick={onPlugins}><i>◇</i><span>Plugin Forge</span></button><button onClick={onSettings}><i>⚙</i><span>Provider settings</span></button></div></aside>;
 }
 
 function Chat({ active, providers, sending, notice, onSend, onCancel, onConfigure }: { active: ConversationDetail | null; providers: Provider[]; sending: boolean; notice: string; onSend: (content: string) => void; onCancel: () => void; onConfigure: () => void }) {

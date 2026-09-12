@@ -2,11 +2,11 @@
 
 Axiom is a local-first agent product with a Go backend and a web frontend. The
 runtime follows one rule: every capability is mounted as a plugin, including
-storage, authentication, model providers, the agent loop, and transports.
+storage, model providers, the agent loop, and transports.
 
 ## Product capabilities
 
-- Local user registration and cookie-based login
+- Single-user local workspace with no login screen or session cookies
 - Encrypted model-provider credentials
 - OpenAI Responses, Anthropic Messages, DeepSeek Chat, and generic OpenAI-compatible providers
 - Persistent conversations and a working model turn

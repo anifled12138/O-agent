@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"axiom.local/agent/internal/agent"
-	"axiom.local/agent/internal/auth"
 	"axiom.local/agent/internal/bootstrap"
 	"axiom.local/agent/internal/config"
 	"axiom.local/agent/internal/core"
@@ -44,12 +43,17 @@ func run() error {
 	host := core.NewHost()
 	plugins := core.NewManager(host)
 	var store *storage.Store
+	var workspaceID string
 	var forgeRepo *pluginforge.Repository
 	var forgeRuntime *pluginruntime.Supervisor
 	var evalService *evalharness.Service
 	register(plugins, &core.Component{Info: core.Manifest{ID: "core.storage.sqlite", Version: "0.1.0", Description: "Local transactional state", Capabilities: []string{"storage.sql", "storage.migrations"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		var err error
 		store, err = storage.Open(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		workspaceID, err = store.EnsureLocalWorkspaceOwner(ctx)
 		if err != nil {
 			return err
 		}
@@ -61,13 +65,6 @@ func run() error {
 			return err
 		}
 		return h.Provide("vault", vault)
-	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "core.auth.local", Version: "0.1.0", Description: "Local user identity and sessions", Requires: []string{"core.storage.sqlite"}, Capabilities: []string{"auth.register", "auth.session"}}, InitFn: func(ctx context.Context, h *core.Host) error {
-		st, err := core.Service[*storage.Store](h, "storage")
-		if err != nil {
-			return err
-		}
-		return h.Provide("auth", auth.New(st))
 	}})
 	register(plugins, &core.Component{Info: core.Manifest{ID: "provider.gateway.v1", Version: "0.2.0", Description: "Provider-neutral model gateway and protocol adapters", Requires: []string{"core.storage.sqlite", "core.secrets.aesgcm"}, Capabilities: []string{"model.chat", "model.tools", "model.health", "model.protocols"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		st, err := core.Service[*storage.Store](h, "storage")
@@ -162,7 +159,7 @@ func run() error {
 		}
 		return h.Provide("bootstrap", bootstrap.New(evolutionService, providers))
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "transport.http.v1", Version: "0.2.0", Description: "Local product API", Requires: []string{"core.auth.local", "runtime.agent.v1", "runtime.plugin-forge.v1", "runtime.eval-harness.v1", "runtime.bootstrap.v1"}, Capabilities: []string{"transport.http"}}})
+	register(plugins, &core.Component{Info: core.Manifest{ID: "transport.http.v1", Version: "0.2.0", Description: "Local product API", Requires: []string{"runtime.agent.v1", "runtime.plugin-forge.v1", "runtime.eval-harness.v1", "runtime.bootstrap.v1"}, Capabilities: []string{"transport.http"}}})
 	if err := plugins.StartAll(ctx); err != nil {
 		return err
 	}
@@ -173,14 +170,13 @@ func run() error {
 			slog.Error("plugin shutdown failed", "error", err)
 		}
 	}()
-	authService, _ := core.Service[*auth.Service](host, "auth")
 	providerService, _ := core.Service[*provider.Service](host, "providers")
 	agentService, _ := core.Service[*agent.Service](host, "agent")
 	evolutionService, _ := core.Service[*evolution.Service](host, "evolution")
 	evalHarnessService, _ := core.Service[*evalharness.Service](host, "eval-harness")
 	bootstrapService, _ := core.Service[*bootstrap.Service](host, "bootstrap")
 	forgeService, _ := core.Service[*pluginforge.Service](host, "plugin-forge")
-	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(authService, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(workspaceID, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErrors := make(chan error, 1)
 	go func() {
 		slog.Info("axiom ready", "address", "http://"+cfg.Addr, "data", absoluteData)

@@ -9,7 +9,7 @@ import (
 )
 
 func (s *Server) generationList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.evolution.ListGenerations(r.Context(), currentUser(r).ID)
+	items, err := s.evolution.ListGenerations(r.Context(), s.workspaceID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -22,7 +22,7 @@ func (s *Server) generationCreateCandidate(w http.ResponseWriter, r *http.Reques
 	if !decode(w, r, &input) {
 		return
 	}
-	item, err := s.evolution.CreateCandidate(r.Context(), currentUser(r).ID, input)
+	item, err := s.evolution.CreateCandidate(r.Context(), s.workspaceID, input)
 	if err != nil {
 		fail(w, err)
 		return
@@ -37,7 +37,7 @@ func (s *Server) generationPromote(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	item, err := s.evolution.Promote(r.Context(), currentUser(r).ID, r.PathValue("id"), input.ExperimentID)
+	item, err := s.evolution.Promote(r.Context(), s.workspaceID, r.PathValue("id"), input.ExperimentID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -46,7 +46,7 @@ func (s *Server) generationPromote(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) challengeList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.evolution.ListChallenges(r.Context(), currentUser(r).ID)
+	items, err := s.evolution.ListChallenges(r.Context(), s.workspaceID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -59,7 +59,7 @@ func (s *Server) challengeCreate(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	item, err := s.evolution.CreateChallenge(r.Context(), currentUser(r).ID, input)
+	item, err := s.evolution.CreateChallenge(r.Context(), s.workspaceID, input)
 	if err != nil {
 		fail(w, err)
 		return
@@ -72,7 +72,7 @@ func (s *Server) challengeBootstrap(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	items, err := s.bootstrap.GenerateCandidates(r.Context(), currentUser(r).ID, r.PathValue("id"), input)
+	items, err := s.bootstrap.GenerateCandidates(r.Context(), s.workspaceID, r.PathValue("id"), input)
 	if err != nil {
 		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -81,7 +81,7 @@ func (s *Server) challengeBootstrap(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) experimentList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.evals.List(r.Context(), currentUser(r).ID)
+	items, err := s.evals.List(r.Context(), s.workspaceID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -94,7 +94,7 @@ func (s *Server) experimentStart(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	item, err := s.evals.Start(r.Context(), currentUser(r).ID, input)
+	item, err := s.evals.Start(r.Context(), s.workspaceID, input)
 	if err != nil {
 		fail(w, err)
 		return
@@ -103,7 +103,7 @@ func (s *Server) experimentStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) experimentGet(w http.ResponseWriter, r *http.Request) {
-	item, err := s.evals.Get(r.Context(), currentUser(r).ID, r.PathValue("id"))
+	item, err := s.evals.Get(r.Context(), s.workspaceID, r.PathValue("id"))
 	if err != nil {
 		fail(w, err)
 		return

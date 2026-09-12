@@ -4,7 +4,7 @@ export const ASSET_ORIGIN = new URL(API).origin;
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const target = /^https?:\/\//.test(path) ? path : `${API}${path}`;
-  const response = await fetch(target, { ...init, credentials: 'include', headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
+  const response = await fetch(target, { ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
   const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
   const text = response.status === 204 ? '' : await response.text();
   if (!response.ok) {
