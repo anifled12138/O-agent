@@ -69,6 +69,35 @@ type TraceEvent struct {
 	CreatedAt      time.Time       `json:"createdAt"`
 }
 
+type AgentTurn struct {
+	ID                    string     `json:"id"`
+	ConversationID        string     `json:"conversationId"`
+	UserID                string     `json:"-"`
+	InputMessageID        string     `json:"inputMessageId"`
+	ResultMessageID       string     `json:"resultMessageId,omitempty"`
+	ProviderID            string     `json:"providerId"`
+	AgentGenerationID     string     `json:"agentGenerationId"`
+	AgentDefinitionDigest string     `json:"agentDefinitionDigest"`
+	Status                string     `json:"status"`
+	StopReason            string     `json:"stopReason,omitempty"`
+	RecoveryClass         string     `json:"recoveryClass,omitempty"`
+	CancelRequested       bool       `json:"cancelRequested"`
+	LastSequence          int        `json:"lastSequence"`
+	StartedAt             time.Time  `json:"startedAt"`
+	UpdatedAt             time.Time  `json:"updatedAt"`
+	CompletedAt           *time.Time `json:"completedAt,omitempty"`
+}
+
+type AgentStep struct {
+	ID           string     `json:"id"`
+	TurnID       string     `json:"turnId"`
+	Ordinal      int        `json:"ordinal"`
+	Status       string     `json:"status"`
+	AttemptCount int        `json:"attemptCount"`
+	StartedAt    time.Time  `json:"startedAt"`
+	CompletedAt  *time.Time `json:"completedAt,omitempty"`
+}
+
 // AgentSpec is the mutable part of an Agent Definition. The Seed Kernel owns
 // execution and permissions; a generation may only select a strategy and its
 // bounded parameters.

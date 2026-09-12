@@ -1,6 +1,6 @@
 # 02 · Agent Loop
 
-状态：Proposed
+状态：Accepted；durable journal/cancel/recovery skeleton implemented，streaming/inbox pending
 
 ## 目标
 
@@ -99,3 +99,18 @@ Agent 创建时固定 Reasoning Driver、Context Policy、系统提示段、Prov
 - steering 与 followup 竞争；
 - Provider/Plugin 更新时 lease 固定。
 
+## 当前实现（2026-09-12）
+
+- `agent_turns`、`agent_steps`、`agent_model_attempts` 保存执行投影；
+- 用户输入、Turn 创建和首事件在一个事务中提交；最终 assistant 消息、终态和末事件也
+  在一个事务中提交；
+- `model.requested` 和 `tool.started` 必须先持久化，失败时禁止越过边界继续调用模型或
+  执行工具；
+- 同一 Conversation 只允许一个 running/cancelling Turn；
+- 取消先写 `turn.cancel_requested`，再触发进程内 `CancelCauseFunc`；
+- Host 启动时把遗留活动 Turn 分类为 `interrupted/safe_to_retry`，存在未闭合 Tool Call
+  时分类为 `needs_reconciliation/unknown_external_effect`，绝不自动重放；
+- API 已提供 Turn 列表和取消，Web UI 在运行中显示 Stop。
+
+下一小步是把提交 Turn 改为异步 Receipt，并增加 live event broker/SSE cursor。此步骤
+完成前，HTTP 请求断开仍会取消对应 Turn，不宣称支持窗口关闭后后台继续执行。

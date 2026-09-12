@@ -104,6 +104,13 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		recovered, err := st.RecoverInterruptedAgentTurns(ctx)
+		if err != nil {
+			return err
+		}
+		if recovered > 0 {
+			slog.Warn("recovered interrupted agent turns", "count", recovered)
+		}
 		return h.Provide("agent", agent.New(st, providers, forge, evolutionService))
 	}})
 	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.plugin-forge.v1", Version: "0.1.0", Description: "User-controlled full-stack plugin forge and sidecar runtime", Requires: []string{"core.storage.sqlite"}, Capabilities: []string{"plugin.generate", "plugin.build", "plugin.approve", "plugin.install", "plugin.invoke"}}, InitFn: func(ctx context.Context, h *core.Host) error {

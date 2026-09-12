@@ -18,6 +18,7 @@ type Installation = { id: string; pluginId: string; projectId: string; activeRel
 type Capability = { id: string; summary: string; risk: string; pluginId?: string; releaseId?: string; version?: string };
 type SurfaceState = { pluginId: string; releaseId: string; kind: string; surfaceId: string; status: string; registryEpoch: number };
 type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; details: Record<string, unknown>; createdAt: string };
+type AgentTurn = { id: string; conversationId: string; status: string; stopReason?: string; recoveryClass?: string; cancelRequested: boolean; lastSequence: number; startedAt: string; completedAt?: string };
 
 export default function AxiomApp() {
   const [loading, setLoading] = useState(true);
@@ -61,22 +62,36 @@ export default function AxiomApp() {
   async function send(content: string) {
     if (!content.trim() || sending) return;
     setSending(true); setNotice('');
+    let targetId = active?.id ?? '';
     try {
       let target = active;
       if (!target) {
         if (!providers.length) { setSettingsOpen(true); return; }
         const created = await request<Conversation>('/conversations', { method: 'POST', body: JSON.stringify({ title: content.trim().slice(0, 42), providerId: providers[0].id }) });
-        target = { ...created, messages: [] }; setConversations((items) => [created, ...items]);
+        target = { ...created, messages: [] }; targetId = created.id; setConversations((items) => [created, ...items]);
       }
       const pending: Message = { id: `pending-${Date.now()}`, role: 'user', content, createdAt: new Date().toISOString() };
       setActive({ ...target, messages: [...target.messages, pending] });
       await request<Message>(`/conversations/${target.id}/messages`, { method: 'POST', body: JSON.stringify({ content }) });
-      const refreshed = await request<ConversationDetail>(`/conversations/${target.id}`);
-      const events = await request<TraceEvent[]>(`/conversations/${target.id}/trace`);
-      setTrace(events);
-      setActive(refreshed); setConversations((items) => items.map((item) => item.id === refreshed.id ? refreshed : item));
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Agent turn failed'); }
-    finally { setSending(false); }
+    finally {
+      if (targetId) {
+        const [refreshed, events] = await Promise.all([request<ConversationDetail>(`/conversations/${targetId}`), request<TraceEvent[]>(`/conversations/${targetId}/trace`)]).catch(() => [null, null] as const);
+        if (refreshed && events) { setTrace(events); setActive(refreshed); setConversations((items) => items.map((item) => item.id === refreshed.id ? refreshed : item)); }
+      }
+      setSending(false);
+    }
+  }
+
+  async function cancelTurn() {
+    if (!active || !sending) return;
+    try {
+      const turns = await request<AgentTurn[]>(`/conversations/${active.id}/turns`);
+      const running = turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling');
+      if (!running) { setNotice('No active turn was found.'); return; }
+      await request(`/agent/turns/${running.id}/cancel`, { method: 'POST', body: JSON.stringify({ reason: 'user_requested' }) });
+      setNotice('Stopping after the current cancellable operation…');
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not stop the turn'); }
   }
 
   if (loading) return <Splash />;
@@ -84,7 +99,7 @@ export default function AxiomApp() {
   return <main className="app-shell">
     <Sidebar user={user} conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onEvolution={() => setEvolutionOpen(true)} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} onLogout={async () => { await request('/auth/logout', { method: 'POST' }); setUser(null); }} />
     <section className="workspace"><header className="workspace-header"><div><span className="eyebrow">LOCAL AGENT / MISSION</span><h1>{active?.title ?? 'Untitled workspace'}</h1></div><div className="header-actions"><span className="status-pill"><i /> runtime online</span><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Open settings">⌘</button></div></header>
-      <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} onSend={send} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} trace={trace} /></div>
+      <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} onSend={send} onCancel={cancelTurn} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} trace={trace} /></div>
     </section>
     {settingsOpen && <Settings providers={providers} onClose={() => setSettingsOpen(false)} onSaved={(next) => { setProviders((items) => items.some((item) => item.id === next.id) ? items.map((item) => item.id === next.id ? next : item) : [next, ...items]); setNotice('Provider saved'); }} />}
     {evolutionOpen && <EvolutionCenter providers={providers} onClose={() => setEvolutionOpen(false)} />}
@@ -109,9 +124,9 @@ function Sidebar({ user, conversations, activeId, onNew, onOpen, onEvolution, on
   return <aside className="sidebar"><div className="brand"><div className="brand-mark">A</div><span>AXIOM</span><small>0.2</small></div><button className="new-button" onClick={onNew}><span>＋</span> New mission <kbd>⌘ N</kbd></button><nav><p>MISSIONS</p>{conversations.length === 0 ? <div className="empty-nav">No missions yet.<br/>Start with an objective.</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onEvolution}><i>⌁</i><span>Evolution Lab</span></button><button onClick={onPlugins}><i>◇</i><span>Plugin Forge</span></button><button onClick={onSettings}><i>⚙</i><span>Provider settings</span></button><div className="operator"><span>{user.displayName.slice(0,2).toUpperCase()}</span><div><b>{user.displayName}</b><small>{user.email}</small></div><button onClick={onLogout} title="Sign out">↗</button></div></div></aside>;
 }
 
-function Chat({ active, providers, sending, notice, onSend, onConfigure }: { active: ConversationDetail | null; providers: Provider[]; sending: boolean; notice: string; onSend: (content: string) => void; onConfigure: () => void }) {
+function Chat({ active, providers, sending, notice, onSend, onCancel, onConfigure }: { active: ConversationDetail | null; providers: Provider[]; sending: boolean; notice: string; onSend: (content: string) => void; onCancel: () => void; onConfigure: () => void }) {
   const [draft, setDraft] = useState(''); const suggestions = ['Review this repository architecture', 'Design a reliable execution plan', 'Trace a bug with evidence']; const submit = () => { const value = draft; if (value.trim()) { setDraft(''); onSend(value); } };
-  return <div className="chat-column"><div className="messages">{!active?.messages.length ? <div className="empty-chat"><div className="pulse-orbit"><span>A</span></div><span className="eyebrow">AGENT READY</span><h2>What are we building?</h2><p>Give Axiom a concrete outcome. The runtime will retain the mission state and route it through your configured model.</p>{!providers.length ? <button className="setup-card" onClick={onConfigure}><span>01</span><div><b>Connect a model provider</b><small>Add any OpenAI-compatible API endpoint</small></div><i>→</i></button> : <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setDraft(text)}>{text}<span>↗</span></button>)}</div>}</div> : active.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><div className="message-role">{message.role === 'user' ? 'YOU' : 'AXIOM'}</div><div className="message-body">{message.content}</div></article>)}{sending && <article className="message assistant"><div className="message-role">AXIOM</div><div className="thinking"><i/><i/><i/> reasoning</div></article>}</div>{notice && <div className="notice">{notice}</div>}<div className="composer"><textarea value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }} placeholder={providers.length ? 'Describe the outcome, constraints, or next move…' : 'Configure a model provider to begin…'} disabled={!providers.length || sending}/><div className="composer-row"><span>Enter to run · Shift Enter for newline</span><button onClick={submit} disabled={!draft.trim() || sending}>Run <i>↑</i></button></div></div></div>;
+  return <div className="chat-column"><div className="messages">{!active?.messages.length ? <div className="empty-chat"><div className="pulse-orbit"><span>A</span></div><span className="eyebrow">AGENT READY</span><h2>What are we building?</h2><p>Give Axiom a concrete outcome. The runtime will retain the mission state and route it through your configured model.</p>{!providers.length ? <button className="setup-card" onClick={onConfigure}><span>01</span><div><b>Connect a model provider</b><small>Add a supported API protocol</small></div><i>→</i></button> : <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setDraft(text)}>{text}<span>↗</span></button>)}</div>}</div> : active.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><div className="message-role">{message.role === 'user' ? 'YOU' : 'AXIOM'}</div><div className="message-body">{message.content}</div></article>)}{sending && <article className="message assistant"><div className="message-role">AXIOM</div><div className="thinking"><i/><i/><i/> reasoning</div></article>}</div>{notice && <div className="notice">{notice}</div>}<div className="composer"><textarea value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }} placeholder={providers.length ? 'Describe the outcome, constraints, or next move…' : 'Configure a model provider to begin…'} disabled={!providers.length || sending}/><div className="composer-row"><span>{sending ? 'Turn is durable and can be cancelled safely' : 'Enter to run · Shift Enter for newline'}</span>{sending ? <button className="stop-button" onClick={onCancel}>Stop <i>■</i></button> : <button onClick={submit} disabled={!draft.trim()}>Run <i>↑</i></button>}</div></div></div>;
 }
 
 function RuntimePanel({ plugins, provider, messageCount, trace }: { plugins: Plugin[]; provider?: Provider; messageCount: number; trace: TraceEvent[] }) {

@@ -68,6 +68,31 @@ CREATE TABLE IF NOT EXISTS agent_trace_events (
  UNIQUE(turn_id, sequence)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_trace_conversation ON agent_trace_events(conversation_id, created_at);
+CREATE TABLE IF NOT EXISTS agent_turns (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
+ user_id TEXT NOT NULL REFERENCES users(id), input_message_id TEXT NOT NULL REFERENCES messages(id),
+ result_message_id TEXT REFERENCES messages(id), provider_id TEXT NOT NULL REFERENCES providers(id),
+ generation_id TEXT NOT NULL, definition_digest TEXT NOT NULL,
+ status TEXT NOT NULL, stop_reason TEXT NOT NULL DEFAULT '', recovery_class TEXT NOT NULL DEFAULT '',
+ cancel_requested INTEGER NOT NULL DEFAULT 0, last_sequence INTEGER NOT NULL DEFAULT 0,
+ started_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, completed_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_agent_turns_conversation ON agent_turns(conversation_id, started_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_turns_one_active ON agent_turns(conversation_id)
+ WHERE status IN ('running','cancelling');
+CREATE TABLE IF NOT EXISTS agent_steps (
+ id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id), ordinal INTEGER NOT NULL,
+ status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
+ started_at DATETIME NOT NULL, completed_at DATETIME,
+ UNIQUE(turn_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS agent_model_attempts (
+ id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id),
+ step_id TEXT NOT NULL REFERENCES agent_steps(id), ordinal INTEGER NOT NULL,
+ status TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', usage_json BLOB NOT NULL DEFAULT '{}',
+ error_class TEXT NOT NULL DEFAULT '', started_at DATETIME NOT NULL, completed_at DATETIME,
+ UNIQUE(step_id, ordinal)
+);
 CREATE TABLE IF NOT EXISTS agent_definitions (
  user_id TEXT NOT NULL REFERENCES users(id), digest TEXT NOT NULL,
  api_version TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL,
@@ -307,7 +332,12 @@ func (s *Store) AddTraceEvent(ctx context.Context, userID string, event domain.T
 }
 
 func (s *Store) TraceEvents(ctx context.Context, userID, conversationID string) ([]domain.TraceEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.id,t.conversation_id,t.turn_id,t.sequence,t.kind,t.details_json,t.created_at FROM agent_trace_events t JOIN conversations c ON c.id=t.conversation_id WHERE t.conversation_id=? AND c.user_id=? ORDER BY t.created_at,t.sequence`, conversationID, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT t.id,t.conversation_id,t.turn_id,t.sequence,t.kind,t.details_json,t.created_at
+FROM agent_trace_events t
+JOIN conversations c ON c.id=t.conversation_id
+LEFT JOIN agent_turns a ON a.id=t.turn_id
+WHERE t.conversation_id=? AND c.user_id=?
+ORDER BY COALESCE(a.started_at,t.created_at),t.sequence,t.created_at`, conversationID, userID)
 	if err != nil {
 		return nil, err
 	}

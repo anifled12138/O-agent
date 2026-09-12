@@ -83,6 +83,6 @@ Release 不影响当前版本。
 
 ## 当前执行位置
 
-从 M1 开始。现有原型作为兼容基线，不先开发更多 UI 或高级 Workflow，直到 Provider
-与 Agent contracts 可支撑它们。
-
+M1 的四种首批协议适配和 Function Calling 归一化已实现；model profile override、
+streaming adapter 和完整 capability probe 仍待完成。M2 已实现 durable Turn/Step/Attempt
+journal、取消和保守重启分类；下一项是异步 Receipt、Inbox 和带 cursor 的 live stream。

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -73,5 +74,23 @@ func TestLoopStopsAtGenerationStepBudget(t *testing.T) {
 	result, err := executeLoop(context.Background(), model, loopRequest{UserID: "u", ProviderID: "p", Generation: testGeneration(evolution.StrategyReact, 2), Scope: &fakeScope{}})
 	if err != nil || !result.Metrics.ReachedStepLimit || result.Metrics.ModelCalls != 2 {
 		t.Fatalf("step budget was not enforced: %#v, %v", result, err)
+	}
+}
+
+func TestLoopDoesNotExecuteToolWhenDurableStartEventFails(t *testing.T) {
+	model := &scriptedModel{results: []provider.Completion{{ToolCalls: []provider.ToolCall{{ID: "call_1", Type: "function", Function: provider.ToolFunction{Name: "read", Arguments: `{}`}}}}}}
+	scope := &fakeScope{}
+	journalFailure := errors.New("journal unavailable")
+	result, err := executeLoop(context.Background(), model, loopRequest{
+		UserID: "u", ProviderID: "p", Generation: testGeneration(evolution.StrategyReact, 2), Scope: scope,
+		Emit: func(kind string, _ any) error {
+			if kind == "tool.started" {
+				return journalFailure
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, journalFailure) || scope.executions != 0 || result.Metrics.ToolCalls != 1 {
+		t.Fatalf("loop crossed the durable boundary: result=%#v executions=%d err=%v", result, scope.executions, err)
 	}
 }

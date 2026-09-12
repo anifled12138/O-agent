@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"axiom.local/agent/internal/domain"
@@ -21,10 +23,12 @@ type Service struct {
 	providers *provider.Service
 	forge     *pluginforge.Service
 	evolution *evolution.Service
+	runningMu sync.Mutex
+	running   map[string]context.CancelCauseFunc
 }
 
 func New(store *storage.Store, providers *provider.Service, forge *pluginforge.Service, evolutionService *evolution.Service) *Service {
-	return &Service{store: store, providers: providers, forge: forge, evolution: evolutionService}
+	return &Service{store: store, providers: providers, forge: forge, evolution: evolutionService, running: map[string]context.CancelCauseFunc{}}
 }
 func (s *Service) List(ctx context.Context, userID string) ([]domain.Conversation, error) {
 	return s.store.ListConversations(ctx, userID)
@@ -34,6 +38,25 @@ func (s *Service) Get(ctx context.Context, userID, id string) (domain.Conversati
 }
 func (s *Service) Trace(ctx context.Context, userID, id string) ([]domain.TraceEvent, error) {
 	return s.store.TraceEvents(ctx, userID, id)
+}
+func (s *Service) Turns(ctx context.Context, userID, conversationID string) ([]domain.AgentTurn, error) {
+	return s.store.AgentTurns(ctx, userID, conversationID)
+}
+func (s *Service) Cancel(ctx context.Context, userID, turnID, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "user_requested"
+	}
+	if err := s.store.RequestAgentTurnCancel(ctx, userID, turnID, reason); err != nil {
+		return err
+	}
+	s.runningMu.Lock()
+	cancel := s.running[turnID]
+	s.runningMu.Unlock()
+	if cancel != nil {
+		cancel(errors.New(reason))
+	}
+	return nil
 }
 func (s *Service) Create(ctx context.Context, userID, title, providerID string) (domain.Conversation, error) {
 	title = strings.TrimSpace(title)
@@ -61,11 +84,6 @@ func (s *Service) Turn(ctx context.Context, userID, conversationID, content stri
 	if content == "" {
 		return domain.Message{}, domain.ErrInvalid
 	}
-	now := time.Now().UTC()
-	userMessage := domain.Message{ID: id("msg"), ConversationID: conversationID, Role: "user", Content: content, CreatedAt: now}
-	if err := s.store.AddMessage(ctx, userID, userMessage); err != nil {
-		return domain.Message{}, err
-	}
 	detail, err := s.store.Conversation(ctx, userID, conversationID)
 	if err != nil {
 		return domain.Message{}, err
@@ -74,19 +92,63 @@ func (s *Service) Turn(ctx context.Context, userID, conversationID, content stri
 	if err != nil {
 		return domain.Message{}, err
 	}
-	messages, omitted := buildContext(detail, generation)
+	now := time.Now().UTC()
+	userMessage := domain.Message{ID: id("msg"), ConversationID: conversationID, Role: "user", Content: content, CreatedAt: now}
+	turn := domain.AgentTurn{ID: id("turn"), ConversationID: conversationID, UserID: userID, InputMessageID: userMessage.ID, ProviderID: detail.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, Status: "running", StartedAt: now, UpdatedAt: now}
+	runCtx, cancel := context.WithCancelCause(ctx)
+	s.runningMu.Lock()
+	s.running[turn.ID] = cancel
+	s.runningMu.Unlock()
+	defer func() {
+		s.runningMu.Lock()
+		delete(s.running, turn.ID)
+		s.runningMu.Unlock()
+		cancel(nil)
+	}()
 	scope := newTurnScope(s, userID)
 	defer scope.Close()
-	trace := newTraceRecorder(ctx, s.store, userID, conversationID)
-	trace.emit("turn.started", map[string]any{"messageCount": len(detail.Messages), "omittedMessages": omitted, "pinnedTools": len(scope.tools), "pinnedSkills": len(scope.skills), "generationId": generation.ID, "definitionDigest": generation.DefinitionDigest, "strategy": generation.Definition.Spec.Strategy})
-	result, err := executeLoop(ctx, s.providers, loopRequest{UserID: userID, ProviderID: detail.ProviderID, Generation: generation, Messages: messages, Scope: scope, Emit: trace.emit})
-	if err != nil {
+	startedDetails, _ := json.Marshal(map[string]any{"messageCount": len(detail.Messages) + 1, "pinnedTools": len(scope.tools), "pinnedSkills": len(scope.skills), "generationId": generation.ID, "definitionDigest": generation.DefinitionDigest, "strategy": generation.Definition.Spec.Strategy})
+	if err := s.store.StartAgentTurn(ctx, userID, turn, userMessage, startedDetails); err != nil {
 		return domain.Message{}, err
 	}
+	detail.Messages = append(detail.Messages, userMessage)
+	messages, omitted := buildContext(detail, generation)
+	trace := newTraceRecorder(runCtx, s.store, userID, turn.ID)
+	if omitted > 0 {
+		if err := trace.emit("context.compacted", map[string]any{"omittedMessages": omitted}); err != nil {
+			return domain.Message{}, s.failTurn(ctx, userID, turn.ID, err, "journal_error")
+		}
+	}
+	result, err := executeLoop(runCtx, s.providers, loopRequest{UserID: userID, ProviderID: detail.ProviderID, Generation: generation, Messages: messages, Scope: scope, Emit: trace.emit})
+	if err != nil {
+		status, reason := "failed", "runtime_error"
+		if errors.Is(runCtx.Err(), context.Canceled) {
+			status, reason = "cancelled", "cancelled"
+		}
+		return domain.Message{}, s.finishFailedTurn(ctx, userID, turn.ID, status, reason, err, result.Metrics)
+	}
 	assistant := domain.Message{ID: id("msg"), ConversationID: conversationID, Role: "assistant", Content: result.Reply, CreatedAt: time.Now().UTC()}
-	err = s.store.AddMessage(ctx, userID, assistant)
-	trace.emit("turn.completed", map[string]any{"replyBytes": len(result.Reply), "persisted": err == nil, "metrics": result.Metrics, "generationId": generation.ID})
-	return assistant, err
+	details, _ := json.Marshal(map[string]any{"replyBytes": len(result.Reply), "metrics": result.Metrics, "generationId": generation.ID})
+	finishCtx, finishCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer finishCancel()
+	if err := s.store.FinishAgentTurn(finishCtx, userID, turn.ID, "completed", "assistant_response", &assistant, details); err != nil {
+		return domain.Message{}, err
+	}
+	return assistant, nil
+}
+
+func (s *Service) failTurn(ctx context.Context, userID, turnID string, cause error, reason string) error {
+	return s.finishFailedTurn(ctx, userID, turnID, "failed", reason, cause, domain.RunMetrics{})
+}
+
+func (s *Service) finishFailedTurn(ctx context.Context, userID, turnID, status, reason string, cause error, metrics domain.RunMetrics) error {
+	details, _ := json.Marshal(map[string]any{"error": cause.Error(), "metrics": metrics})
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if journalErr := s.store.FinishAgentTurn(finishCtx, userID, turnID, status, reason, nil, details); journalErr != nil {
+		return errors.Join(cause, journalErr)
+	}
+	return cause
 }
 
 // RunEvaluation executes one immutable generation without writing conversation

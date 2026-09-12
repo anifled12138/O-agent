@@ -65,7 +65,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/conversations", s.requireUser(http.HandlerFunc(s.conversationCreate)))
 	mux.Handle("GET /api/v1/conversations/{id}", s.requireUser(http.HandlerFunc(s.conversationGet)))
 	mux.Handle("GET /api/v1/conversations/{id}/trace", s.requireUser(http.HandlerFunc(s.conversationTrace)))
+	mux.Handle("GET /api/v1/conversations/{id}/turns", s.requireUser(http.HandlerFunc(s.conversationTurns)))
 	mux.Handle("POST /api/v1/conversations/{id}/messages", s.requireUser(http.HandlerFunc(s.messageCreate)))
+	mux.Handle("POST /api/v1/agent/turns/{id}/cancel", s.requireUser(http.HandlerFunc(s.turnCancel)))
 	mux.Handle("GET /api/v1/evolution/generations", s.requireUser(http.HandlerFunc(s.generationList)))
 	mux.Handle("POST /api/v1/evolution/generations/candidates", s.requireUser(http.HandlerFunc(s.generationCreateCandidate)))
 	mux.Handle("POST /api/v1/evolution/generations/{id}/promote", s.requireUser(http.HandlerFunc(s.generationPromote)))
@@ -234,6 +236,27 @@ func (s *Server) conversationTrace(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusOK, events)
 }
+func (s *Server) conversationTurns(w http.ResponseWriter, r *http.Request) {
+	turns, err := s.agent.Turns(r.Context(), currentUser(r).ID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, turns)
+}
+func (s *Server) turnCancel(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Reason string `json:"reason"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if err := s.agent.Cancel(r.Context(), currentUser(r).ID, r.PathValue("id"), in.Reason); err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, map[string]any{"ok": true})
+}
 func (s *Server) messageCreate(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Content string `json:"content"`
@@ -243,6 +266,10 @@ func (s *Server) messageCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	m, err := s.agent.Turn(r.Context(), currentUser(r).ID, r.PathValue("id"), in.Content)
 	if err != nil {
+		if errors.Is(err, domain.ErrInvalid) || errors.Is(err, domain.ErrConflict) || errors.Is(err, domain.ErrNotFound) {
+			fail(w, err)
+			return
+		}
 		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
