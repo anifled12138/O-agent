@@ -1,17 +1,9 @@
 'use client';
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { request } from './api';
 
 type Provider = { id: string; name: string; model: string };
-const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8080/api/v1';
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, { ...init, credentials: 'include', headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(body.error || 'Request failed');
-  }
-  return response.json();
-}
 
 type AgentSpec = { strategy: 'react.v1' | 'plan-react.v1'; systemPrompt: string; plannerPrompt?: string; maxSteps: number };
 type Generation = { id: string; number: number; scope: string; status: string; definitionDigest: string; definition: { name: string; description: string; parentDigest?: string; spec: AgentSpec }; createdAt: string };

@@ -56,6 +56,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/auth/logout", s.requireUser(http.HandlerFunc(s.logout)))
 	mux.Handle("GET /api/v1/auth/me", s.requireUser(http.HandlerFunc(s.me)))
 	mux.Handle("GET /api/v1/system/plugins", s.requireUser(http.HandlerFunc(s.pluginList)))
+	mux.Handle("GET /api/v1/provider-kinds", s.requireUser(http.HandlerFunc(s.providerKinds)))
 	mux.Handle("GET /api/v1/providers", s.requireUser(http.HandlerFunc(s.providerList)))
 	mux.Handle("POST /api/v1/providers", s.requireUser(http.HandlerFunc(s.providerCreate)))
 	mux.Handle("PUT /api/v1/providers/{id}", s.requireUser(http.HandlerFunc(s.providerUpdate)))
@@ -157,6 +158,9 @@ func (s *Server) providerList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusOK, items)
+}
+func (s *Server) providerKinds(w http.ResponseWriter, _ *http.Request) {
+	write(w, http.StatusOK, provider.Kinds())
 }
 func (s *Server) providerCreate(w http.ResponseWriter, r *http.Request) {
 	var in provider.Input

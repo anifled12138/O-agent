@@ -1,5 +1,7 @@
 @import 'tailwindcss';
 
+.provider-form select{height:48px;border:1px solid #303638;background:#111517;padding:0 14px;color:var(--ink);outline:none}.provider-form select:focus{border-color:#7d9944;box-shadow:0 0 0 3px #c8ff4f0a}
+
 :root {
   --background: #ffffff;
   --foreground: #171717;

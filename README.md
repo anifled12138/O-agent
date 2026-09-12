@@ -8,7 +8,7 @@ storage, authentication, model providers, the agent loop, and transports.
 
 - Local user registration and cookie-based login
 - Encrypted model-provider credentials
-- OpenAI-compatible provider configuration and connectivity test
+- OpenAI Responses, Anthropic Messages, DeepSeek Chat, and generic OpenAI-compatible providers
 - Persistent conversations and a working model turn
 - Plugin lifecycle and runtime inspection
 - Responsive product UI
@@ -33,6 +33,8 @@ defined in
 [`docs/prd-recursive-bootstrap-agent-v0.1.md`](docs/prd-recursive-bootstrap-agent-v0.1.md).
 The implemented M0/M1 vertical slice is documented in
 [`docs/evolution-runtime-implementation.md`](docs/evolution-runtime-implementation.md).
+The executable architecture and implementation contracts are indexed in
+[`docs/design/README.md`](docs/design/README.md).
 
 ## Run locally
 

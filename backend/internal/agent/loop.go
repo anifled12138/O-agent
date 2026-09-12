@@ -61,6 +61,7 @@ func executeLoop(ctx context.Context, models modelRuntime, request loopRequest) 
 			emit("planner.failed", map[string]any{"error": err.Error()})
 			return loopResult{Metrics: metrics}, err
 		}
+		emitCompatibilityWarnings(emit, completion.Warnings, 0)
 		brief := strings.TrimSpace(completion.Content)
 		if brief == "" {
 			metrics.DurationMillis = time.Since(started).Milliseconds()
@@ -85,6 +86,7 @@ func executeLoop(ctx context.Context, models modelRuntime, request loopRequest) 
 			emit("model.failed", map[string]any{"step": step + 1, "error": err.Error()})
 			return loopResult{Metrics: metrics}, err
 		}
+		emitCompatibilityWarnings(emit, completion.Warnings, step+1)
 		emit("model.completed", map[string]any{"step": step + 1, "toolCallCount": len(completion.ToolCalls), "contentBytes": len(completion.Content), "model": completion.Model, "usage": completion.Usage})
 		if len(completion.ToolCalls) == 0 {
 			reply := strings.TrimSpace(completion.Content)
@@ -108,6 +110,12 @@ func executeLoop(ctx context.Context, models modelRuntime, request loopRequest) 
 	metrics.ReachedStepLimit = true
 	metrics.DurationMillis = time.Since(started).Milliseconds()
 	return loopResult{Reply: "I reached this generation's execution-step limit. Completed observations are preserved; continue the mission or create a frontier challenge to test a stronger agent generation.", Metrics: metrics}, nil
+}
+
+func emitCompatibilityWarnings(emit func(string, any), warnings []provider.CompatibilityWarning, step int) {
+	for _, warning := range warnings {
+		emit("provider.compatibility_warning", map[string]any{"step": step, "code": warning.Code, "message": warning.Message})
+	}
 }
 
 func addUsage(metrics *domain.RunMetrics, usage provider.Usage) {

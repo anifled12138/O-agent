@@ -36,3 +36,8 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# local validation artifacts (the repository uses package-lock.json)
+/pnpm-lock.yaml
+/pnpm-workspace.yaml
+*.tsbuildinfo

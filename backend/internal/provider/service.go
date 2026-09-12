@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -37,8 +36,9 @@ type ToolCall struct {
 	Function ToolFunction `json:"function"`
 }
 type ToolFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Name                      string `json:"name"`
+	Arguments                 string `json:"arguments"`
+	normalizedObjectArguments bool
 }
 type ToolDefinition struct {
 	Type     string `json:"type"`
@@ -53,6 +53,7 @@ type Completion struct {
 	ToolCalls []ToolCall
 	Model     string
 	Usage     Usage
+	Warnings  []CompatibilityWarning
 }
 type Usage struct {
 	PromptTokens     int `json:"promptTokens"`
@@ -71,13 +72,11 @@ func New(store *storage.Store, vault *secure.Vault) *Service {
 
 func (s *Service) Create(ctx context.Context, userID string, in Input) (domain.Provider, error) {
 	in.Name = strings.TrimSpace(in.Name)
-	in.Kind = strings.TrimSpace(in.Kind)
+	var ok bool
+	in.Kind, ok = normalizeKind(in.Kind)
 	in.Model = strings.TrimSpace(in.Model)
-	if in.Kind == "" {
-		in.Kind = "openai-compatible"
-	}
-	baseURL, ok := canonicalBaseURL(in.BaseURL)
-	if in.Name == "" || in.Model == "" || in.APIKey == "" || !ok {
+	baseURL, validURL := canonicalBaseURL(in.BaseURL)
+	if in.Name == "" || in.Model == "" || in.APIKey == "" || !ok || !validURL {
 		return domain.Provider{}, domain.ErrInvalid
 	}
 	in.BaseURL = baseURL
@@ -96,13 +95,14 @@ func (s *Service) Update(ctx context.Context, userID, id string, in Input) (doma
 		return domain.Provider{}, err
 	}
 	in.Name = strings.TrimSpace(in.Name)
-	in.Kind = strings.TrimSpace(in.Kind)
-	in.Model = strings.TrimSpace(in.Model)
-	if in.Kind == "" {
-		in.Kind = "openai-compatible"
+	if strings.TrimSpace(in.Kind) == "" {
+		in.Kind = existing.Kind
 	}
+	var validKind bool
+	in.Kind, validKind = normalizeKind(in.Kind)
+	in.Model = strings.TrimSpace(in.Model)
 	baseURL, ok := canonicalBaseURL(in.BaseURL)
-	if in.Name == "" || in.Model == "" || !ok {
+	if in.Name == "" || in.Model == "" || !ok || !validKind {
 		return domain.Provider{}, domain.ErrInvalid
 	}
 	if in.APIKey != "" {
@@ -129,15 +129,17 @@ func (s *Service) Test(ctx context.Context, userID, id string) error {
 	if err != nil {
 		return err
 	}
-	endpoint := apiEndpoint(p.BaseURL, "/models")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	adapter, err := adapterFor(p.Kind)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	resp, err := s.client.Do(req)
+	req, err := adapter.modelsRequest(ctx, p, key)
 	if err != nil {
 		return err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return transportError(err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -145,10 +147,10 @@ func (s *Service) Test(ctx context.Context, userID, id string) error {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("provider returned %s from %s: %s", resp.Status, endpoint, bodyPreview(body))
+		return httpProviderError(resp, body)
 	}
 	if !json.Valid(body) {
-		return fmt.Errorf("provider returned non-JSON content from %s (%s); check the API base URL", endpoint, responseType(resp))
+		return &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, SafeDetail: fmt.Sprintf("provider returned non-JSON content from %s (%s); check the API base URL", req.URL.String(), responseType(resp))}
 	}
 	var models struct {
 		Data []struct {
@@ -185,25 +187,17 @@ func (s *Service) CompleteWithTools(ctx context.Context, userID, id string, mess
 	if err != nil {
 		return Completion{}, err
 	}
-	payload := map[string]any{"model": p.Model, "messages": messages, "temperature": 0.2}
-	if len(tools) > 0 {
-		payload["tools"] = tools
-		payload["tool_choice"] = "auto"
-	}
-	body, err := json.Marshal(payload)
+	adapter, err := adapterFor(p.Kind)
 	if err != nil {
 		return Completion{}, err
 	}
-	endpoint := apiEndpoint(p.BaseURL, "/chat/completions")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := adapter.completionRequest(ctx, p, key, messages, tools)
 	if err != nil {
 		return Completion{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return Completion{}, err
+		return Completion{}, transportError(err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
@@ -211,42 +205,60 @@ func (s *Service) CompleteWithTools(ctx context.Context, userID, id string, mess
 		return Completion{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Completion{}, fmt.Errorf("provider returned %s from %s: %s", resp.Status, endpoint, bodyPreview(raw))
+		return Completion{}, httpProviderError(resp, raw)
 	}
 	if !json.Valid(raw) {
-		return Completion{}, fmt.Errorf("provider returned non-JSON content from %s (%s); check the API base URL", endpoint, responseType(resp))
+		return Completion{}, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, SafeDetail: fmt.Sprintf("provider returned non-JSON content from %s (%s); check the API base URL", req.URL.String(), responseType(resp))}
 	}
-	var result struct {
-		Model string `json:"model"`
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		} `json:"usage"`
-		Choices []struct {
-			Message struct {
-				Content   string     `json:"content"`
-				ToolCalls []ToolCall `json:"tool_calls"`
-			} `json:"message"`
-		} `json:"choices"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
+	completion, err := adapter.decodeCompletion(raw)
+	if err != nil {
+		return Completion{}, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, SafeDetail: err.Error(), Cause: err}
 	}
-	if err = json.Unmarshal(raw, &result); err != nil {
-		return Completion{}, err
+	return completion, nil
+}
+
+func transportError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &ProviderError{Class: ErrorCancelled, SafeDetail: err.Error(), Cause: err}
 	}
-	if result.Error != nil {
-		return Completion{}, errors.New(result.Error.Message)
+	return &ProviderError{Class: ErrorUnavailable, SafeDetail: "could not reach the model provider", Cause: err}
+}
+
+func httpProviderError(resp *http.Response, body []byte) error {
+	class := ErrorInvalidRequest
+	lowerBody := strings.ToLower(string(body))
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		class = ErrorAuthentication
+	case resp.StatusCode == http.StatusNotFound:
+		class = ErrorNotFound
+	case resp.StatusCode == http.StatusTooManyRequests:
+		class = ErrorRateLimit
+	case resp.StatusCode >= 500:
+		class = ErrorUnavailable
+	case strings.Contains(lowerBody, "context_length_exceeded") || strings.Contains(lowerBody, "context window") || strings.Contains(lowerBody, "too many tokens"):
+		class = ErrorContextOverflow
+	case strings.Contains(lowerBody, "unsupported") || strings.Contains(lowerBody, "not supported"):
+		class = ErrorUnsupported
 	}
-	if len(result.Choices) == 0 {
-		return Completion{}, errors.New("provider returned no assistant choice")
+	detail := fmt.Sprintf("provider returned %s from %s: %s", resp.Status, resp.Request.URL.String(), bodyPreview(body))
+	return &ProviderError{Class: class, StatusCode: resp.StatusCode, RetryAfter: retryAfter(resp.Header.Get("Retry-After")), SafeDetail: detail}
+}
+
+func retryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
 	}
-	message := result.Choices[0].Message
-	if strings.TrimSpace(message.Content) == "" && len(message.ToolCalls) == 0 {
-		return Completion{}, errors.New("provider returned neither content nor tool calls")
+	if wait, err := time.ParseDuration(value + "s"); err == nil && wait > 0 {
+		return wait
 	}
-	return Completion{Content: message.Content, ToolCalls: message.ToolCalls, Model: result.Model, Usage: Usage{PromptTokens: result.Usage.PromptTokens, CompletionTokens: result.Usage.CompletionTokens, TotalTokens: result.Usage.TotalTokens}}, nil
+	if when, err := http.ParseTime(value); err == nil {
+		if wait := time.Until(when); wait > 0 {
+			return wait
+		}
+	}
+	return 0
 }
 
 func (s *Service) secret(ctx context.Context, userID, id string) (domain.Provider, string, error) {

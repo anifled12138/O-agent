@@ -1,10 +1,12 @@
 'use client';
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import EvolutionCenter from './EvolutionCenter';
+import { API, ASSET_ORIGIN, request } from './api';
 
 type User = { id: string; email: string; displayName: string };
 export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; hasApiKey: boolean };
+type ProviderKind = { kind: string; label: string; description: string; defaultBaseUrl: string };
 type Conversation = { id: string; title: string; providerId: string; agentGenerationId?: string; agentDefinitionDigest?: string; updatedAt: string };
 type Message = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string };
 type ConversationDetail = Conversation & { messages: Message[] };
@@ -16,19 +18,6 @@ type Installation = { id: string; pluginId: string; projectId: string; activeRel
 type Capability = { id: string; summary: string; risk: string; pluginId?: string; releaseId?: string; version?: string };
 type SurfaceState = { pluginId: string; releaseId: string; kind: string; surfaceId: string; status: string; registryEpoch: number };
 type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; details: Record<string, unknown>; createdAt: string };
-
-const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8080/api/v1';
-const ASSET_ORIGIN = new URL(API).origin;
-
-export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, { ...init, credentials: 'include', headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(body.error || 'Request failed');
-  }
-  if (response.status === 204) return undefined as T;
-  return response.json();
-}
 
 export default function AxiomApp() {
   const [loading, setLoading] = useState(true);
@@ -262,8 +251,57 @@ function forgeGuidance(state: string) {
 }
 
 function Settings({ providers, onClose, onSaved }: { providers: Provider[]; onClose: () => void; onSaved: (provider: Provider) => void }) {
-  const [busy, setBusy] = useState(false); const [status, setStatus] = useState(''); const [editing, setEditing] = useState<Provider | null>(providers[0] ?? null); const defaultName = useMemo(() => providers.length ? `Provider ${providers.length + 1}` : 'Primary model', [providers.length]);
-  async function save(event: FormEvent<HTMLFormElement>) { event.preventDefault(); setBusy(true); setStatus(''); const form = new FormData(event.currentTarget); try { const saved = await request<Provider>(editing ? `/providers/${editing.id}` : '/providers', { method: editing ? 'PUT' : 'POST', body: JSON.stringify(Object.fromEntries(form)) }); onSaved(saved); setEditing(saved); setStatus('Provider saved. Run Test to verify the model ID.'); } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not save provider'); } finally { setBusy(false); } }
-  async function test(id: string) { setStatus('Testing provider…'); try { await request(`/providers/${id}/test`, { method: 'POST' }); setStatus('Connection healthy.'); } catch (error) { setStatus(error instanceof Error ? error.message : 'Connection failed'); } }
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="settings-modal"><header><div><span className="eyebrow">SYSTEM / PROVIDERS</span><h2>Model connections</h2></div><button onClick={onClose}>×</button></header><p className="modal-lead">Connect an API model. Credentials are encrypted at rest by the local Go service and are never returned to the browser.</p>{!!providers.length && <div className="provider-list">{providers.map((item) => <div key={item.id}><span className="model-icon">M</span><div><b>{item.name}</b><small>{item.model} · {item.baseUrl}</small></div><div className="provider-actions"><button onClick={() => { setEditing(item); setStatus(''); }}>Edit</button><button onClick={() => test(item.id)}>Test</button></div></div>)}</div>}<form key={editing?.id ?? 'new'} onSubmit={save} className="provider-form"><p>{editing ? 'EDIT OPENAI-COMPATIBLE PROVIDER' : 'ADD OPENAI-COMPATIBLE PROVIDER'}</p><div className="form-grid"><label>CONNECTION NAME<input name="name" defaultValue={editing?.name ?? defaultName} required /></label><label>MODEL ID<input name="model" defaultValue={editing?.model ?? ''} placeholder="gpt-5 / deepseek-chat" required /></label><label className="wide">BASE URL<input name="baseUrl" defaultValue={editing?.baseUrl ?? 'https://api.openai.com/v1'} required /></label><label className="wide">API KEY<input name="apiKey" type="password" placeholder={editing ? 'Leave blank to keep the existing key' : 'sk-…'} required={!editing} /></label></div><input type="hidden" name="kind" value="openai-compatible"/>{status && <div className="form-status">{status}</div>}<button className="primary-button" disabled={busy}>{busy ? 'Encrypting…' : editing ? 'Update connection' : 'Save connection'}<span>→</span></button>{editing && <button type="button" className="text-button" onClick={() => { setEditing(null); setStatus(''); }}>Add another provider instead</button>}</form></section></div>;
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+  const [editing, setEditing] = useState<Provider | null>(providers[0] ?? null);
+  const [kinds, setKinds] = useState<ProviderKind[]>([]);
+  const defaultName = useMemo(() => providers.length ? `Provider ${providers.length + 1}` : 'Primary model', [providers.length]);
+
+  useEffect(() => {
+    request<ProviderKind[]>('/provider-kinds').then(setKinds).catch((error) => setStatus(error instanceof Error ? error.message : 'Could not load provider protocols'));
+  }, []);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setStatus('');
+    const form = new FormData(event.currentTarget);
+    try {
+      const saved = await request<Provider>(editing ? `/providers/${editing.id}` : '/providers', { method: editing ? 'PUT' : 'POST', body: JSON.stringify(Object.fromEntries(form)) });
+      onSaved(saved); setEditing(saved); setStatus('Provider saved. Run Test to verify authentication and the model ID.');
+    } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not save provider'); }
+    finally { setBusy(false); }
+  }
+
+  async function test(id: string) {
+    setStatus('Testing provider…');
+    try { await request(`/providers/${id}/test`, { method: 'POST' }); setStatus('Connection healthy.'); }
+    catch (error) { setStatus(error instanceof Error ? error.message : 'Connection failed'); }
+  }
+
+  function selectKind(event: ChangeEvent<HTMLSelectElement>) {
+    if (editing) return;
+    const selected = kinds.find((item) => item.kind === event.target.value);
+    const base = event.currentTarget.form?.elements.namedItem('baseUrl');
+    if (selected && base instanceof HTMLInputElement) base.value = selected.defaultBaseUrl;
+  }
+
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="settings-modal">
+      <header><div><span className="eyebrow">SYSTEM / PROVIDERS</span><h2>Model connections</h2></div><button onClick={onClose}>×</button></header>
+      <p className="modal-lead">Choose the provider&apos;s real API protocol. Credentials are encrypted by the local Go host and are never returned to the browser.</p>
+      {!!providers.length && <div className="provider-list">{providers.map((item) => <div key={item.id}><span className="model-icon">M</span><div><b>{item.name}</b><small>{item.model} · {item.kind}</small></div><div className="provider-actions"><button onClick={() => { setEditing(item); setStatus(''); }}>Edit</button><button onClick={() => test(item.id)}>Test</button></div></div>)}</div>}
+      <form key={editing?.id ?? 'new'} onSubmit={save} className="provider-form">
+        <p>{editing ? 'EDIT MODEL CONNECTION' : 'ADD MODEL CONNECTION'}</p>
+        <div className="form-grid">
+          <label>PROTOCOL<select name="kind" defaultValue={editing?.kind ?? 'openai-responses'} onChange={selectKind} required>{kinds.length ? kinds.map((item) => <option key={item.kind} value={item.kind}>{item.label}</option>) : <option value={editing?.kind ?? 'openai-responses'}>{editing?.kind ?? 'Loading protocols…'}</option>}</select></label>
+          <label>CONNECTION NAME<input name="name" defaultValue={editing?.name ?? defaultName} required /></label>
+          <label className="wide">MODEL ID<input name="model" defaultValue={editing?.model ?? ''} placeholder="gpt-5 / claude-sonnet / deepseek-chat" required /></label>
+          <label className="wide">BASE URL<input name="baseUrl" defaultValue={editing?.baseUrl ?? 'https://api.openai.com/v1'} required /></label>
+          <label className="wide">API KEY<input name="apiKey" type="password" placeholder={editing ? 'Leave blank to keep the existing key' : 'API key'} required={!editing} /></label>
+        </div>
+        {status && <div className="form-status">{status}</div>}
+        <button className="primary-button" disabled={busy}>{busy ? 'Encrypting…' : editing ? 'Update connection' : 'Save connection'}<span>→</span></button>
+        {editing && <button type="button" className="text-button" onClick={() => { setEditing(null); setStatus(''); }}>Add another provider instead</button>}
+      </form>
+    </section>
+  </div>;
 }

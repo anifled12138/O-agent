@@ -69,7 +69,7 @@ func run() error {
 		}
 		return h.Provide("auth", auth.New(st))
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "provider.openai-compatible", Version: "0.1.0", Description: "OpenAI-compatible model API adapter", Requires: []string{"core.storage.sqlite", "core.secrets.aesgcm"}, Capabilities: []string{"model.chat", "model.health"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+	register(plugins, &core.Component{Info: core.Manifest{ID: "provider.gateway.v1", Version: "0.2.0", Description: "Provider-neutral model gateway and protocol adapters", Requires: []string{"core.storage.sqlite", "core.secrets.aesgcm"}, Capabilities: []string{"model.chat", "model.tools", "model.health", "model.protocols"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		st, err := core.Service[*storage.Store](h, "storage")
 		if err != nil {
 			return err
@@ -87,7 +87,7 @@ func run() error {
 		}
 		return h.Provide("evolution", evolution.New(st))
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.agent.v1", Version: "0.2.0", Description: "Generation-pinned provider-neutral Agent runtime", Requires: []string{"core.storage.sqlite", "provider.openai-compatible", "runtime.plugin-forge.v1", "runtime.evolution.v1"}, Capabilities: []string{"agent.conversation", "agent.turn", "agent.tools", "agent.definition-runtime"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.agent.v1", Version: "0.2.0", Description: "Generation-pinned provider-neutral Agent runtime", Requires: []string{"core.storage.sqlite", "provider.gateway.v1", "runtime.plugin-forge.v1", "runtime.evolution.v1"}, Capabilities: []string{"agent.conversation", "agent.turn", "agent.tools", "agent.definition-runtime"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		st, err := core.Service[*storage.Store](h, "storage")
 		if err != nil {
 			return err
@@ -144,7 +144,7 @@ func run() error {
 		evalService.Close()
 		return nil
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.bootstrap.v1", Version: "0.1.0", Description: "Model-assisted bounded Agent Definition candidate generation", Requires: []string{"provider.openai-compatible", "runtime.evolution.v1"}, Capabilities: []string{"agent.self-bootstrap", "agent.candidate-generation"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.bootstrap.v1", Version: "0.1.0", Description: "Model-assisted bounded Agent Definition candidate generation", Requires: []string{"provider.gateway.v1", "runtime.evolution.v1"}, Capabilities: []string{"agent.self-bootstrap", "agent.candidate-generation"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		evolutionService, err := core.Service[*evolution.Service](h, "evolution")
 		if err != nil {
 			return err
