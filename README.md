@@ -10,6 +10,7 @@ storage, authentication, model providers, the agent loop, and transports.
 - Encrypted model-provider credentials
 - OpenAI Responses, Anthropic Messages, DeepSeek Chat, and generic OpenAI-compatible providers
 - Persistent conversations and a working model turn
+- Durable asynchronous turns with cancellation, restart classification, and resumable SSE events
 - Plugin lifecycle and runtime inspection
 - Responsive product UI
 - V2 full-stack, UI-only, Service, Agent Tool, and lazy Skill plugins

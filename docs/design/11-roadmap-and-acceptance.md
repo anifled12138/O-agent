@@ -85,4 +85,5 @@ Release 不影响当前版本。
 
 M1 的四种首批协议适配和 Function Calling 归一化已实现；model profile override、
 streaming adapter 和完整 capability probe 仍待完成。M2 已实现 durable Turn/Step/Attempt
-journal、取消和保守重启分类；下一项是异步 Receipt、Inbox 和带 cursor 的 live stream。
+journal、异步 Receipt、可重连 SSE、取消和保守重启分类；下一项是 Provider delta
+streaming、Inbox 和恢复执行策略。

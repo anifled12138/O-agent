@@ -53,6 +53,10 @@ func TestRunJournalCommitsInputEventsAndOutputAtomically(t *testing.T) {
 	if err != nil || len(events) != 4 || events[0].Kind != "turn.started" || events[3].Kind != "turn.completed" {
 		t.Fatalf("events = %#v, %v", events, err)
 	}
+	resumed, err := store.TurnEvents(ctx, userID, turn.ID, 2)
+	if err != nil || len(resumed) != 2 || resumed[0].Sequence != 3 || resumed[1].Sequence != 4 {
+		t.Fatalf("resumed events = %#v, %v", resumed, err)
+	}
 	detail, err = store.Conversation(ctx, userID, conversation.ID)
 	if err != nil || len(detail.Messages) != 2 || detail.Messages[1].ID != output.ID {
 		t.Fatalf("output was not committed with the turn: %#v, %v", detail.Messages, err)

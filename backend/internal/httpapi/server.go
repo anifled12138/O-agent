@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,6 +97,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v2/ui/plugins/{plugin}/services/{service}/call", s.requireUser(http.HandlerFunc(s.runtimeUIServiceCall)))
 	mux.Handle("GET /api/v2/plugin-assets/{release}/{path...}", s.requireUser(http.HandlerFunc(s.pluginAsset)))
 	mux.Handle("GET /api/v2/agent/runs/{id}/trace", s.requireUser(http.HandlerFunc(s.conversationTrace)))
+	mux.Handle("POST /api/v2/agent/conversations/{id}/turns", s.requireUser(http.HandlerFunc(s.turnSubmit)))
+	mux.Handle("GET /api/v2/agent/turns/{id}/events", s.requireUser(http.HandlerFunc(s.turnEvents)))
 	return s.recoverer(s.cors(s.logging(mux)))
 }
 
@@ -256,6 +260,84 @@ func (s *Server) turnCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+func (s *Server) turnSubmit(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Content string `json:"content"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	receipt, err := s.agent.Submit(r.Context(), currentUser(r).ID, r.PathValue("id"), in.Content)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, receipt)
+}
+func (s *Server) turnEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		write(w, http.StatusInternalServerError, map[string]string{"error": "streaming unavailable"})
+		return
+	}
+	afterValue := r.URL.Query().Get("after")
+	if header := r.Header.Get("Last-Event-ID"); afterValue == "" && header != "" {
+		afterValue = header
+	}
+	after, err := strconv.Atoi(afterValue)
+	if afterValue != "" && (err != nil || after < 0) {
+		write(w, http.StatusBadRequest, map[string]string{"error": "invalid event cursor"})
+		return
+	}
+	turnID := r.PathValue("id")
+	wake, unsubscribe := s.agent.SubscribeTurn(turnID)
+	defer unsubscribe()
+	events, err := s.agent.TurnEvents(r.Context(), currentUser(r).ID, turnID, after)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	terminal := false
+	send := func(items []domain.TraceEvent) error {
+		for _, event := range items {
+			payload, marshalErr := json.Marshal(event)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if _, writeErr := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", event.Sequence, payload); writeErr != nil {
+				return writeErr
+			}
+			after = event.Sequence
+			terminal = event.Kind == "turn.completed" || event.Kind == "turn.failed" || event.Kind == "turn.cancelled" || event.Kind == "turn.needs_reconciliation"
+		}
+		flusher.Flush()
+		return nil
+	}
+	if err := send(events); err != nil || terminal {
+		return
+	}
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-wake:
+			events, err := s.agent.TurnEvents(r.Context(), currentUser(r).ID, turnID, after)
+			if err != nil || send(events) != nil || terminal {
+				return
+			}
+		}
+	}
 }
 func (s *Server) messageCreate(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -516,7 +598,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 			w.Header().Set("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Last-Event-ID")
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
 			w.WriteHeader(http.StatusNoContent)
 			return

@@ -88,6 +88,13 @@ type AgentTurn struct {
 	CompletedAt           *time.Time `json:"completedAt,omitempty"`
 }
 
+type TurnReceipt struct {
+	TurnID         string `json:"turnId"`
+	ConversationID string `json:"conversationId"`
+	InputMessageID string `json:"inputMessageId"`
+	Status         string `json:"status"`
+}
+
 type AgentStep struct {
 	ID           string     `json:"id"`
 	TurnID       string     `json:"turnId"`

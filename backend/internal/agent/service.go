@@ -19,16 +19,18 @@ import (
 )
 
 type Service struct {
+	hostCtx   context.Context
 	store     *storage.Store
 	providers *provider.Service
 	forge     *pluginforge.Service
 	evolution *evolution.Service
 	runningMu sync.Mutex
 	running   map[string]context.CancelCauseFunc
+	events    *eventBroker
 }
 
-func New(store *storage.Store, providers *provider.Service, forge *pluginforge.Service, evolutionService *evolution.Service) *Service {
-	return &Service{store: store, providers: providers, forge: forge, evolution: evolutionService, running: map[string]context.CancelCauseFunc{}}
+func New(hostCtx context.Context, store *storage.Store, providers *provider.Service, forge *pluginforge.Service, evolutionService *evolution.Service) *Service {
+	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, running: map[string]context.CancelCauseFunc{}, events: newEventBroker()}
 }
 func (s *Service) List(ctx context.Context, userID string) ([]domain.Conversation, error) {
 	return s.store.ListConversations(ctx, userID)
@@ -42,6 +44,12 @@ func (s *Service) Trace(ctx context.Context, userID, id string) ([]domain.TraceE
 func (s *Service) Turns(ctx context.Context, userID, conversationID string) ([]domain.AgentTurn, error) {
 	return s.store.AgentTurns(ctx, userID, conversationID)
 }
+func (s *Service) TurnEvents(ctx context.Context, userID, turnID string, after int) ([]domain.TraceEvent, error) {
+	return s.store.TurnEvents(ctx, userID, turnID, after)
+}
+func (s *Service) SubscribeTurn(turnID string) (<-chan struct{}, func()) {
+	return s.events.subscribe(turnID)
+}
 func (s *Service) Cancel(ctx context.Context, userID, turnID, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -50,6 +58,7 @@ func (s *Service) Cancel(ctx context.Context, userID, turnID, reason string) err
 	if err := s.store.RequestAgentTurnCancel(ctx, userID, turnID, reason); err != nil {
 		return err
 	}
+	s.events.notify(turnID)
 	s.runningMu.Lock()
 	cancel := s.running[turnID]
 	s.runningMu.Unlock()
@@ -80,16 +89,43 @@ func (s *Service) Create(ctx context.Context, userID, title, providerID string) 
 	return c, nil
 }
 func (s *Service) Turn(ctx context.Context, userID, conversationID, content string) (domain.Message, error) {
+	return s.runTurn(ctx, userID, conversationID, content, nil)
+}
+
+type turnStart struct {
+	receipt domain.TurnReceipt
+	err     error
+}
+
+func (s *Service) Submit(_ context.Context, userID, conversationID, content string) (domain.TurnReceipt, error) {
+	started := make(chan turnStart, 1)
+	go func() {
+		_, _ = s.runTurn(s.hostCtx, userID, conversationID, content, started)
+	}()
+	result := <-started
+	return result.receipt, result.err
+}
+
+func (s *Service) runTurn(ctx context.Context, userID, conversationID, content string, started chan<- turnStart) (domain.Message, error) {
+	signalStart := func(receipt domain.TurnReceipt, err error) {
+		if started != nil {
+			started <- turnStart{receipt: receipt, err: err}
+			started = nil
+		}
+	}
 	content = strings.TrimSpace(content)
 	if content == "" {
+		signalStart(domain.TurnReceipt{}, domain.ErrInvalid)
 		return domain.Message{}, domain.ErrInvalid
 	}
 	detail, err := s.store.Conversation(ctx, userID, conversationID)
 	if err != nil {
+		signalStart(domain.TurnReceipt{}, err)
 		return domain.Message{}, err
 	}
 	generation, err := s.evolution.ConversationGeneration(ctx, userID, conversationID)
 	if err != nil {
+		signalStart(domain.TurnReceipt{}, err)
 		return domain.Message{}, err
 	}
 	now := time.Now().UTC()
@@ -109,11 +145,14 @@ func (s *Service) Turn(ctx context.Context, userID, conversationID, content stri
 	defer scope.Close()
 	startedDetails, _ := json.Marshal(map[string]any{"messageCount": len(detail.Messages) + 1, "pinnedTools": len(scope.tools), "pinnedSkills": len(scope.skills), "generationId": generation.ID, "definitionDigest": generation.DefinitionDigest, "strategy": generation.Definition.Spec.Strategy})
 	if err := s.store.StartAgentTurn(ctx, userID, turn, userMessage, startedDetails); err != nil {
+		signalStart(domain.TurnReceipt{}, err)
 		return domain.Message{}, err
 	}
+	s.events.notify(turn.ID)
+	signalStart(domain.TurnReceipt{TurnID: turn.ID, ConversationID: conversationID, InputMessageID: userMessage.ID, Status: "running"}, nil)
 	detail.Messages = append(detail.Messages, userMessage)
 	messages, omitted := buildContext(detail, generation)
-	trace := newTraceRecorder(runCtx, s.store, userID, turn.ID)
+	trace := newTraceRecorder(runCtx, s.store, userID, turn.ID, s.events.notify)
 	if omitted > 0 {
 		if err := trace.emit("context.compacted", map[string]any{"omittedMessages": omitted}); err != nil {
 			return domain.Message{}, s.failTurn(ctx, userID, turn.ID, err, "journal_error")
@@ -134,6 +173,7 @@ func (s *Service) Turn(ctx context.Context, userID, conversationID, content stri
 	if err := s.store.FinishAgentTurn(finishCtx, userID, turn.ID, "completed", "assistant_response", &assistant, details); err != nil {
 		return domain.Message{}, err
 	}
+	s.events.notify(turn.ID)
 	return assistant, nil
 }
 
@@ -148,6 +188,7 @@ func (s *Service) finishFailedTurn(ctx context.Context, userID, turnID, status, 
 	if journalErr := s.store.FinishAgentTurn(finishCtx, userID, turnID, status, reason, nil, details); journalErr != nil {
 		return errors.Join(cause, journalErr)
 	}
+	s.events.notify(turnID)
 	return cause
 }
 

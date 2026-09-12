@@ -2,7 +2,7 @@
 
 import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import EvolutionCenter from './EvolutionCenter';
-import { API, ASSET_ORIGIN, request } from './api';
+import { API, API_V2, ASSET_ORIGIN, request } from './api';
 
 type User = { id: string; email: string; displayName: string };
 export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; hasApiKey: boolean };
@@ -19,6 +19,7 @@ type Capability = { id: string; summary: string; risk: string; pluginId?: string
 type SurfaceState = { pluginId: string; releaseId: string; kind: string; surfaceId: string; status: string; registryEpoch: number };
 type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; details: Record<string, unknown>; createdAt: string };
 type AgentTurn = { id: string; conversationId: string; status: string; stopReason?: string; recoveryClass?: string; cancelRequested: boolean; lastSequence: number; startedAt: string; completedAt?: string };
+type TurnReceipt = { turnId: string; conversationId: string; inputMessageId: string; status: string };
 
 export default function AxiomApp() {
   const [loading, setLoading] = useState(true);
@@ -72,7 +73,13 @@ export default function AxiomApp() {
       }
       const pending: Message = { id: `pending-${Date.now()}`, role: 'user', content, createdAt: new Date().toISOString() };
       setActive({ ...target, messages: [...target.messages, pending] });
-      await request<Message>(`/conversations/${target.id}/messages`, { method: 'POST', body: JSON.stringify({ content }) });
+      const receipt = await request<TurnReceipt>(`${API_V2}/agent/conversations/${target.id}/turns`, { method: 'POST', body: JSON.stringify({ content }) });
+      await waitForTurn(receipt.turnId, (event) => {
+        setTrace((items) => items.some((item) => item.id === event.id) ? items : [...items, event]);
+        if (event.kind === 'turn.failed') setNotice(typeof event.details.error === 'string' ? event.details.error : 'Agent turn failed.');
+        if (event.kind === 'turn.cancelled') setNotice('Turn stopped. Completed observations remain in the journal.');
+        if (event.kind === 'turn.needs_reconciliation') setNotice('Turn stopped with an external effect that must be reconciled before retrying.');
+      });
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Agent turn failed'); }
     finally {
       if (targetId) {
@@ -105,6 +112,28 @@ export default function AxiomApp() {
     {evolutionOpen && <EvolutionCenter providers={providers} onClose={() => setEvolutionOpen(false)} />}
     {pluginsOpen && <PluginCenter onClose={() => setPluginsOpen(false)} />}
   </main>;
+}
+
+function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const source = new EventSource(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/events`, { withCredentials: true });
+    source.onmessage = (message) => {
+      try {
+        const event = JSON.parse(message.data) as TraceEvent;
+        onEvent(event);
+        if (event.kind === 'turn.completed' || event.kind === 'turn.failed' || event.kind === 'turn.cancelled' || event.kind === 'turn.needs_reconciliation') {
+          source.close();
+          resolve();
+        }
+      } catch (error) {
+        source.close();
+        reject(error);
+      }
+    };
+    source.onerror = () => {
+      if (source.readyState === EventSource.CLOSED) reject(new Error('The turn event stream closed before a terminal event.'));
+    };
+  });
 }
 
 function Splash() { return <div className="splash"><div className="brand-mark">A</div><span>Booting plugin runtime…</span></div>; }

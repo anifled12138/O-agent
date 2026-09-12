@@ -1,6 +1,6 @@
 # 02 · Agent Loop
 
-状态：Accepted；durable journal/cancel/recovery skeleton implemented，streaming/inbox pending
+状态：Accepted；durable journal/async receipt/cancel/event resume implemented，token streaming/inbox pending
 
 ## 目标
 
@@ -111,6 +111,10 @@ Agent 创建时固定 Reasoning Driver、Context Policy、系统提示段、Prov
 - Host 启动时把遗留活动 Turn 分类为 `interrupted/safe_to_retry`，存在未闭合 Tool Call
   时分类为 `needs_reconciliation/unknown_external_effect`，绝不自动重放；
 - API 已提供 Turn 列表和取消，Web UI 在运行中显示 Stop。
+- V2 提交接口在 durable start 后返回 Receipt，执行绑定 Host 生命周期而不是浏览器请求；
+- SSE 使用 durable sequence 作为 cursor，内存 Broker 只发送唤醒信号，断线重连始终从
+  SQLite 补齐，因此慢客户端不会成为运行时状态源。
 
-下一小步是把提交 Turn 改为异步 Receipt，并增加 live event broker/SSE cursor。此步骤
-完成前，HTTP 请求断开仍会取消对应 Turn，不宣称支持窗口关闭后后台继续执行。
+下一小步是 Provider token/tool-call delta streaming、Inbox，以及客户端打开已有运行中
+Turn 时自动重连。旧 V1 同步消息接口仍会随 HTTP 请求取消；Web UI 已切换到 V2 异步
+Receipt 接口。

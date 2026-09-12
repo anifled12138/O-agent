@@ -229,6 +229,33 @@ FROM agent_turns WHERE user_id=? AND conversation_id=? ORDER BY started_at DESC`
 	return result, rows.Err()
 }
 
+func (s *Store) TurnEvents(ctx context.Context, userID, turnID string, after int) ([]domain.TraceEvent, error) {
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM agent_turns WHERE id=? AND user_id=?`, turnID, userID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT e.id,e.conversation_id,e.turn_id,e.sequence,e.kind,e.details_json,e.created_at
+FROM agent_trace_events e JOIN agent_turns t ON t.id=e.turn_id
+WHERE e.turn_id=? AND t.user_id=? AND e.sequence>? ORDER BY e.sequence`, turnID, userID, after)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []domain.TraceEvent{}
+	for rows.Next() {
+		var event domain.TraceEvent
+		var details []byte
+		if err := rows.Scan(&event.ID, &event.ConversationID, &event.TurnID, &event.Sequence, &event.Kind, &details, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		event.Details = details
+		result = append(result, event)
+	}
+	return result, rows.Err()
+}
+
 func (s *Store) RecoverInterruptedAgentTurns(ctx context.Context) (int64, error) {
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx, `UPDATE agent_turns AS t SET
