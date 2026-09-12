@@ -4,7 +4,7 @@
 
 ## 目标
 
-Axiom 是本地运行、接入外部 LLM API 的完整 Agent 产品。用户通过客户端对话提出
+O 是本地运行、接入外部 LLM API 的完整 Agent 产品。用户通过客户端对话提出
 目标；Agent 可以直接推理，也可以使用 Function Calling、MCP、Skill、Memory 和
 Plugin 完成任务。缺失的稳定能力可以由 Agent 生成 Plugin，但安装权限仍属于用户。
 
@@ -50,7 +50,7 @@ Agent Runtime 可以替换 Reasoning Driver、Context Policy、Provider route、
 ## 不做的事情
 
 - 不部署或管理本地模型；本地模型若提供兼容 API，只被视为一个 Provider。
-- 不让 Plugin patch Axiom 核心源码完成安装。
+- 不让 Plugin patch O 核心源码完成安装。
 - 不把所有插件说明、Skill 正文或 MCP Schema 默认塞进上下文。
 - 不用模型自然语言声明替代真实执行结果。
 - 不把模块化单体拆成一组本机微服务。

@@ -1,6 +1,6 @@
-# Axiom Agent
+# O Agent
 
-Axiom is a local-first agent product with a Go backend and a web frontend. The
+O is a local-first agent product with a Go backend and a web frontend. The
 runtime follows one rule: every capability is mounted as a plugin, including
 storage, model providers, the agent loop, and transports.
 
@@ -59,10 +59,12 @@ Open `http://127.0.0.1:3000`. Runtime data is written to
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AXIOM_ADDR` | `127.0.0.1:8080` | Backend listen address |
-| `AXIOM_DATA_DIR` | `../data` | SQLite database and encryption key directory |
-| `AXIOM_FRONTEND_ORIGIN` | `http://127.0.0.1:3000` | Allowed browser origin |
-| `AXIOM_WORKSPACE_ROOT` | `..` | Workspace exposed through approved Host brokers |
+| `O_ADDR` | `127.0.0.1:8080` | Backend listen address |
+| `O_DATA_DIR` | `../data` | SQLite database and encryption key directory |
+| `O_FRONTEND_ORIGIN` | `http://127.0.0.1:3000` | Allowed browser origin |
+| `O_WORKSPACE_ROOT` | `..` | Workspace exposed through approved Host brokers |
+
+Legacy `AXIOM_*` variables remain accepted for compatibility.
 
 ## Verify
 

@@ -570,15 +570,15 @@ func write(w http.ResponseWriter, status int, value any) {
 func fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalid):
-		write(w, http.StatusBadRequest, map[string]string{"error": "invalid input"})
+		write(w, http.StatusBadRequest, map[string]string{"error": "输入无效"})
 	case errors.Is(err, domain.ErrConflict):
-		write(w, http.StatusConflict, map[string]string{"error": "resource already exists"})
+		write(w, http.StatusConflict, map[string]string{"error": "资源已存在"})
 	case errors.Is(err, domain.ErrUnauthorized):
-		write(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		write(w, http.StatusUnauthorized, map[string]string{"error": "没有执行此操作的权限"})
 	case errors.Is(err, domain.ErrNotFound):
-		write(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		write(w, http.StatusNotFound, map[string]string{"error": "未找到资源"})
 	default:
 		slog.Error("request failed", "error", err)
-		write(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		write(w, http.StatusInternalServerError, map[string]string{"error": "内部错误"})
 	}
 }

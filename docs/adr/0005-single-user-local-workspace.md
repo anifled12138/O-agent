@@ -4,7 +4,7 @@
 
 ## 决策
 
-Axiom 本地产品不提供注册、登录、登出和 Cookie session。Web UI 或未来桌面客户端
+O 本地产品不提供注册、登录、登出和 Cookie session。Web UI 或未来桌面客户端
 连接 loopback/local socket 后直接进入工作台。
 
 Go Host 在启动时解析一个持久的本地工作区所有者 ID。升级已有安装时复用最早创建的

@@ -1,4 +1,4 @@
-# Axiom 本地 Agent 产品系统设计 v0.1
+# O 本地 Agent 产品系统设计 v0.1
 
 状态：Draft
 
@@ -10,13 +10,13 @@
 > [`prd-recursive-bootstrap-agent-v0.1.md`](prd-recursive-bootstrap-agent-v0.1.md)
 > 中的版本化 Agent Generation、递归自举和 Eval Harness 方向取代。
 
-本文定义 Axiom 下一阶段的产品目标、系统边界和工程路线。它不是对当前
+本文定义 O 下一阶段的产品目标、系统边界和工程路线。它不是对当前
 实现的描述，而是后续实现应收敛到的目标架构。已有 Plugin Runtime V2
 继续保留，并作为新架构的能力底座之一。
 
 ## 1. 产品定义
 
-Axiom 是一个完整的本地 Agent 客户端，而不是一个带聊天框的网页，也
+O 是一个完整的本地 Agent 客户端，而不是一个带聊天框的网页，也
 不是一个插件管理后台。
 
 它在用户电脑上运行可靠的 Agent Host，连接用户配置的任意受支持 LLM
@@ -57,7 +57,7 @@ UI、后台 Service 和外部设备适配器都是 Plugin 的不同 Surface，�
 - 不负责训练或本地部署 LLM。
 - 不复制某个现有 Agent Harness 的完整实现。
 - 不让模型直接成为操作系统权限主体。
-- 不允许 Plugin 通过修改 Axiom 核心源码完成安装。
+- 不允许 Plugin 通过修改 O 核心源码完成安装。
 - 不承诺任意前端代码都能注入桌面 Shell 的任意位置。
 - 不把“模型输出了一段计划”视为任务已经可靠执行。
 
@@ -80,7 +80,7 @@ LLM 是可替换、非确定性的决策建议器。以下内容只能由 Host �
 
 ### 3.2 小内核，万物 Plugin
 
-“万物 Plugin”不等于“内核没有边界”。Axiom 保留一个不可被普通 Plugin
+“万物 Plugin”不等于“内核没有边界”。O 保留一个不可被普通 Plugin
 替换的最小可信内核：
 
 - Run 状态机；
@@ -115,7 +115,7 @@ Skill 正文、历史证据和 Plugin 代码均按需加载。
 ## 4. 系统拓扑
 
 ```text
-┌──────────────────────── Axiom Desktop ────────────────────────┐
+┌──────────────────────── O Desktop ────────────────────────┐
 │ Native Shell                                                   │
 │ Window / Tray / Update / Notification / File Picker           │
 │                                                                │
@@ -124,7 +124,7 @@ Skill 正文、历史证据和 Plugin 代码均按需加载。
 └──────────────────────────────┬─────────────────────────────────┘
                                │ local authenticated IPC
 ┌──────────────────────────────▼─────────────────────────────────┐
-│ Axiom Host (Go)                                                 │
+│ O Host (Go)                                                 │
 │                                                                │
 │ API Gateway       Identity        Event Store      Scheduler   │
 │ Run Engine        Context Engine  Policy Engine    Eval Engine │
@@ -554,7 +554,7 @@ release/
 ```
 
 安装只会写入 Plugin Store、Installation State 和 Plugin Data，不会 patch
-Axiom 二进制或前端源代码。
+O 二进制或前端源代码。
 
 ### 11.2 激活事务
 
@@ -576,7 +576,7 @@ Axiom 二进制或前端源代码。
 WASM 组件运行，前端以隔离 Bundle 运行，两者通过 release-bound Service
 Contract 通信。UI 热拔插通过 Slot Registry 增删视图，不要求重启 Shell。
 
-只有真正需要新的原生窗口能力或内核权限时，才属于 Axiom 核心升级，不
+只有真正需要新的原生窗口能力或内核权限时，才属于 O 核心升级，不
 伪装成普通 Plugin 热更新。
 
 ## 12. 权限和安全模型
@@ -863,7 +863,7 @@ Broker、UI 隔离和供应链验证都是必需项，不能依赖静态代码�
 7. 在客户端展示执行时间线和证据；
 8. 保持现有 Plugin Runtime 和延迟 Capability 兼容。
 
-完成这一里程碑后，Axiom 才从“能调用 Plugin 的聊天应用”进入“可靠运行
+完成这一里程碑后，O 才从“能调用 Plugin 的聊天应用”进入“可靠运行
 任务的本地 Agent 客户端”。之后再接 MCP、自举 Plugin 和更多推理扩展，
 不会反复推翻底层状态模型。
 

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Prove that Axiom is a real local product rather than a framework diagram. A
+Prove that O is a real local product rather than a framework diagram. A
 user must be able to create a local identity, connect an API model, create a
 mission, complete a model turn, and inspect the mounted runtime.
 

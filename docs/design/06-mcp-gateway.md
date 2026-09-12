@@ -4,8 +4,8 @@
 
 ## 边界
 
-MCP 是连接外部 Tool、Resource 和 Prompt 的标准协议，不是 Axiom 内部 Plugin ABI，
-也不负责 Agent Loop、用户权限或 Plugin 安装。Axiom 使用官方 Go SDK，不重写协议。
+MCP 是连接外部 Tool、Resource 和 Prompt 的标准协议，不是 O 内部 Plugin ABI，
+也不负责 Agent Loop、用户权限或 Plugin 安装。O 使用官方 Go SDK，不重写协议。
 
 ## 连接模型
 
@@ -33,7 +33,7 @@ type MCPConnection struct {
 
 ## 能力映射
 
-| MCP | Axiom |
+| MCP | O |
 | --- | --- |
 | Tool | discoverable Tool Surface |
 | Resource | Resource handle/provider，不自动注入正文 |
@@ -58,7 +58,7 @@ MIME 和大小，正文由 `resource.read` 按需获取。
 - stdio process 不继承全部环境和 Provider secrets；
 - Remote URL 固定 scheme/host，重定向重新校验；
 - Sampling/roots/logging 等旧能力只做兼容，不成为新架构依赖；
-- Tool 调用仍经过 Axiom Policy、Approval、Schema 和审计。
+- Tool 调用仍经过 O Policy、Approval、Schema 和审计。
 
 ## 实现
 

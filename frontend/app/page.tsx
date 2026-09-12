@@ -1,3 +1,3 @@
-import AxiomApp from './AxiomApp';
+import OApp from './OApp';
 
-export default AxiomApp;
+export default OApp;

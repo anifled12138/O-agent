@@ -179,7 +179,7 @@ func run() error {
 	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(workspaceID, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErrors := make(chan error, 1)
 	go func() {
-		slog.Info("axiom ready", "address", "http://"+cfg.Addr, "data", absoluteData)
+		slog.Info("O ready", "address", "http://"+cfg.Addr, "data", absoluteData)
 		serverErrors <- server.ListenAndServe()
 	}()
 	select {

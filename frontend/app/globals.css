@@ -61,7 +61,7 @@ body {
   color-scheme: light;
 }
 
-html, body { background: #fff; color: var(--ink); }
+html, body { background: #fff; color: var(--ink); font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", sans-serif; }
 button, input, textarea, select { border-radius: 8px; }
 button { transition: background-color .15s ease, border-color .15s ease, color .15s ease; }
 ::selection { background: #dbeafe; }

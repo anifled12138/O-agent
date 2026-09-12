@@ -1,11 +1,11 @@
-# Axiom Agent 范式审计 v0.1
+# O Agent 范式审计 v0.1
 
 状态：Research Draft，不代表最终产品方向  
 日期：2026-09-07
 
 ## 1. 审计目的
 
-本文件不从 Axiom 已有实现或 DeepSeek Harness 的功能缺口出发。它先回答三个
+本文件不从 O 已有实现或 DeepSeek Harness 的功能缺口出发。它先回答三个
 更基础的问题：
 
 1. Codex、Claude Code、Manus、OpenClaw 和 DeepSeek Harness 的共同运行假设
@@ -66,12 +66,12 @@ Manus 的 Sandbox Agent 仍属于同一结构。
 
 DSH 已经允许模型、工具、Skill、Session、Sandbox、Storage、Loop、Schedule
 和 UI 成为插件，并允许 Creator Mode 在内存中检查、组合和试验 Cordis
-Plugin。Axiom 不应再把“Loop 也能替换”或“Plugin 可以同时包含前后端”描述为
+Plugin。O 不应再把“Loop 也能替换”或“Plugin 可以同时包含前后端”描述为
 差异。
 
 ### 3.2 动态 Harness 生成与架构搜索
 
-现有 Axiom PRD 把完整 Agent Definition 的生成、A/B、选择和代际晋升作为
+现有 O PRD 把完整 Agent Definition 的生成、A/B、选择和代际晋升作为
 核心。这个方向已经有明确研究先例：
 
 - ADAS / Meta Agent Search 让 Meta Agent 用代码发明和组合 Agent 系统；
@@ -80,7 +80,7 @@ Plugin。Axiom 不应再把“Loop 也能替换”或“Plugin 可以同时包�
 - 相关 Test-Time Harness Evolution 工作把可执行控制程序作为搜索对象。
 
 因此“Agent 自动设计 Agent”不是空白。更重要的是，JIT-Agent 的效果依赖专门
-训练的 27B Harness 模型和训练数据，而 Axiom 当前约束是不训练本地或自有基础
+训练的 27B Harness 模型和训练数据，而 O 当前约束是不训练本地或自有基础
 模型。仅用通用 API 模型加 Prompt 重做同一方向，在成本和效果上都没有合理的
 领先假设。
 
@@ -182,7 +182,7 @@ DSH 提供“所有部件都可以插件化”和“Agent 可以在 Creator Mode
 
 ```text
 DSH:  开发/组合 Plugin → 配置 Runtime → Agent 使用 → 得到任务结果
-Axiom: 用户需求 → Agent 完成任务 → 提取可复用能力 → 下次直接调用/继续扩展
+O: 用户需求 → Agent 完成任务 → 提取可复用能力 → 下次直接调用/继续扩展
 ```
 
 DSH 理论上可以通过插件实现这条链。任何图灵完备插件系统都能实现普通软件功能，

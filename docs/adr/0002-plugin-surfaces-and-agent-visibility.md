@@ -7,7 +7,7 @@ Implementation notes and verification evidence are summarized in
 
 ## Context
 
-Axiom milestone 1 proved one full-stack plugin path: generate a Go sidecar and
+O milestone 1 proved one full-stack plugin path: generate a Go sidecar and
 an iframe UI, build an immutable release, approve its permissions, activate it,
 invoke a model-facing capability, hot-swap a new release, and roll back.
 
@@ -30,7 +30,7 @@ model context.
 
 ## Decision
 
-Axiom will separate the plugin system into four layers:
+O will separate the plugin system into four layers:
 
 1. **Package plane** — source, build, immutable releases, signatures, grants,
    dependencies, installation, updates, rollback, and audit.
@@ -686,7 +686,7 @@ Each phase is independently testable and receives its own Git commit.
 
 ## Engineering constraints
 
-- No plugin installation may patch Axiom Host source.
+- No plugin installation may patch O Host source.
 - Core upgrades and plugin packages remain separate product operations.
 - No destructive migration; schema changes are additive until verified.
 - Existing user data and immutable packages are preserved.

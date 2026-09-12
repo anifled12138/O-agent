@@ -5,7 +5,7 @@ Date: 2026-09-10
 
 ## Context
 
-An Axiom plugin release may contribute any combination of:
+An O plugin release may contribute any combination of:
 
 - an out-of-process backend;
 - Host services consumed by another plugin;
@@ -14,7 +14,7 @@ An Axiom plugin release may contribute any combination of:
 - event hooks and background jobs.
 
 Hot plug cannot mean replacing code inside the Go process. Go plugins cannot be
-reliably unloaded and are not the Axiom extension boundary. Axiom hot swap is a
+reliably unloaded and are not the O extension boundary. O hot swap is a
 transactional switch between two immutable plugin releases. The old release
 remains available while work already bound to it drains.
 

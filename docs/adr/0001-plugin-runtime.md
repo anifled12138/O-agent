@@ -4,7 +4,7 @@ Status: Accepted for milestone 1
 
 ## Context
 
-Axiom needs to evolve its reasoning loop without coupling model providers,
+O needs to evolve its reasoning loop without coupling model providers,
 storage, tools, transports, and policy. Dynamic Go shared objects are not a
 portable option on Windows and would make upgrades unsafe.
 

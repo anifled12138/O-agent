@@ -1,4 +1,4 @@
-# Axiom 系统架构 v0.2（讨论稿）
+# O 系统架构 v0.2（讨论稿）
 
 状态：Discussion Draft  
 日期：2026-09-12  
@@ -10,14 +10,14 @@
 
 ## 1. 先给结论
 
-Axiom 不直接采用 DSH 或 Pi 的代码框架，而采用它们已经证明有效的两个设计：
+O 不直接采用 DSH 或 Pi 的代码框架，而采用它们已经证明有效的两个设计：
 
 - 从 DSH 借鉴：`Agent` 与具体 `AgentLoop` 分离、会话事件是模型上下文的事实来源、
   服务/事件/注册具有明确生命周期、作用域随 Agent 或 Plugin 一起释放。
 - 从 Pi 借鉴：默认循环保持小而清楚、SDK 优先、扩展开发体验简单、工具调用和流式
   事件有稳定顺序。
 
-但 Axiom 不照搬它们的扩展权限模型：
+但 O 不照搬它们的扩展权限模型：
 
 - DSH 的“所有部分都是同一插件树”适合高度可组合的 Harness，但我们的插件会由
   Agent 和普通用户生成，因此权限、身份、事件存储、资源 Broker、安装事务和审计
@@ -63,11 +63,11 @@ DSH 使用 Cordis 组织服务、类型事件和可撤销 effect。模型适配�
    一个总线。
 4. 注册属于一个作用域，卸载时自动撤销；创建 Agent 的所有权和 disposer 明确。
 
-这些机制直接解决替换循环、恢复会话、热卸载和依赖倒置，应该进入 Axiom。
+这些机制直接解决替换循环、恢复会话、热卸载和依赖倒置，应该进入 O。
 
 ### 2.2 DSH 不直接照搬的部分
 
-DSH 允许从同一插件树替换几乎全部产品组成。Axiom 的威胁模型不同：插件可由
+DSH 允许从同一插件树替换几乎全部产品组成。O 的威胁模型不同：插件可由
 Agent 自举生成，不能让其替换自己的授权者、审计者或隔离边界。因此：
 
 - Policy、Approval、Identity、Event Store、Artifact Store、Plugin Coordinator、
@@ -82,20 +82,20 @@ Pi 的 Agent Core 是一个容易理解的工具循环：一次模型响应和�
 工具存在时继续调用模型；它支持流式事件、并行或串行工具执行、steering/follow-up、
 上下文转换和 SDK 嵌入。它的优势是小、透明、扩展作者容易理解。
 
-Axiom 默认 Driver 也应保持这种规模。复杂规划、多 Agent、Verifier 或 Workflow
+O 默认 Driver 也应保持这种规模。复杂规划、多 Agent、Verifier 或 Workflow
 应该由可替换 Driver/Plugin 组合，而不是把所有策略硬编码进唯一主循环。
 
 ### 2.4 Pi 不直接照搬的部分
 
 Pi 的扩展可直接使用 Node 内置模块并拥有宿主进程权限，热重载主要是开发体验。
-Axiom 的生产插件不能采用这一信任模型。Pi Package 的资源筛选和固定 Git/npm 版本
-值得参考，但 Axiom Release 还必须增加：内容摘要、权限绑定、进程隔离、原子激活、
+O 的生产插件不能采用这一信任模型。Pi Package 的资源筛选和固定 Git/npm 版本
+值得参考，但 O Release 还必须增加：内容摘要、权限绑定、进程隔离、原子激活、
 前后端同版本切换、调用租约和持久化恢复。
 
 ## 3. 产品进程拓扑
 
 ```text
- Axiom Desktop (Electron)
+ O Desktop (Electron)
  ┌─────────────────────────────────────────────────────────────┐
  │ Main: window/tray/update/custom protocol/local socket proxy │
  │ Preload: very small typed bridge                            │
@@ -357,7 +357,7 @@ PluginSpec -> isolated Git workspace -> build/test -> package
 ```
 
 Release 是不可修改的目录或 `.axp` 包，摘要覆盖规范化 Manifest 和全部声明 Artifact。
-开发中的 Plugin Project 使用独立 Git 仓库；不能嵌套写入 Axiom 主仓库。Agent 可以
+开发中的 Plugin Project 使用独立 Git 仓库；不能嵌套写入 O 主仓库。Agent 可以
 修改 Project，但没有写 Release Store、Grant Store 或活动路由表的权限。
 
 ### 8.2 Manifest
@@ -483,7 +483,7 @@ Agent 不能完成：批准自己的新增权限、伪造测试通过、修改 R
 
 ## 9. MCP 的位置
 
-MCP 是外部能力协议，不是 Axiom Plugin ABI，也不是 Agent Loop。实现方式：
+MCP 是外部能力协议，不是 O Plugin ABI，也不是 Agent Loop。实现方式：
 
 1. `MCP Gateway` 使用官方 Go SDK；
 2. 每个连接是独立 Host client，保留服务器身份和来源；
