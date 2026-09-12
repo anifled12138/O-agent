@@ -89,5 +89,6 @@ Node、文件系统或其他 Plugin iframe。
 
 Web UI 使用 V2 async Turn Receipt；durable event 通过 SSE sequence cursor 接续，Stop 先
 持久化取消意图再触发执行上下文。当前流中已经包含 Turn、Model、Tool 和终态事件，
-Provider token delta 与打开已有活动 Turn 时的自动重连仍待实现。V1 同步接口暂时保留
-用于兼容，不作为客户端默认路径。
+打开已有活动 Turn 时客户端会自动重新订阅；切换会话只关闭旧 EventSource，不取消
+后台执行。Provider token delta 仍待实现。V1 同步接口暂时保留用于兼容，不作为客户端
+默认路径。

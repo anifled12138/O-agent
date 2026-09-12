@@ -34,6 +34,10 @@ export default function AxiomApp() {
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState('');
   const [trace, setTrace] = useState<TraceEvent[]>([]);
+  const activeIdRef = useRef('');
+  const observationRef = useRef<{ turnId: string; controller: AbortController; promise: Promise<void> } | null>(null);
+
+  useEffect(() => () => observationRef.current?.controller.abort(), []);
 
   const hydrate = useCallback(async () => {
     const me = await request<User>('/auth/me');
@@ -54,11 +58,52 @@ export default function AxiomApp() {
       setUser(me); setProviders(providerList); setConversations(conversationList); setPlugins(pluginList);
     }).catch(() => setUser(null)).finally(() => setLoading(false));
   }, []);
-  async function openConversation(id: string) { const [detail, events] = await Promise.all([request<ConversationDetail>(`/conversations/${id}`), request<TraceEvent[]>(`/conversations/${id}/trace`)]); setActive(detail); setTrace(events); }
+  function observeTurn(turnId: string, conversationId: string) {
+    if (observationRef.current?.turnId === turnId) return observationRef.current.promise;
+    observationRef.current?.controller.abort();
+    const controller = new AbortController();
+    const promise = waitForTurn(turnId, (event) => {
+      if (activeIdRef.current !== conversationId) return;
+      setTrace((items) => items.some((item) => item.id === event.id) ? items : [...items, event]);
+      if (event.kind === 'turn.failed') setNotice(typeof event.details.error === 'string' ? event.details.error : 'Agent turn failed.');
+      if (event.kind === 'turn.cancelled') setNotice('Turn stopped. Completed observations remain in the journal.');
+      if (event.kind === 'turn.needs_reconciliation') setNotice('Turn stopped with an external effect that must be reconciled before retrying.');
+    }, controller.signal).finally(() => {
+      if (observationRef.current?.turnId === turnId) observationRef.current = null;
+    });
+    observationRef.current = { turnId, controller, promise };
+    return promise;
+  }
+
+  async function refreshConversation(id: string) {
+    const [detail, events] = await Promise.all([request<ConversationDetail>(`/conversations/${id}`), request<TraceEvent[]>(`/conversations/${id}/trace`)]);
+    if (activeIdRef.current === id) { setActive(detail); setTrace(events); }
+    setConversations((items) => items.map((item) => item.id === detail.id ? detail : item));
+  }
+
+  async function openConversation(id: string) {
+    observationRef.current?.controller.abort();
+    observationRef.current = null;
+    activeIdRef.current = id;
+    const [detail, events, turns] = await Promise.all([request<ConversationDetail>(`/conversations/${id}`), request<TraceEvent[]>(`/conversations/${id}/trace`), request<AgentTurn[]>(`/conversations/${id}/turns`)]);
+    if (activeIdRef.current !== id) return;
+    setActive(detail); setTrace(events); setNotice('');
+    const running = turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling');
+    if (running) {
+      setSending(true);
+      void observeTurn(running.id, id).then(() => refreshConversation(id)).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not resume turn events')).finally(() => {
+        if (activeIdRef.current === id) setSending(false);
+      });
+    } else {
+      setSending(false);
+    }
+  }
   async function newConversation() {
     if (!providers.length) { setSettingsOpen(true); return; }
+    observationRef.current?.controller.abort();
+    observationRef.current = null;
     const created = await request<Conversation>('/conversations', { method: 'POST', body: JSON.stringify({ title: 'New mission', providerId: providers[0].id }) });
-    setConversations((items) => [created, ...items]); setActive({ ...created, messages: [] }); setTrace([]);
+    activeIdRef.current = created.id; setConversations((items) => [created, ...items]); setActive({ ...created, messages: [] }); setTrace([]);
   }
   async function send(content: string) {
     if (!content.trim() || sending) return;
@@ -69,24 +114,22 @@ export default function AxiomApp() {
       if (!target) {
         if (!providers.length) { setSettingsOpen(true); return; }
         const created = await request<Conversation>('/conversations', { method: 'POST', body: JSON.stringify({ title: content.trim().slice(0, 42), providerId: providers[0].id }) });
-        target = { ...created, messages: [] }; targetId = created.id; setConversations((items) => [created, ...items]);
+        target = { ...created, messages: [] }; targetId = created.id; activeIdRef.current = created.id; setConversations((items) => [created, ...items]);
       }
       const pending: Message = { id: `pending-${Date.now()}`, role: 'user', content, createdAt: new Date().toISOString() };
       setActive({ ...target, messages: [...target.messages, pending] });
       const receipt = await request<TurnReceipt>(`${API_V2}/agent/conversations/${target.id}/turns`, { method: 'POST', body: JSON.stringify({ content }) });
-      await waitForTurn(receipt.turnId, (event) => {
-        setTrace((items) => items.some((item) => item.id === event.id) ? items : [...items, event]);
-        if (event.kind === 'turn.failed') setNotice(typeof event.details.error === 'string' ? event.details.error : 'Agent turn failed.');
-        if (event.kind === 'turn.cancelled') setNotice('Turn stopped. Completed observations remain in the journal.');
-        if (event.kind === 'turn.needs_reconciliation') setNotice('Turn stopped with an external effect that must be reconciled before retrying.');
-      });
+      await observeTurn(receipt.turnId, target.id);
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Agent turn failed'); }
     finally {
       if (targetId) {
         const [refreshed, events] = await Promise.all([request<ConversationDetail>(`/conversations/${targetId}`), request<TraceEvent[]>(`/conversations/${targetId}/trace`)]).catch(() => [null, null] as const);
-        if (refreshed && events) { setTrace(events); setActive(refreshed); setConversations((items) => items.map((item) => item.id === refreshed.id ? refreshed : item)); }
+        if (refreshed && events) {
+          if (activeIdRef.current === targetId) { setTrace(events); setActive(refreshed); }
+          setConversations((items) => items.map((item) => item.id === refreshed.id ? refreshed : item));
+        }
       }
-      setSending(false);
+      if (activeIdRef.current === targetId) setSending(false);
     }
   }
 
@@ -114,9 +157,10 @@ export default function AxiomApp() {
   </main>;
 }
 
-function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void): Promise<void> {
+function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const source = new EventSource(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/events`, { withCredentials: true });
+    signal?.addEventListener('abort', () => { source.close(); resolve(); }, { once: true });
     source.onmessage = (message) => {
       try {
         const event = JSON.parse(message.data) as TraceEvent;

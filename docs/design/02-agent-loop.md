@@ -115,6 +115,6 @@ Agent 创建时固定 Reasoning Driver、Context Policy、系统提示段、Prov
 - SSE 使用 durable sequence 作为 cursor，内存 Broker 只发送唤醒信号，断线重连始终从
   SQLite 补齐，因此慢客户端不会成为运行时状态源。
 
-下一小步是 Provider token/tool-call delta streaming、Inbox，以及客户端打开已有运行中
-Turn 时自动重连。旧 V1 同步消息接口仍会随 HTTP 请求取消；Web UI 已切换到 V2 异步
-Receipt 接口。
+Web UI 打开已有活动 Turn 时会按 durable cursor 自动重新订阅，切换页面只断开观察连接，
+不会取消 Host 中的执行。下一小步是 Provider token/tool-call delta streaming、Inbox 和
+恢复执行策略。旧 V1 同步消息接口仍会随 HTTP 请求取消，仅用于兼容。
