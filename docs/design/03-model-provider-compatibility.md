@@ -121,3 +121,10 @@ UI 只展示 `SafeDetail` 和诊断 ID。HTML、代理登录页和整个响应�
 - 前端允许选择协议，自动给出默认 Base URL；
 - fixture 覆盖 content 为 null、arguments 为 object、无 choices、HTML、429 和工具调用。
 
+## 当前实现（2026-09-12）
+
+四种非流式 wire adapter 已接入 Model Gateway。流式层已实现有界 SSE parser 和统一
+`StreamEvent`，覆盖 OpenAI Responses、Chat-compatible/DeepSeek 与 Anthropic 的文本、
+Tool Call、增量参数、usage 和终态组装；半截 Tool JSON 永不进入 Dispatcher。下一提交
+把 parser 接入 HTTP transport 和 Agent live-event channel，在此之前默认调用仍走非流式
+完成接口。
