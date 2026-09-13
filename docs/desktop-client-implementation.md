@@ -37,10 +37,11 @@ Electron is a lifecycle and presentation boundary, not a replacement backend.
 7. On application exit Main closes the Host stdin channel. The Host converts
    EOF into context cancellation and runs its normal HTTP/plugin shutdown path.
 
-The packaged application stores durable product data under Electron's stable
-per-user application data directory. Development mode deliberately reuses
-`D:\agent-harness\data`. Host and renderer logs are kept under the application's
-`logs` directory.
+An installed application stores durable product data under Electron's stable
+per-user application data directory. Development mode and portable builds run
+directly from this repository deliberately reuse `D:\agent-harness\data`, so
+existing provider configuration and conversations remain available. Host and
+renderer logs are kept under the application's `logs` directory.
 
 ## Renderer security
 

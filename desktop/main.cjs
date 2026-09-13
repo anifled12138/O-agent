@@ -18,6 +18,14 @@ let runtimeOrigin = '';
 let allowingQuit = false;
 let backendReady = false;
 
+function packagedRepositoryRoot() {
+  if (development) return repositoryRoot;
+  const candidate = path.resolve(path.dirname(app.getPath('exe')), '..', '..', '..');
+  const releaseRoot = path.join(candidate, 'release') + path.sep;
+  const executable = app.getPath('exe');
+  return executable.startsWith(releaseRoot) && fs.existsSync(path.join(candidate, 'backend', 'go.mod')) ? candidate : '';
+}
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
@@ -110,8 +118,9 @@ async function startBackend(frontendOrigin) {
     ? await developmentBackend()
     : path.join(app.getAppPath(), 'runtime', process.platform === 'win32' ? 'o-host.exe' : 'o-host');
   if (!fs.existsSync(executable)) throw new Error(`缺少本地 Go Host：${executable}`);
-  const dataDir = process.env.O_DATA_DIR || (development ? path.join(repositoryRoot, 'data') : path.join(app.getPath('userData'), 'data'));
-  const workspaceRoot = process.env.O_WORKSPACE_ROOT || (development ? repositoryRoot : app.getPath('documents'));
+  const localRepository = packagedRepositoryRoot();
+  const dataDir = process.env.O_DATA_DIR || (localRepository ? path.join(localRepository, 'data') : path.join(app.getPath('userData'), 'data'));
+  const workspaceRoot = process.env.O_WORKSPACE_ROOT || localRepository || app.getPath('documents');
   backendProcess = spawn(executable, [], {
     cwd: development ? path.join(repositoryRoot, 'backend') : path.dirname(executable),
     env: {
