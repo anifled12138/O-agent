@@ -60,6 +60,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/capabilities/fragments", s.fragmentList)
 	mux.HandleFunc("GET /api/v1/capabilities/capsules", s.capsuleList)
 	mux.HandleFunc("POST /api/v1/capabilities/capsules/{id}/verify", s.capsuleVerify)
+	mux.HandleFunc("POST /api/v1/capabilities/capsules/{id}/promote", s.capsulePromote)
+	mux.HandleFunc("GET /api/v1/capabilities/promotions", s.promotionList)
+	mux.HandleFunc("POST /api/v1/capabilities/promotions/{id}/retry", s.promotionRetry)
 	mux.HandleFunc("GET /api/v1/evolution/generations", s.generationList)
 	mux.HandleFunc("POST /api/v1/evolution/generations/candidates", s.generationCreateCandidate)
 	mux.HandleFunc("POST /api/v1/evolution/generations/{id}/promote", s.generationPromote)
@@ -120,11 +123,29 @@ func (s *Server) capsuleList(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) capsuleVerify(w http.ResponseWriter, r *http.Request) {
 	report := s.agent.VerifyCapsule(r.Context(), r.PathValue("id"))
-	status := http.StatusOK
-	if !report.Passed {
-		status = http.StatusUnprocessableEntity
+	write(w, http.StatusOK, report)
+}
+
+func (s *Server) capsulePromote(w http.ResponseWriter, r *http.Request) {
+	job, err := s.agent.PromoteCapsule(s.workspaceID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
 	}
-	write(w, status, report)
+	write(w, http.StatusAccepted, job)
+}
+
+func (s *Server) promotionList(w http.ResponseWriter, _ *http.Request) {
+	write(w, http.StatusOK, s.agent.Promotions(s.workspaceID))
+}
+
+func (s *Server) promotionRetry(w http.ResponseWriter, r *http.Request) {
+	job, err := s.agent.RetryPromotion(s.workspaceID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, job)
 }
 
 func (s *Server) providerList(w http.ResponseWriter, r *http.Request) {

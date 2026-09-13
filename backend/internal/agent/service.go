@@ -16,31 +16,37 @@ import (
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/evolution"
 	"axiom.local/agent/internal/pluginforge"
+	"axiom.local/agent/internal/promotion"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/scriptruntime"
 	"axiom.local/agent/internal/storage"
 )
 
 type Service struct {
-	hostCtx   context.Context
-	store     *storage.Store
-	providers *provider.Service
-	forge     *pluginforge.Service
-	evolution *evolution.Service
-	fragments *capability.Registry
-	capsules  *capsule.Repository
-	runningMu sync.Mutex
-	running   map[string]context.CancelCauseFunc
-	events    *eventBroker
+	hostCtx    context.Context
+	store      *storage.Store
+	providers  *provider.Service
+	forge      *pluginforge.Service
+	evolution  *evolution.Service
+	fragments  *capability.Registry
+	capsules   *capsule.Repository
+	promotions *promotion.Service
+	runningMu  sync.Mutex
+	running    map[string]context.CancelCauseFunc
+	events     *eventBroker
 }
 
-func New(hostCtx context.Context, store *storage.Store, providers *provider.Service, forge *pluginforge.Service, evolutionService *evolution.Service, workspaceRoot string) (*Service, error) {
+func New(hostCtx context.Context, store *storage.Store, providers *provider.Service, forge *pluginforge.Service, evolutionService *evolution.Service, workspaceRoot, dataDir string) (*Service, error) {
 	scripts := scriptruntime.New()
 	capsules, err := capsule.Open(workspaceRoot, scripts)
 	if err != nil {
 		return nil, err
 	}
-	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, fragments: capability.NewRegistry(scripts), capsules: capsules, running: map[string]context.CancelCauseFunc{}, events: newEventBroker()}, nil
+	promotions, err := promotion.Open(hostCtx, dataDir, capsules, forge)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, fragments: capability.NewRegistry(scripts), capsules: capsules, promotions: promotions, running: map[string]context.CancelCauseFunc{}, events: newEventBroker()}, nil
 }
 
 func (s *Service) Fragments(userID, conversationID string) []capability.Fragment {
@@ -51,6 +57,18 @@ func (s *Service) Capsules() []capsule.Summary { return s.capsules.List() }
 
 func (s *Service) VerifyCapsule(ctx context.Context, id string) capsule.VerificationReport {
 	return s.capsules.Verify(ctx, id)
+}
+
+func (s *Service) Promotions(userID string) []promotion.Job {
+	return s.promotions.List(userID)
+}
+
+func (s *Service) PromoteCapsule(userID, id string) (promotion.Job, error) {
+	return s.promotions.Request(userID, id)
+}
+
+func (s *Service) RetryPromotion(userID, id string) (promotion.Job, error) {
+	return s.promotions.Retry(userID, id)
 }
 func (s *Service) List(ctx context.Context, userID string) ([]domain.Conversation, error) {
 	return s.store.ListConversations(ctx, userID)

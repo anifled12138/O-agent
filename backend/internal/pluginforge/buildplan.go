@@ -45,7 +45,7 @@ func (s *Service) executeLegacyBuild(ctx context.Context, project Project, docum
 	if err := manifest.Validate(); err != nil {
 		return buildResult{}, err
 	}
-	goExe, err := findGo()
+	goExe, err := s.findGo()
 	if err != nil {
 		return buildResult{}, err
 	}
@@ -94,7 +94,7 @@ func (s *Service) executeV2Build(ctx context.Context, project Project, manifest 
 	artifacts := map[string]string{}
 
 	if manifest.Runtime != nil && manifest.Runtime.Backend != nil {
-		goExe, err := findGo()
+		goExe, err := s.findGo()
 		if err != nil {
 			return buildResult{}, err
 		}

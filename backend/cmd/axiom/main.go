@@ -122,7 +122,7 @@ func run() error {
 		if recovered > 0 {
 			slog.Warn("recovered interrupted agent turns", "count", recovered)
 		}
-		agentService, err = agent.New(ctx, st, providers, forge, evolutionService, cfg.WorkspaceRoot)
+		agentService, err = agent.New(ctx, st, providers, forge, evolutionService, cfg.WorkspaceRoot, cfg.DataDir)
 		if err != nil {
 			return err
 		}

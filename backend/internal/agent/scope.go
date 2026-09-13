@@ -139,6 +139,10 @@ func (s *turnScope) execute(ctx context.Context, name string, arguments json.Raw
 		return s.dropFragment(arguments)
 	case "axiom_capsule_save":
 		return s.saveCapsule(arguments)
+	case "axiom_capsule_promote":
+		return s.promoteCapsule(arguments)
+	case "axiom_promotion_status":
+		return s.promotionStatus(arguments)
 	}
 	if manifest, ok := s.loadedCapsules[name]; ok {
 		output, _, err := s.owner.capsules.Invoke(ctx, manifest.ID, arguments)
@@ -355,6 +359,42 @@ func (s *turnScope) saveCapsule(arguments json.RawMessage) json.RawMessage {
 	return toolOK(manifest.Summary())
 }
 
+func (s *turnScope) promoteCapsule(arguments json.RawMessage) json.RawMessage {
+	if s.evaluation {
+		return toolError("capsules cannot be promoted in evaluation mode")
+	}
+	var input struct {
+		CapsuleID string `json:"capsuleId"`
+	}
+	if json.Unmarshal(arguments, &input) != nil || strings.TrimSpace(input.CapsuleID) == "" {
+		return toolError("capsuleId is required")
+	}
+	job, err := s.owner.PromoteCapsule(s.userID, input.CapsuleID)
+	if err != nil {
+		return toolError(err.Error())
+	}
+	return toolOK(map[string]any{"job": job, "approvalBoundary": "The pipeline may verify and build a release, but only the user can approve and install it."})
+}
+
+func (s *turnScope) promotionStatus(arguments json.RawMessage) json.RawMessage {
+	var input struct {
+		JobID string `json:"jobId"`
+	}
+	if len(arguments) > 0 && json.Unmarshal(arguments, &input) != nil {
+		return toolError("invalid promotion status arguments")
+	}
+	jobs := s.owner.Promotions(s.userID)
+	if input.JobID == "" {
+		return toolOK(jobs)
+	}
+	for _, job := range jobs {
+		if job.ID == input.JobID {
+			return toolOK(job)
+		}
+	}
+	return toolError("promotion job not found")
+}
+
 func fragmentContractID(name string) string {
 	digest := sha256.Sum256([]byte(strings.TrimSpace(name)))
 	return "fragment." + hex.EncodeToString(digest[:8])
@@ -366,6 +406,8 @@ func fragmentTools() []provider.ToolDefinition {
 		tool("axiom_fragment_invoke", "Invoke one previously created fragment by opaque handle. Do not recreate a fragment when the same handle still applies.", `{"type":"object","required":["fragmentId","input"],"properties":{"fragmentId":{"type":"string"},"input":{"type":"object"}},"additionalProperties":false}`),
 		tool("axiom_fragment_drop", "Drop an ephemeral capability that is no longer useful.", `{"type":"object","required":["fragmentId"],"properties":{"fragmentId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_capsule_save", "Promote a successfully executed conversation fragment into an immutable workspace capsule with its real execution evidence. This does not install a global plugin.", `{"type":"object","required":["fragmentId"],"properties":{"fragmentId":{"type":"string"},"intent":{"type":"string"},"fallback":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_capsule_promote", "Queue a verified workspace Capsule for background promotion into a compiled reference plugin. The pipeline stops at the user approval boundary and never installs automatically.", `{"type":"object","required":["capsuleId"],"properties":{"capsuleId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_promotion_status", "Inspect background Capsule promotion jobs without waiting for them. Use the returned Forge project only after the job reaches user approval.", `{"type":"object","properties":{"jobId":{"type":"string"}},"additionalProperties":false}`),
 	}
 }
 
