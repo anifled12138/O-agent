@@ -57,6 +57,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/conversations/{id}/turns", s.conversationTurns)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/messages", s.messageCreate)
 	mux.HandleFunc("POST /api/v1/agent/turns/{id}/cancel", s.turnCancel)
+	mux.HandleFunc("GET /api/v1/capabilities/fragments", s.fragmentList)
+	mux.HandleFunc("GET /api/v1/capabilities/capsules", s.capsuleList)
+	mux.HandleFunc("POST /api/v1/capabilities/capsules/{id}/verify", s.capsuleVerify)
 	mux.HandleFunc("GET /api/v1/evolution/generations", s.generationList)
 	mux.HandleFunc("POST /api/v1/evolution/generations/candidates", s.generationCreateCandidate)
 	mux.HandleFunc("POST /api/v1/evolution/generations/{id}/promote", s.generationPromote)
@@ -105,6 +108,23 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) pluginList(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, s.plugins.Snapshots())
+}
+
+func (s *Server) fragmentList(w http.ResponseWriter, r *http.Request) {
+	write(w, http.StatusOK, s.agent.Fragments(s.workspaceID, strings.TrimSpace(r.URL.Query().Get("conversationId"))))
+}
+
+func (s *Server) capsuleList(w http.ResponseWriter, _ *http.Request) {
+	write(w, http.StatusOK, s.agent.Capsules())
+}
+
+func (s *Server) capsuleVerify(w http.ResponseWriter, r *http.Request) {
+	report := s.agent.VerifyCapsule(r.Context(), r.PathValue("id"))
+	status := http.StatusOK
+	if !report.Passed {
+		status = http.StatusUnprocessableEntity
+	}
+	write(w, status, report)
 }
 
 func (s *Server) providerList(w http.ResponseWriter, r *http.Request) {

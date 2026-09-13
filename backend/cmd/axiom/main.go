@@ -22,11 +22,15 @@ import (
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/pluginruntime"
 	"axiom.local/agent/internal/provider"
+	"axiom.local/agent/internal/scriptruntime"
 	"axiom.local/agent/internal/secure"
 	"axiom.local/agent/internal/storage"
 )
 
 func main() {
+	if scriptruntime.IsWorker() {
+		os.Exit(scriptruntime.RunWorker(os.Stdin, os.Stdout))
+	}
 	if err := run(); err != nil {
 		slog.Error("axiom stopped", "error", err)
 		os.Exit(1)
@@ -56,6 +60,7 @@ func run() error {
 	var forgeRepo *pluginforge.Repository
 	var forgeRuntime *pluginruntime.Supervisor
 	var evalService *evalharness.Service
+	var agentService *agent.Service
 	register(plugins, &core.Component{Info: core.Manifest{ID: "core.storage.sqlite", Version: "0.1.0", Description: "Local transactional state", Capabilities: []string{"storage.sql", "storage.migrations"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		var err error
 		store, err = storage.Open(cfg.DataDir)
@@ -117,7 +122,11 @@ func run() error {
 		if recovered > 0 {
 			slog.Warn("recovered interrupted agent turns", "count", recovered)
 		}
-		return h.Provide("agent", agent.New(ctx, st, providers, forge, evolutionService))
+		agentService, err = agent.New(ctx, st, providers, forge, evolutionService, cfg.WorkspaceRoot)
+		if err != nil {
+			return err
+		}
+		return h.Provide("agent", agentService)
 	}})
 	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.plugin-forge.v1", Version: "0.1.0", Description: "User-controlled full-stack plugin forge and sidecar runtime", Requires: []string{"core.storage.sqlite"}, Capabilities: []string{"plugin.generate", "plugin.build", "plugin.approve", "plugin.install", "plugin.invoke"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		var err error
@@ -180,7 +189,7 @@ func run() error {
 		}
 	}()
 	providerService, _ := core.Service[*provider.Service](host, "providers")
-	agentService, _ := core.Service[*agent.Service](host, "agent")
+	agentService, _ = core.Service[*agent.Service](host, "agent")
 	evolutionService, _ := core.Service[*evolution.Service](host, "evolution")
 	evalHarnessService, _ := core.Service[*evalharness.Service](host, "eval-harness")
 	bootstrapService, _ := core.Service[*bootstrap.Service](host, "bootstrap")

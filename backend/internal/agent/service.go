@@ -11,10 +11,13 @@ import (
 	"sync"
 	"time"
 
+	"axiom.local/agent/internal/capability"
+	"axiom.local/agent/internal/capsule"
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/evolution"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/provider"
+	"axiom.local/agent/internal/scriptruntime"
 	"axiom.local/agent/internal/storage"
 )
 
@@ -24,13 +27,30 @@ type Service struct {
 	providers *provider.Service
 	forge     *pluginforge.Service
 	evolution *evolution.Service
+	fragments *capability.Registry
+	capsules  *capsule.Repository
 	runningMu sync.Mutex
 	running   map[string]context.CancelCauseFunc
 	events    *eventBroker
 }
 
-func New(hostCtx context.Context, store *storage.Store, providers *provider.Service, forge *pluginforge.Service, evolutionService *evolution.Service) *Service {
-	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, running: map[string]context.CancelCauseFunc{}, events: newEventBroker()}
+func New(hostCtx context.Context, store *storage.Store, providers *provider.Service, forge *pluginforge.Service, evolutionService *evolution.Service, workspaceRoot string) (*Service, error) {
+	scripts := scriptruntime.New()
+	capsules, err := capsule.Open(workspaceRoot, scripts)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, fragments: capability.NewRegistry(scripts), capsules: capsules, running: map[string]context.CancelCauseFunc{}, events: newEventBroker()}, nil
+}
+
+func (s *Service) Fragments(userID, conversationID string) []capability.Fragment {
+	return s.fragments.List(userID, conversationID)
+}
+
+func (s *Service) Capsules() []capsule.Summary { return s.capsules.List() }
+
+func (s *Service) VerifyCapsule(ctx context.Context, id string) capsule.VerificationReport {
+	return s.capsules.Verify(ctx, id)
 }
 func (s *Service) List(ctx context.Context, userID string) ([]domain.Conversation, error) {
 	return s.store.ListConversations(ctx, userID)
@@ -141,7 +161,7 @@ func (s *Service) runTurn(ctx context.Context, userID, conversationID, content s
 		s.runningMu.Unlock()
 		cancel(nil)
 	}()
-	scope := newTurnScope(s, userID)
+	scope := newTurnScope(s, userID, conversationID, turn.ID)
 	defer scope.Close()
 	startedDetails, _ := json.Marshal(map[string]any{"messageCount": len(detail.Messages) + 1, "pinnedTools": len(scope.tools), "pinnedSkills": len(scope.skills), "generationId": generation.ID, "definitionDigest": generation.DefinitionDigest, "strategy": generation.Definition.Spec.Strategy})
 	if err := s.store.StartAgentTurn(ctx, userID, turn, userMessage, startedDetails); err != nil {

@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 
+	"axiom.local/agent/internal/capability"
+	"axiom.local/agent/internal/capsule"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/provider"
 )
@@ -29,32 +31,36 @@ type loadedTool struct {
 }
 
 type turnScope struct {
-	owner        *Service
-	userID       string
-	lease        pluginforge.TurnLease
-	tools        map[string]pluginforge.CapabilityBinding
-	skills       map[string]pluginforge.SkillBinding
-	creator      map[string]provider.ToolDefinition
-	loaded       map[string]loadedTool
-	loadedByID   map[string]string
-	loadedCreate map[string]provider.ToolDefinition
+	owner          *Service
+	userID         string
+	conversationID string
+	turnID         string
+	evaluation     bool
+	lease          pluginforge.TurnLease
+	tools          map[string]pluginforge.CapabilityBinding
+	skills         map[string]pluginforge.SkillBinding
+	creator        map[string]provider.ToolDefinition
+	loaded         map[string]loadedTool
+	loadedByID     map[string]string
+	loadedCreate   map[string]provider.ToolDefinition
+	loadedCapsules map[string]capsule.Manifest
 }
 
-func newTurnScope(owner *Service, userID string) *turnScope {
-	return newScopedTurn(owner, userID, false)
+func newTurnScope(owner *Service, userID, conversationID, turnID string) *turnScope {
+	return newScopedTurn(owner, userID, conversationID, turnID, false)
 }
 
 func newEvaluationScope(owner *Service, userID string) *turnScope {
-	return newScopedTurn(owner, userID, true)
+	return newScopedTurn(owner, userID, "", "", true)
 }
 
-func newScopedTurn(owner *Service, userID string, evaluation bool) *turnScope {
+func newScopedTurn(owner *Service, userID, conversationID, turnID string, evaluation bool) *turnScope {
 	lease := owner.forge.BeginTurn(userID)
 	creator := creatorTools()
 	if evaluation {
 		creator = map[string]provider.ToolDefinition{}
 	}
-	scope := &turnScope{owner: owner, userID: userID, lease: lease, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}}
+	scope := &turnScope{owner: owner, userID: userID, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}}
 	for _, binding := range lease.Capabilities() {
 		if evaluation && binding.Risk != "workspace-readonly" {
 			continue
@@ -70,18 +76,33 @@ func newScopedTurn(owner *Service, userID string, evaluation bool) *turnScope {
 	return scope
 }
 
-func (s *turnScope) Close() { s.lease.Close() }
+func (s *turnScope) Close() {
+	if s.turnID != "" && s.owner != nil && s.owner.fragments != nil {
+		s.owner.fragments.DropTurn(s.userID, s.turnID)
+	}
+	s.lease.Close()
+}
 
 func (s *turnScope) definitions() []provider.ToolDefinition {
 	result := []provider.ToolDefinition{
 		tool("axiom_capability_search", "Search the compact capability index for relevant installed Agent tools, lazy skills, or creator actions. Results contain summaries only; call axiom_capability_load before use.", `{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}`),
 		tool("axiom_capability_load", "Load one exact capability from search results. Agent tools become callable with their exact schema; skills return their instructions lazily.", `{"type":"object","required":["capabilityId"],"properties":{"capabilityId":{"type":"string"}},"additionalProperties":false}`),
 	}
+	if !s.evaluation {
+		result = append(result, fragmentTools()...)
+	}
 	for _, item := range s.loaded {
 		result = append(result, item.Definition)
 	}
 	for _, item := range s.loadedCreate {
 		result = append(result, item)
+	}
+	for name, manifest := range s.loadedCapsules {
+		definition := provider.ToolDefinition{Type: "function"}
+		definition.Function.Name = name
+		definition.Function.Description = manifest.Contract.Summary + " [workspace capsule]"
+		definition.Function.Parameters = append(json.RawMessage(nil), manifest.Contract.InputSchema...)
+		result = append(result, definition)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Function.Name < result[j].Function.Name })
 	return result
@@ -108,6 +129,25 @@ func (s *turnScope) execute(ctx context.Context, name string, arguments json.Raw
 		value, err := s.load(input.CapabilityID)
 		if err != nil {
 			return toolError(err.Error())
+		}
+		return toolOK(value)
+	case "axiom_fragment_create":
+		return s.createFragment(arguments)
+	case "axiom_fragment_invoke":
+		return s.invokeFragment(ctx, arguments)
+	case "axiom_fragment_drop":
+		return s.dropFragment(arguments)
+	case "axiom_capsule_save":
+		return s.saveCapsule(arguments)
+	}
+	if manifest, ok := s.loadedCapsules[name]; ok {
+		output, _, err := s.owner.capsules.Invoke(ctx, manifest.ID, arguments)
+		if err != nil {
+			return toolError(err.Error())
+		}
+		var value any
+		if json.Unmarshal(output, &value) != nil {
+			value = json.RawMessage(output)
 		}
 		return toolOK(value)
 	}
@@ -154,6 +194,15 @@ func (s *turnScope) search(query string, limit int) []capabilityCandidate {
 			result = append(result, candidate)
 		}
 	}
+	if s.owner != nil && s.owner.capsules != nil {
+		for _, item := range s.owner.capsules.List() {
+			candidate := capabilityCandidate{ID: item.ID, Kind: "capsule", Summary: item.Summary, Tags: item.Tags, Visibility: "workspace"}
+			candidate.Score = relevance(terms, item.ID+" "+item.Name+" "+item.Summary+" "+item.Intent+" "+strings.Join(item.Tags, " "))
+			if candidate.Score > 0 || len(terms) == 0 {
+				result = append(result, candidate)
+			}
+		}
+	}
 	for id, definition := range s.creator {
 		candidate := capabilityCandidate{ID: id, Kind: "creator-action", Summary: definition.Function.Description, Visibility: "creator-only"}
 		candidate.Score = relevance(terms, id+" "+definition.Function.Description+" plugin create build generate install source revision inspect read tree diff patch repair rollback 插件 创建 生成 源码 查看 修改 补丁 构建 安装")
@@ -189,7 +238,135 @@ func (s *turnScope) load(id string) (any, error) {
 		s.loadedCreate[id] = definition
 		return map[string]any{"id": id, "kind": "creator-action", "functionName": id, "inputSchema": definition.Function.Parameters, "approvalBoundary": "The Agent may prepare releases; only the user can approve grants."}, nil
 	}
+	if s.owner != nil && s.owner.capsules != nil {
+		manifest, err := s.owner.capsules.Get(id)
+		if err != nil {
+			return nil, fmt.Errorf("capability %q is not present in this turn snapshot", id)
+		}
+		digest := sha256.Sum256([]byte(manifest.Digest + "\x00" + manifest.ID))
+		name := "axiom_capsule_" + hex.EncodeToString(digest[:8])
+		definition := provider.ToolDefinition{Type: "function"}
+		definition.Function.Name = name
+		definition.Function.Description = manifest.Contract.Summary + " [workspace capsule; fallback: " + manifest.Contract.Fallback + "]"
+		definition.Function.Parameters = append(json.RawMessage(nil), manifest.Contract.InputSchema...)
+		s.loadedCapsules[name] = manifest
+		return map[string]any{"id": id, "kind": "capsule", "functionName": name, "digest": manifest.Digest, "inputSchema": manifest.Contract.InputSchema, "outputSchema": manifest.Contract.OutputSchema, "fallback": manifest.Contract.Fallback}, nil
+	}
 	return nil, fmt.Errorf("capability %q is not present in this turn snapshot", id)
+}
+
+func (s *turnScope) createFragment(arguments json.RawMessage) json.RawMessage {
+	if s.evaluation || s.conversationID == "" || s.turnID == "" {
+		return toolError("fragments cannot be created in this run mode")
+	}
+	var input struct {
+		Name          string           `json:"name"`
+		Summary       string           `json:"summary"`
+		Intent        string           `json:"intent"`
+		Tags          []string         `json:"tags"`
+		Scope         capability.Scope `json:"scope"`
+		InputSchema   json.RawMessage  `json:"inputSchema"`
+		OutputSchema  json.RawMessage  `json:"outputSchema"`
+		Program       string           `json:"program"`
+		Fallback      string           `json:"fallback"`
+		TimeoutMillis int              `json:"timeoutMillis"`
+	}
+	if err := json.Unmarshal(arguments, &input); err != nil {
+		return toolError("invalid fragment definition")
+	}
+	if input.Scope == "" {
+		input.Scope = capability.ScopeTurn
+	}
+	contract := capability.Contract{
+		APIVersion: capability.APIVersion, ID: fragmentContractID(input.Name), Name: input.Name, Summary: input.Summary, Intent: input.Intent,
+		Tags: input.Tags, Tier: capability.TierFragment, Scope: input.Scope, Runtime: capability.RuntimeJavaScript,
+		InputSchema: input.InputSchema, OutputSchema: input.OutputSchema,
+		Limits: capability.Limits{TimeoutMillis: input.TimeoutMillis, MemoryMiB: 64, MaxOutputKiB: 256}, Fallback: input.Fallback,
+	}
+	fragment, err := s.owner.fragments.Register(s.userID, s.conversationID, s.turnID, contract, input.Program)
+	if err != nil {
+		return toolError(err.Error())
+	}
+	return toolOK(fragment)
+}
+
+func (s *turnScope) invokeFragment(ctx context.Context, arguments json.RawMessage) json.RawMessage {
+	if s.evaluation {
+		return toolError("fragments cannot run in evaluation mode")
+	}
+	var input struct {
+		FragmentID string          `json:"fragmentId"`
+		Input      json.RawMessage `json:"input"`
+	}
+	if json.Unmarshal(arguments, &input) != nil || input.FragmentID == "" || len(input.Input) == 0 {
+		return toolError("fragmentId and input are required")
+	}
+	output, err := s.owner.fragments.Invoke(ctx, s.userID, s.conversationID, input.FragmentID, input.Input)
+	if err != nil {
+		return toolError(err.Error())
+	}
+	var value any
+	if json.Unmarshal(output, &value) != nil {
+		return toolError("fragment returned invalid JSON")
+	}
+	return toolOK(value)
+}
+
+func (s *turnScope) dropFragment(arguments json.RawMessage) json.RawMessage {
+	if s.evaluation {
+		return toolError("fragments cannot be changed in evaluation mode")
+	}
+	var input struct {
+		FragmentID string `json:"fragmentId"`
+	}
+	if json.Unmarshal(arguments, &input) != nil || input.FragmentID == "" {
+		return toolError("fragmentId is required")
+	}
+	if err := s.owner.fragments.Drop(s.userID, s.conversationID, input.FragmentID); err != nil {
+		return toolError(err.Error())
+	}
+	return toolOK(map[string]any{"dropped": true, "fragmentId": input.FragmentID})
+}
+
+func (s *turnScope) saveCapsule(arguments json.RawMessage) json.RawMessage {
+	if s.evaluation {
+		return toolError("capsules cannot be saved in evaluation mode")
+	}
+	var input struct {
+		FragmentID string `json:"fragmentId"`
+		Intent     string `json:"intent"`
+		Fallback   string `json:"fallback"`
+	}
+	if json.Unmarshal(arguments, &input) != nil || input.FragmentID == "" {
+		return toolError("fragmentId is required")
+	}
+	fragment, err := s.owner.fragments.Get(s.userID, s.conversationID, input.FragmentID)
+	if err != nil {
+		return toolError(err.Error())
+	}
+	manifest, err := capsule.FromFragment(fragment, input.Intent, input.Fallback)
+	if err != nil {
+		return toolError(err.Error())
+	}
+	manifest, err = s.owner.capsules.Save(manifest)
+	if err != nil {
+		return toolError(err.Error())
+	}
+	return toolOK(manifest.Summary())
+}
+
+func fragmentContractID(name string) string {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(name)))
+	return "fragment." + hex.EncodeToString(digest[:8])
+}
+
+func fragmentTools() []provider.ToolDefinition {
+	return []provider.ToolDefinition{
+		tool("axiom_fragment_create", "Create an isolated zero-compile JavaScript capability for repeated deterministic work in this turn or conversation. The program is a function body with one input object and must return JSON. It has no file, network, process, environment, or secret access.", `{"type":"object","required":["name","summary","intent","inputSchema","outputSchema","program","fallback"],"properties":{"name":{"type":"string"},"summary":{"type":"string"},"intent":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"scope":{"type":"string","enum":["turn","conversation"]},"inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"program":{"type":"string"},"fallback":{"type":"string"},"timeoutMillis":{"type":"integer"}},"additionalProperties":false}`),
+		tool("axiom_fragment_invoke", "Invoke one previously created fragment by opaque handle. Do not recreate a fragment when the same handle still applies.", `{"type":"object","required":["fragmentId","input"],"properties":{"fragmentId":{"type":"string"},"input":{"type":"object"}},"additionalProperties":false}`),
+		tool("axiom_fragment_drop", "Drop an ephemeral capability that is no longer useful.", `{"type":"object","required":["fragmentId"],"properties":{"fragmentId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_capsule_save", "Promote a successfully executed conversation fragment into an immutable workspace capsule with its real execution evidence. This does not install a global plugin.", `{"type":"object","required":["fragmentId"],"properties":{"fragmentId":{"type":"string"},"intent":{"type":"string"},"fallback":{"type":"string"}},"additionalProperties":false}`),
+	}
 }
 
 func (s *turnScope) loadPluginTool(binding pluginforge.CapabilityBinding) string {
