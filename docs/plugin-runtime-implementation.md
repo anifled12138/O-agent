@@ -60,6 +60,28 @@ same resolver with `creator-only` visibility and cannot approve grants. A
 bounded context builder retains recent persisted messages, and durable trace
 events record model and tool boundaries without storing raw tool arguments.
 
+## Agent authoring loop
+
+Generated plugin source is not injected into normal Agent context. Creator
+actions expose a lazy authoring protocol instead:
+
+1. inspect a compact source tree containing paths, sizes, and SHA-256 hashes;
+2. read only the files needed for the current change;
+3. apply a Git unified diff against an explicit expected revision;
+4. build and test the immutable candidate;
+5. use structured build failure text to repeat the inspect/patch/build loop;
+6. request user approval, then install only after the user grants it.
+
+Each accepted file write or patch is a Git commit in the plugin's own
+repository. Patch validation rejects deletion, rename, binary data, file-mode
+changes, symlinks, paths outside the declared source contract, stale revisions,
+files over 512 KiB, and patches over 1 MiB. The latest bounded commit diff can
+be inspected without loading the entire project. The Host repository is never
+an authoring target, and an active release remains mounted while a new revision
+is developed. Per-project source operations are serialized, and build or edit
+refuses uncommitted external source changes so every packaged byte remains
+traceable to a commit; ephemeral `build/` output is excluded.
+
 ## Resource and process hardening
 
 New V2 sidecars use `axiom.rpc/v2` and request filesystem, network, secret, or

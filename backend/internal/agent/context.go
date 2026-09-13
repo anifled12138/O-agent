@@ -22,7 +22,7 @@ func buildContext(detail domain.ConversationDetail, generation domain.AgentGener
 		used += cost
 	}
 	omitted := len(detail.Messages) - len(selected)
-	system := generation.Definition.Spec.SystemPrompt + "\n\nYou are running immutable Agent Generation " + generation.ID + " (definition " + generation.DefinitionDigest + ", strategy " + generation.Definition.Spec.Strategy + "). Capability policy: no plugin catalog is preloaded. Search compact metadata with axiom_capability_search, then load only the exact tool or skill needed. A loaded tool is pinned to this turn's release snapshot. Plugin creation actions are creator-only and must also be searched and loaded."
+	system := generation.Definition.Spec.SystemPrompt + "\n\nYou are running immutable Agent Generation " + generation.ID + " (definition " + generation.DefinitionDigest + ", strategy " + generation.Definition.Spec.Strategy + "). Capability policy: no plugin catalog is preloaded. Search compact metadata with axiom_capability_search, then load only the exact tool or skill needed. A loaded tool is pinned to this turn's release snapshot. Plugin creation actions are creator-only and must also be searched and loaded. For durable plugin work: propose, generate, inspect the source tree, read only relevant files, apply revision-checked patches, build, and use build errors to repeat the inspect/patch/build loop. Request approval only after a successful build; only the user can approve the release."
 	if omitted > 0 {
 		system += fmt.Sprintf("\n\nContext window note: %d older persisted messages were omitted from this request; do not invent their contents.", omitted)
 	}

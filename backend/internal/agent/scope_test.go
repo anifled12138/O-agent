@@ -58,3 +58,15 @@ func TestCreatorActionsAreNotPartOfTheBootstrapTools(t *testing.T) {
 		}
 	}
 }
+
+func TestCreatorActionsExposeLazySourceDevelopmentLoop(t *testing.T) {
+	tools := creatorTools()
+	for _, name := range []string{"axiom_plugin_source_tree", "axiom_plugin_read_source", "axiom_plugin_source_diff", "axiom_plugin_apply_patch", "axiom_plugin_build"} {
+		if _, ok := tools[name]; !ok {
+			t.Fatalf("missing creator action %s", name)
+		}
+	}
+	if !strings.Contains(string(tools["axiom_plugin_apply_patch"].Function.Parameters), "expectedRevision") {
+		t.Fatal("patch action must require optimistic revision control")
+	}
+}

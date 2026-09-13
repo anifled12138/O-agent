@@ -156,7 +156,7 @@ func (s *turnScope) search(query string, limit int) []capabilityCandidate {
 	}
 	for id, definition := range s.creator {
 		candidate := capabilityCandidate{ID: id, Kind: "creator-action", Summary: definition.Function.Description, Visibility: "creator-only"}
-		candidate.Score = relevance(terms, id+" "+definition.Function.Description+" plugin create build generate install source revision rollback")
+		candidate.Score = relevance(terms, id+" "+definition.Function.Description+" plugin create build generate install source revision inspect read tree diff patch repair rollback 插件 创建 生成 源码 查看 修改 补丁 构建 安装")
 		if candidate.Score > 0 {
 			result = append(result, candidate)
 		}
@@ -249,7 +249,11 @@ func creatorTools() map[string]provider.ToolDefinition {
 		tool("axiom_plugin_projects", "List Plugin Forge projects and lifecycle state.", `{"type":"object","properties":{},"additionalProperties":false}`),
 		tool("axiom_plugin_propose", "Create a plugin proposal for a missing durable capability. This does not generate or install anything.", `{"type":"object","required":["name","description"],"properties":{"name":{"type":"string"},"description":{"type":"string"},"shape":{"type":"string","enum":["hybrid","agent-tool","ui","service","skill"]}},"additionalProperties":false}`),
 		tool("axiom_plugin_generate", "Generate source for a proposed plugin project in its isolated Git repository.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_write_source", "Create or replace a text source file inside a generated plugin Git workspace.", `{"type":"object","required":["projectId","path","content"],"properties":{"projectId":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_source_tree", "Inspect a compact file tree and content hashes for a generated plugin without loading file contents.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_read_source", "Read one allowed text source file from a generated plugin Git workspace.", `{"type":"object","required":["projectId","path"],"properties":{"projectId":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_source_diff", "Read the latest committed plugin source change as a bounded unified diff.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_write_source", "Create or replace one text source file against an inspected plugin revision. Prefer a patch for ordinary edits.", `{"type":"object","required":["projectId","path","content","expectedRevision"],"properties":{"projectId":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"},"expectedRevision":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_apply_patch", "Apply a revision-checked Git patch to allowed plugin text sources. Deletion, rename, binary, mode, and out-of-contract changes are rejected.", `{"type":"object","required":["projectId","expectedRevision","patch"],"properties":{"projectId":{"type":"string"},"expectedRevision":{"type":"string"},"patch":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_begin_revision", "Begin an update while the active release keeps serving pinned turns.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_build", "Build and verify declared plugin surfaces into an immutable release.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_request_approval", "Move a tested release to user permission review; this never grants approval.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),

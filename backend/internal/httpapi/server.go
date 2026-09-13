@@ -68,6 +68,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/evolution/experiments/{id}", s.experimentGet)
 	mux.HandleFunc("GET /api/v1/plugin-forge/projects", s.forgeProjectList)
 	mux.HandleFunc("POST /api/v1/plugin-forge/projects", s.forgeProjectCreate)
+	mux.HandleFunc("GET /api/v1/plugin-forge/projects/{id}/source-tree", s.forgeSourceTree)
+	mux.HandleFunc("GET /api/v1/plugin-forge/projects/{id}/source", s.forgeSourceRead)
+	mux.HandleFunc("GET /api/v1/plugin-forge/projects/{id}/diff", s.forgeSourceDiff)
+	mux.HandleFunc("POST /api/v1/plugin-forge/projects/{id}/patch", s.forgeSourcePatch)
 	mux.HandleFunc("POST /api/v1/plugin-forge/projects/{id}/{action}", s.forgeProjectAction)
 	mux.HandleFunc("GET /api/v1/plugin-runtime/installations", s.runtimeInstallationList)
 	mux.HandleFunc("GET /api/v1/plugin-runtime/capabilities", s.runtimeCapabilityList)
@@ -324,6 +328,46 @@ func (s *Server) forgeProjectCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusCreated, project)
+}
+
+func (s *Server) forgeSourceTree(w http.ResponseWriter, r *http.Request) {
+	tree, err := s.forge.SourceTree(r.Context(), s.workspaceID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, tree)
+}
+
+func (s *Server) forgeSourceRead(w http.ResponseWriter, r *http.Request) {
+	file, err := s.forge.ReadSourceFile(r.Context(), s.workspaceID, r.PathValue("id"), r.URL.Query().Get("path"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, file)
+}
+
+func (s *Server) forgeSourceDiff(w http.ResponseWriter, r *http.Request) {
+	diff, err := s.forge.SourceDiff(r.Context(), s.workspaceID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, diff)
+}
+
+func (s *Server) forgeSourcePatch(w http.ResponseWriter, r *http.Request) {
+	var in pluginforge.PatchInput
+	if !decode(w, r, &in) {
+		return
+	}
+	project, diff, err := s.forge.ApplySourcePatch(r.Context(), s.workspaceID, r.PathValue("id"), in)
+	if err != nil {
+		write(w, http.StatusConflict, map[string]any{"error": err.Error(), "project": project})
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"project": project, "diff": diff})
 }
 
 func (s *Server) forgeProjectAction(w http.ResponseWriter, r *http.Request) {

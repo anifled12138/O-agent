@@ -117,6 +117,36 @@ type ProjectView struct {
 	Releases      []Release `json:"releases"`
 }
 
+// SourceEntry is the compact, content-addressed view exposed to the Agent.
+// Source contents stay lazy and are read explicitly through ReadSourceFile.
+type SourceEntry struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+type SourceTree struct {
+	ProjectID string        `json:"projectId"`
+	Revision  string        `json:"revision"`
+	State     State         `json:"state"`
+	Files     []SourceEntry `json:"files"`
+}
+
+type SourceFile struct {
+	ProjectID string `json:"projectId"`
+	Revision  string `json:"revision"`
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	SHA256    string `json:"sha256"`
+}
+
+type SourceDiff struct {
+	ProjectID string `json:"projectId"`
+	Revision  string `json:"revision"`
+	Patch     string `json:"patch"`
+	Truncated bool   `json:"truncated"`
+}
+
 type Release struct {
 	ID             string                       `json:"id"`
 	ProjectID      string                       `json:"projectId"`

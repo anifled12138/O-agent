@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"axiom.local/agent/internal/domain"
@@ -45,6 +46,7 @@ type Service struct {
 	runtime       Runtime
 	dataDir       string
 	workspaceRoot string
+	sourceLocks   sync.Map
 }
 
 type CreateInput struct {
@@ -54,14 +56,22 @@ type CreateInput struct {
 }
 
 type SourceFileInput struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
+	Path             string `json:"path"`
+	Content          string `json:"content"`
+	ExpectedRevision string `json:"expectedRevision"`
 }
 
 func NewService(repo *Repository, runtime Runtime, dataDir, workspaceRoot string) *Service {
 	service := &Service{repo: repo, runtime: runtime, dataDir: dataDir, workspaceRoot: workspaceRoot}
 	runtime.SetObserver(service.handleRuntimeEvent)
 	return service
+}
+
+func (s *Service) lockSourceProject(projectID string) func() {
+	value, _ := s.sourceLocks.LoadOrStore(projectID, &sync.Mutex{})
+	lock := value.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (s *Service) handleRuntimeEvent(event RuntimeEvent) {
@@ -160,6 +170,8 @@ func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Pr
 }
 
 func (s *Service) Generate(ctx context.Context, userID, projectID string) (Project, error) {
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
 	p, err := s.repo.Transition(ctx, userID, projectID, StateGenerating, "")
 	if err != nil {
 		return Project{}, err
@@ -170,7 +182,10 @@ func (s *Service) Generate(ctx context.Context, userID, projectID string) (Proje
 		failed, _ := s.repo.Transition(ctx, userID, projectID, StateGenerationFailed, err.Error())
 		return failed, err
 	}
-	commitGeneratedProject(p.SourceDir)
+	if err = commitGeneratedProject(ctx, p.SourceDir); err != nil {
+		failed, _ := s.repo.Transition(ctx, userID, projectID, StateGenerationFailed, err.Error())
+		return failed, err
+	}
 	p, err = s.repo.Transition(ctx, userID, projectID, StateGenerated, "")
 	if err == nil {
 		s.audit(ctx, p, "project.generated", map[string]any{"sourceDir": p.SourceDir, "specVersion": pluginmanifest.SpecV2, "shape": shape})
@@ -179,6 +194,8 @@ func (s *Service) Generate(ctx context.Context, userID, projectID string) (Proje
 }
 
 func (s *Service) WriteSourceFile(ctx context.Context, userID, projectID string, in SourceFileInput) (Project, error) {
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
 	project, err := s.repo.Project(ctx, userID, projectID)
 	if err != nil {
 		return Project{}, err
@@ -186,20 +203,28 @@ func (s *Service) WriteSourceFile(ctx context.Context, userID, projectID string,
 	if project.State != StateGenerated && project.State != StateBuildFailed {
 		return Project{}, errors.New("source can only be edited before a successful release build")
 	}
-	if len(in.Content) > 512<<10 {
-		return Project{}, errors.New("plugin source file exceeds 512 KiB")
+	if err = ensureSourceRepositoryClean(ctx, project.SourceDir); err != nil {
+		return Project{}, err
 	}
-	relative := filepath.Clean(filepath.FromSlash(strings.TrimSpace(in.Path)))
-	if !allowedSourcePath(relative) {
-		return Project{}, errors.New("source path is outside the plugin contract")
-	}
-	root, err := filepath.Abs(project.SourceDir)
+	currentRevision, err := gitText(ctx, project.SourceDir, "rev-parse", "HEAD")
 	if err != nil {
 		return Project{}, err
 	}
-	target, err := filepath.Abs(filepath.Join(root, relative))
-	if err != nil || !pathWithin(root, target) {
-		return Project{}, errors.New("source path escapes the plugin workspace")
+	if strings.TrimSpace(in.ExpectedRevision) == "" || strings.TrimSpace(in.ExpectedRevision) != currentRevision {
+		return Project{}, errors.New("source revision changed; inspect the source tree again before writing a file")
+	}
+	if len(in.Content) > maxSourceFileBytes {
+		return Project{}, errors.New("plugin source file exceeds 512 KiB")
+	}
+	if strings.ContainsRune(in.Content, '\x00') {
+		return Project{}, errors.New("plugin source must be text")
+	}
+	relative, target, err := resolveSourcePath(project.SourceDir, in.Path)
+	if err != nil {
+		return Project{}, err
+	}
+	if err = ensureNoSymlinkPath(project.SourceDir, target); err != nil {
+		return Project{}, err
 	}
 	if err = os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return Project{}, err
@@ -207,12 +232,23 @@ func (s *Service) WriteSourceFile(ctx context.Context, userID, projectID string,
 	if err = os.WriteFile(target, []byte(in.Content), 0o600); err != nil {
 		return Project{}, err
 	}
-	commitSourceChange(project.SourceDir, filepath.ToSlash(relative))
+	if err = commitSourceChange(ctx, project.SourceDir, filepath.ToSlash(relative)); err != nil {
+		return Project{}, err
+	}
 	s.audit(ctx, project, "source.updated", map[string]any{"path": filepath.ToSlash(relative), "bytes": len(in.Content)})
 	return project, nil
 }
 
 func (s *Service) BuildAndTest(ctx context.Context, userID, projectID string) (Project, Release, error) {
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
+	project, err := s.repo.Project(ctx, userID, projectID)
+	if err != nil {
+		return Project{}, Release{}, err
+	}
+	if err = ensureSourceRepositoryClean(ctx, project.SourceDir); err != nil {
+		return project, Release{}, err
+	}
 	p, err := s.repo.Transition(ctx, userID, projectID, StateBuilding, "")
 	if err != nil {
 		return Project{}, Release{}, err
@@ -661,7 +697,7 @@ func copyIfMissing(source, target string, mode os.FileMode) error {
 }
 
 func allowedSourcePath(path string) bool {
-	if path == "plugin.json" {
+	if path == "plugin.json" || path == ".gitignore" {
 		return true
 	}
 	if filepath.IsAbs(path) || path == "." || path == ".." || strings.HasPrefix(path, ".."+string(os.PathSeparator)) {

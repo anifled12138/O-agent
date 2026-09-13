@@ -16,6 +16,7 @@ storage, model providers, the agent loop, and transports.
 - V2 full-stack, UI-only, Service, Agent Tool, and lazy Skill plugins
 - Immutable releases, explicit grants, hot swap, rollback, and crash recovery
 - Lazy capability search/load with per-turn release pinning and durable traces
+- Agent-driven inspect/patch/build plugin authoring with per-change Git commits
 - Separate sandboxed UI bridge and Agent authority
 - Dependency-checked UI-to-Service bridge with an explicit caller principal
 - Host resource brokers and Windows Job Object containment

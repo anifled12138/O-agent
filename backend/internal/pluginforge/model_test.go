@@ -1,10 +1,15 @@
 package pluginforge
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"axiom.local/agent/internal/pluginmanifest"
+	"axiom.local/agent/internal/storage"
 )
 
 func TestLifecycleRequiresApproval(t *testing.T) {
@@ -51,7 +56,7 @@ func TestManifestRejectsInvalidProtocol(t *testing.T) {
 }
 
 func TestSourceEditsStayInsidePluginWorkspace(t *testing.T) {
-	for _, path := range []string{"plugin.json", "backend/main.go", "backend/go.mod", "frontend/index.html", "frontend/app.js", "skills/guide/SKILL.md", "README.md"} {
+	for _, path := range []string{"plugin.json", ".gitignore", "backend/main.go", "backend/go.mod", "frontend/index.html", "frontend/app.js", "skills/guide/SKILL.md", "README.md"} {
 		if !allowedSourcePath(path) {
 			t.Fatalf("expected %q to be allowed", path)
 		}
@@ -60,6 +65,138 @@ func TestSourceEditsStayInsidePluginWorkspace(t *testing.T) {
 		if allowedSourcePath(path) {
 			t.Fatalf("expected %q to be rejected", path)
 		}
+	}
+}
+
+func TestSourcePatchRejectsDestructiveAndEscapingChanges(t *testing.T) {
+	for name, patch := range map[string]string{
+		"delete": "diff --git a/backend/main.go b/backend/main.go\ndeleted file mode 100644\n--- a/backend/main.go\n+++ /dev/null\n",
+		"rename": "diff --git a/backend/main.go b/backend/other.go\nsimilarity index 100%\nrename from backend/main.go\nrename to backend/other.go\n",
+		"escape": "diff --git a/../../host.go b/../../host.go\n--- a/../../host.go\n+++ b/../../host.go\n",
+		"binary": "diff --git a/frontend/blob.js b/frontend/blob.js\nGIT binary patch\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := validateSourcePatch(patch); err == nil {
+				t.Fatal("unsafe patch was accepted")
+			}
+		})
+	}
+}
+
+func TestSourcePatchIsRevisionedAndInspectable(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "backend"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "plugin.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "backend", "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitGeneratedProject(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	before, err := gitText(ctx, root, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := "diff --git a/backend/main.go b/backend/main.go\n--- a/backend/main.go\n+++ b/backend/main.go\n@@ -1 +1 @@\n-package main\n+package main // generated\n"
+	paths, err := validateSourcePatch(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = gitWithInput(ctx, root, patch, "apply", "--check", "--index", "--whitespace=error-all", "-"); err != nil {
+		t.Fatal(err)
+	}
+	if err = gitWithInput(ctx, root, patch, "apply", "--index", "--whitespace=fix", "-"); err != nil {
+		t.Fatal(err)
+	}
+	if err = verifyPatchedWorkspace(ctx, root, paths); err != nil {
+		t.Fatal(err)
+	}
+	if err = commitSourcePatch(ctx, root, paths); err != nil {
+		t.Fatal(err)
+	}
+	diff, err := latestSourceDiff(ctx, Project{ID: "project", SourceDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.Revision == before || !strings.Contains(diff.Patch, "+package main // generated") {
+		t.Fatalf("unexpected committed diff: %#v", diff)
+	}
+	entries, err := inspectSourceTree(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Path != "backend/main.go" || entries[1].Path != "plugin.json" {
+		t.Fatalf("unexpected source tree: %#v", entries)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "build"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "build", "plugin.exe"), []byte("artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSourceRepositoryClean(ctx, root); err != nil {
+		t.Fatalf("ephemeral build output made the source dirty: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("external change\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSourceRepositoryClean(ctx, root); err == nil {
+		t.Fatal("uncommitted source change was accepted")
+	}
+}
+
+func TestServiceRunsRevisionCheckedAuthoringLoop(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	store, err := storage.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, err := store.EnsureLocalWorkspaceOwner(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := OpenRepository(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	service := &Service{repo: repository, dataDir: dataDir, workspaceRoot: dataDir}
+
+	project, err := service.Create(ctx, userID, CreateInput{Name: "Patch loop", Description: "Verify the authoring loop", Shape: ShapeAgentTool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err = service.Generate(ctx, userID, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := service.SourceTree(ctx, userID, project.ID)
+	if err != nil || len(tree.Files) == 0 {
+		t.Fatalf("source tree failed: tree=%#v err=%v", tree, err)
+	}
+	patch := "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,5 +1,7 @@\n # Patch loop\n \n Verify the authoring loop\n \n Generated by Axiom Plugin Forge as a agent-tool plugin.\n+\n+Revision checked.\n"
+	if _, _, err = service.ApplySourcePatch(ctx, userID, project.ID, PatchInput{ExpectedRevision: "stale", Patch: patch}); err == nil {
+		t.Fatal("stale patch revision was accepted")
+	}
+	_, diff, err := service.ApplySourcePatch(ctx, userID, project.ID, PatchInput{ExpectedRevision: tree.Revision, Patch: patch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := service.ReadSourceFile(ctx, userID, project.ID, "README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Revision != diff.Revision || !strings.Contains(file.Content, "Revision checked.") {
+		t.Fatalf("patch result is inconsistent: file=%#v diff=%#v", file, diff)
 	}
 }
 

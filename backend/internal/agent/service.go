@@ -220,15 +220,17 @@ func tool(name, description, schema string) provider.ToolDefinition {
 
 func (s *Service) runCreatorTool(ctx context.Context, userID, name string, arguments json.RawMessage) json.RawMessage {
 	var input struct {
-		ProjectID    string          `json:"projectId"`
-		CapabilityID string          `json:"capabilityId"`
-		Input        json.RawMessage `json:"input"`
-		Name         string          `json:"name"`
-		Description  string          `json:"description"`
-		Path         string          `json:"path"`
-		Content      string          `json:"content"`
-		ReleaseID    string          `json:"releaseId"`
-		Shape        string          `json:"shape"`
+		ProjectID        string          `json:"projectId"`
+		CapabilityID     string          `json:"capabilityId"`
+		Input            json.RawMessage `json:"input"`
+		Name             string          `json:"name"`
+		Description      string          `json:"description"`
+		Path             string          `json:"path"`
+		Content          string          `json:"content"`
+		Patch            string          `json:"patch"`
+		ExpectedRevision string          `json:"expectedRevision"`
+		ReleaseID        string          `json:"releaseId"`
+		Shape            string          `json:"shape"`
 	}
 	if len(arguments) == 0 || json.Unmarshal(arguments, &input) != nil {
 		return toolError("invalid tool arguments")
@@ -242,8 +244,19 @@ func (s *Service) runCreatorTool(ctx context.Context, userID, name string, argum
 		value, err = s.forge.Create(ctx, userID, pluginforge.CreateInput{Name: input.Name, Description: input.Description, Shape: input.Shape})
 	case "axiom_plugin_generate":
 		value, err = s.forge.Generate(ctx, userID, input.ProjectID)
+	case "axiom_plugin_source_tree":
+		value, err = s.forge.SourceTree(ctx, userID, input.ProjectID)
+	case "axiom_plugin_read_source":
+		value, err = s.forge.ReadSourceFile(ctx, userID, input.ProjectID, input.Path)
+	case "axiom_plugin_source_diff":
+		value, err = s.forge.SourceDiff(ctx, userID, input.ProjectID)
 	case "axiom_plugin_write_source":
-		value, err = s.forge.WriteSourceFile(ctx, userID, input.ProjectID, pluginforge.SourceFileInput{Path: input.Path, Content: input.Content})
+		value, err = s.forge.WriteSourceFile(ctx, userID, input.ProjectID, pluginforge.SourceFileInput{Path: input.Path, Content: input.Content, ExpectedRevision: input.ExpectedRevision})
+	case "axiom_plugin_apply_patch":
+		var project pluginforge.Project
+		var diff pluginforge.SourceDiff
+		project, diff, err = s.forge.ApplySourcePatch(ctx, userID, input.ProjectID, pluginforge.PatchInput{ExpectedRevision: input.ExpectedRevision, Patch: input.Patch})
+		value = map[string]any{"project": project, "diff": diff}
 	case "axiom_plugin_begin_revision":
 		value, err = s.forge.BeginRevision(ctx, userID, input.ProjectID)
 	case "axiom_plugin_build":
