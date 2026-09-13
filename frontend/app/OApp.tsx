@@ -135,8 +135,8 @@ export default function OApp() {
   if (loading) return <Splash />;
   return <main className="app-shell">
     <Sidebar conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onEvolution={() => setEvolutionOpen(true)} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} />
-    <section className="workspace"><header className="workspace-header"><div><span className="eyebrow">本地 AGENT / 对话</span><h1>{active?.title ?? '新的工作区'}</h1></div><div className="header-actions"><span className="status-pill"><i /> 运行中</span><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="打开设置">⌘</button></div></header>
-      <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} onSend={send} onCancel={cancelTurn} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} trace={trace} /></div>
+    <section className="workspace"><header className="workspace-header"><div><span className="eyebrow">本地 AGENT / 对话</span><h1>{active?.title ?? '新的工作区'}</h1></div><div className="header-actions"><span className={`status-pill${sending ? ' active' : ''}`}><i /> {sending ? '运行中' : '就绪'}</span><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="打开设置">⌘</button></div></header>
+      <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} trace={trace} onSend={send} onCancel={cancelTurn} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} trace={trace} /></div>
     </section>
     {settingsOpen && <Settings providers={providers} onClose={() => setSettingsOpen(false)} onSaved={(next) => { setProviders((items) => items.some((item) => item.id === next.id) ? items.map((item) => item.id === next.id ? next : item) : [next, ...items]); setNotice('模型服务已保存'); }} />}
     {evolutionOpen && <EvolutionCenter providers={providers} onClose={() => setEvolutionOpen(false)} />}
@@ -173,23 +173,60 @@ function Sidebar({ conversations, activeId, onNew, onOpen, onEvolution, onPlugin
   return <aside className="sidebar"><div className="brand"><div className="brand-mark">O</div><span>O</span><small>0.2</small></div><button className="new-button" onClick={onNew}><span>＋</span> 新对话 <kbd>⌘ N</kbd></button><nav><p>对话</p>{conversations.length === 0 ? <div className="empty-nav">还没有对话。<br/>从一个目标开始。</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onEvolution}><i>⌁</i><span>演化实验室</span></button><button onClick={onPlugins}><i>◇</i><span>插件工坊</span></button><button onClick={onSettings}><i>⚙</i><span>模型设置</span></button></div></aside>;
 }
 
-function Chat({ active, providers, sending, notice, onSend, onCancel, onConfigure }: { active: ConversationDetail | null; providers: Provider[]; sending: boolean; notice: string; onSend: (content: string) => void; onCancel: () => void; onConfigure: () => void }) {
-  const [draft, setDraft] = useState(''); const suggestions = ['检查这个项目的架构', '设计一份可靠的执行计划', '根据证据定位一个问题']; const submit = () => { const value = draft; if (value.trim()) { setDraft(''); onSend(value); } };
-  return <div className="chat-column"><div className="messages">{!active?.messages.length ? <div className="empty-chat"><div className="pulse-orbit"><span>O</span></div><span className="eyebrow">AGENT 已就绪</span><h2>今天想做什么？</h2><p>告诉 O 你想达成的结果和约束。运行时会保留任务状态，并交给你配置的模型处理。</p>{!providers.length ? <button className="setup-card" onClick={onConfigure}><span>01</span><div><b>连接模型服务</b><small>配置模型供应商及其 API 协议</small></div><i>→</i></button> : <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setDraft(text)}>{text}<span>↗</span></button>)}</div>}</div> : active.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><div className="message-role">{message.role === 'user' ? '你' : 'O'}</div><div className="message-body">{message.content}</div></article>)}{sending && <article className="message assistant"><div className="message-role">O</div><div className="thinking"><i/><i/><i/> 正在思考</div></article>}</div>{notice && <div className="notice">{notice}</div>}<div className="composer"><textarea value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }} placeholder={providers.length ? '描述目标、约束，或者下一步行动…' : '请先配置模型服务…'} disabled={!providers.length || sending}/><div className="composer-row"><span>{sending ? '任务过程已持久化，可安全停止' : 'Enter 发送 · Shift Enter 换行'}</span>{sending ? <button className="stop-button" onClick={onCancel}>停止 <i>■</i></button> : <button onClick={submit} disabled={!draft.trim()}>发送 <i>↑</i></button>}</div></div></div>;
+function Chat({ active, providers, sending, notice, trace, onSend, onCancel, onConfigure }: { active: ConversationDetail | null; providers: Provider[]; sending: boolean; notice: string; trace: TraceEvent[]; onSend: (content: string) => void; onCancel: () => void; onConfigure: () => void }) {
+  const [draft, setDraft] = useState('');
+  const [activityOpen, setActivityOpen] = useState(false);
+  const suggestions = ['检查这个项目的架构', '设计一份可靠的执行计划', '根据证据定位一个问题'];
+  const submit = () => { const value = draft; if (!sending && value.trim()) { setDraft(''); onSend(value); } };
+  return <div className="chat-column"><div className="messages">{!active?.messages.length ? <div className="empty-chat"><div className="pulse-orbit"><span>O</span></div><span className="eyebrow">AGENT 已就绪</span><h2>今天想做什么？</h2><p>告诉 O 你想达成的结果和约束。运行时会保留任务状态，并交给你配置的模型处理。</p>{!providers.length ? <button className="setup-card" onClick={onConfigure}><span>01</span><div><b>连接模型服务</b><small>配置模型供应商及其 API 协议</small></div><i>→</i></button> : <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setDraft(text)}>{text}<span>↗</span></button>)}</div>}</div> : active.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><div className="message-role">{message.role === 'user' ? '你' : 'O'}</div><div className="message-body">{message.content}</div></article>)}{sending && <article className="message assistant running-message"><div className="message-role">O</div><div className="thinking-stack"><div className="thinking-row"><div className="thinking"><i/><i/><i/> 正在处理</div><div className="thinking-actions"><button type="button" onClick={() => setActivityOpen((open) => !open)}>{activityOpen ? '收起过程' : '查看过程'}</button><button type="button" className="inline-stop" onClick={onCancel}>停止</button></div></div>{activityOpen && <ActivityTrace trace={trace} />}</div></article>}</div>{notice && <div className="notice">{notice}</div>}<div className="composer"><textarea value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !sending) { e.preventDefault(); submit(); } }} placeholder={!providers.length ? '请先配置模型服务…' : sending ? '可以先输入下一条消息，当前任务完成后发送…' : '描述目标、约束，或者下一步行动…'} disabled={!providers.length}/><div className="composer-row"><span>{sending ? '可以继续输入草稿 · 当前任务可安全停止' : 'Enter 发送 · Shift Enter 换行'}</span>{sending ? <button className="stop-button" onClick={onCancel}>停止 <i>■</i></button> : <button onClick={submit} disabled={!draft.trim()}>发送 <i>↑</i></button>}</div></div></div>;
+}
+
+function ActivityTrace({ trace }: { trace: TraceEvent[] }) {
+  const events = trace.slice(-12).reverse();
+  return <section className="activity-trace" aria-label="Agent 运行过程"><header><b>运行过程</b><small>来自运行时事件，不额外调用模型</small></header>{events.length ? <div className="activity-events">{events.map((event) => <article key={event.id} className={eventTone(event.kind)}><i/><div><b>{eventLabel(event.kind)}</b><span>{eventSummary(event)}</span></div><small>#{event.sequence}</small></article>)}</div> : <p>正在等待第一条运行事件…</p>}</section>;
 }
 
 function RuntimePanel({ plugins, provider, messageCount, trace }: { plugins: Plugin[]; provider?: Provider; messageCount: number; trace: TraceEvent[] }) {
   const running = plugins.filter((item) => item.state === 'running').length;
-  return <aside className="runtime-panel"><div className="panel-title"><div><span className="eyebrow">实时检查</span><h3>运行状态</h3></div><span className="live-dot">实时</span></div><div className="runtime-metric"><span>插件图</span><b>{running}<small> / {plugins.length} 个运行中</small></b><div className="meter"><i style={{width: plugins.length ? `${running/plugins.length*100}%` : '0%'}}/></div></div><div className="runtime-section"><p>当前模型</p>{provider ? <div className="model-card"><div className="model-icon">M</div><div><b>{provider.model}</b><small>{provider.name} · API</small></div><i>●</i></div> : <div className="muted-card">尚未配置模型服务</div>}</div><div className="runtime-section"><p>任务状态</p><dl><div><dt>阶段</dt><dd>{eventLabel(trace.at(-1)?.kind ?? (messageCount ? 'checkpointed' : 'idle'))}</dd></div><div><dt>消息</dt><dd>{messageCount}</dd></div><div><dt>策略</dt><dd>按需加载 / 版本固定</dd></div></dl></div>{!!trace.length && <div className="runtime-section trace-list"><p>最近轨迹</p>{trace.slice(-6).map((event) => <div key={event.id}><i/><span>{eventLabel(event.kind)}</span><small>#{event.sequence}</small></div>)}</div>}<div className="runtime-section plugin-list"><p>插件图</p>{plugins.slice(0,6).map((item) => <div key={item.id}><i className={item.state}/><span>{item.id.replace('core.','').replace('.v1','')}</span><small>{item.version}</small></div>)}</div><div className="runtime-foot"><span>状态</span><b>本地 / 已加密</b></div></aside>;
+  return <aside className="runtime-panel"><div className="panel-title"><div><span className="eyebrow">实时检查</span><h3>运行状态</h3></div><span className="live-dot">实时</span></div><div className="runtime-metric"><span>插件图</span><b>{running}<small> / {plugins.length} 个运行中</small></b><div className="meter"><i style={{width: plugins.length ? `${running/plugins.length*100}%` : '0%'}}/></div></div><div className="runtime-section"><p>当前模型</p>{provider ? <div className="model-card"><div className="model-icon">M</div><div><b>{provider.model}</b><small>{provider.name} · API</small></div><i>●</i></div> : <div className="muted-card">尚未配置模型服务</div>}</div><div className="runtime-section"><p>任务状态</p><dl><div><dt>阶段</dt><dd>{eventLabel(trace.at(-1)?.kind ?? (messageCount ? 'checkpointed' : 'idle'))}</dd></div><div><dt>消息</dt><dd>{messageCount}</dd></div><div><dt>策略</dt><dd>按需加载 / 版本固定</dd></div></dl></div>{!!trace.length && <div className="runtime-section trace-list"><p>最近轨迹</p>{trace.slice(-6).map((event) => <div className={eventTone(event.kind)} key={event.id}><i/><span>{eventLabel(event.kind)}</span><small>#{event.sequence}</small></div>)}</div>}<div className="runtime-section plugin-list"><p>插件图</p>{plugins.slice(0,6).map((item) => <div key={item.id}><i className={item.state}/><span>{item.id.replace('core.','').replace('.v1','')}</span><small>{item.version}</small></div>)}</div><div className="runtime-foot"><span>状态</span><b>本地 / 已加密</b></div></aside>;
 }
 
 function eventLabel(value: string) {
   const labels: Record<string, string> = {
     idle: '空闲', checkpointed: '已保存', 'turn.started': '任务开始', 'turn.completed': '任务完成',
     'turn.failed': '任务失败', 'turn.cancelled': '任务已取消', 'turn.needs_reconciliation': '等待确认',
-    'model.started': '模型调用', 'model.completed': '模型完成', 'tool.started': '工具调用', 'tool.completed': '工具完成',
+    'model.requested': '正在请求模型', 'model.started': '模型调用', 'model.completed': '模型完成', 'model.failed': '模型调用失败',
+    'planner.requested': '正在请求规划', 'planner.completed': '规划完成', 'planner.failed': '规划失败',
+    'tools.dispatched': '准备调用工具', 'tools.completed': '工具批次完成', 'tool.started': '工具调用', 'tool.completed': '工具完成',
+    'context.compacted': '上下文已压缩', 'provider.compatibility_warning': '模型兼容性提示',
   };
   return labels[value] ?? value;
+}
+
+function eventTone(kind: string) {
+  if (kind.includes('failed')) return 'failed';
+  if (kind.includes('cancelled') || kind.includes('warning')) return 'warning';
+  if (kind.includes('completed')) return 'completed';
+  return 'running';
+}
+
+function eventSummary(event: TraceEvent) {
+  const details = event.details ?? {};
+  const number = (key: string) => typeof details[key] === 'number' ? details[key] as number : undefined;
+  const text = (key: string) => typeof details[key] === 'string' ? details[key] as string : '';
+  const step = number('step');
+  if (event.kind === 'model.requested') return `第 ${step ?? 1} 步 · ${number('messageCount') ?? 0} 条上下文 · ${number('toolDefinitionCount') ?? 0} 个可用工具`;
+  if (event.kind === 'model.completed') return `第 ${step ?? 1} 步 · ${number('toolCallCount') ?? 0} 个工具调用 · 输出 ${number('contentBytes') ?? 0} 字节`;
+  if (event.kind === 'model.failed' || event.kind === 'planner.failed' || event.kind === 'turn.failed') return text('error') || '运行时未返回详细错误';
+  if (event.kind === 'tool.started') return `${text('name') || '未命名工具'} · 第 ${step ?? 1} 步`;
+  if (event.kind === 'tool.completed') return `${text('name') || '未命名工具'} · ${details.ok === false ? '执行失败' : '执行成功'} · ${number('durationMillis') ?? 0} ms`;
+  if (event.kind === 'tools.dispatched' || event.kind === 'tools.completed') return `第 ${step ?? 1} 步 · ${number('toolCallCount') ?? 0} 个工具`;
+  if (event.kind === 'context.compacted') return `省略 ${number('omittedMessages') ?? 0} 条较早消息`;
+  if (event.kind === 'provider.compatibility_warning') return text('message') || text('code') || '供应商兼容性提示';
+  if (event.kind === 'turn.started') return `${number('messageCount') ?? 0} 条消息 · ${number('pinnedTools') ?? 0} 个固定工具`;
+  if (event.kind === 'turn.completed') return '结果已经保存到当前对话';
+  if (event.kind === 'turn.cancelled') return '用户停止了当前任务';
+  return step ? `第 ${step} 步` : '运行状态已更新';
 }
 
 function stateLabel(value: string) {
