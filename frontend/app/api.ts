@@ -1,4 +1,13 @@
-export const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8080/api/v1';
+declare global {
+  interface Window {
+    oDesktop?: Readonly<{ apiOrigin: string; platform: string; version: string }>;
+  }
+}
+
+const desktopOrigin = typeof window !== 'undefined' ? window.oDesktop?.apiOrigin : undefined;
+const configuredAPI = typeof process !== 'undefined' ? process.env.NEXT_PUBLIC_API_URL : undefined;
+
+export const API = desktopOrigin ? `${desktopOrigin}/api/v1` : configuredAPI ?? 'http://127.0.0.1:8080/api/v1';
 export const API_V2 = API.replace(/\/api\/v1\/?$/, '/api/v2');
 export const ASSET_ORIGIN = new URL(API).origin;
 

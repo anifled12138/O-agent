@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,8 +39,16 @@ func run() error {
 		return err
 	}
 	absoluteData, _ := filepath.Abs(cfg.DataDir)
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	ctx, stopSignals := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	if os.Getenv("O_DESKTOP_STDIN") == "1" {
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			cancelRoot()
+		}()
+	}
 	host := core.NewHost()
 	plugins := core.NewManager(host)
 	var store *storage.Store

@@ -1,6 +1,7 @@
 # O Agent
 
-O is a local-first agent product with a Go backend and a web frontend. The
+O is a local-first agent product with a Go backend and an Electron desktop
+client. The same React interface remains available as a development Web UI. The
 runtime follows one rule: every capability is mounted as a plugin, including
 storage, model providers, the agent loop, and transports.
 
@@ -13,6 +14,7 @@ storage, model providers, the agent loop, and transports.
 - Durable asynchronous turns with cancellation, restart classification, and resumable SSE events
 - Plugin lifecycle and runtime inspection
 - Responsive product UI
+- Windows desktop process with an embedded UI bundle and managed Go Host
 - V2 full-stack, UI-only, Service, Agent Tool, and lazy Skill plugins
 - Immutable releases, explicit grants, hot swap, rollback, and crash recovery
 - Lazy capability search/load with per-turn release pinning and durable traces
@@ -56,6 +58,25 @@ npm run dev
 Open `http://127.0.0.1:3000`. Runtime data is written to
 `D:\agent-harness\data` by default and is intentionally ignored by Git.
 
+To run the real desktop client in development, use one command. It builds and
+owns the Go Host automatically:
+
+```powershell
+cd D:\agent-harness
+npm run dev:desktop
+```
+
+To produce both a portable Windows application folder and an installer:
+
+```powershell
+cd D:\agent-harness
+npm run build:desktop
+```
+
+Versioned outputs are written under `D:\agent-harness\release`. The desktop
+runtime implementation is documented in
+[`docs/desktop-client-implementation.md`](docs/desktop-client-implementation.md).
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -77,4 +98,8 @@ cd D:\agent-harness\backend
 cd D:\agent-harness\frontend
 npm run lint
 npm run build
+npm run build:desktop-ui
+
+cd D:\agent-harness\desktop
+npm audit --audit-level=high
 ```

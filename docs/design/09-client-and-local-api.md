@@ -1,6 +1,6 @@
 # 09 · 客户端与本地 API
 
-状态：Proposed
+状态：Desktop M1 Implemented
 
 ## 两种客户端形态
 
@@ -93,3 +93,18 @@ Web UI 使用 V2 async Turn Receipt；durable event 通过 SSE sequence cursor �
 后台执行。Provider token delta 仍待实现。V1 同步接口暂时保留用于兼容，不作为客户端
 默认路径。产品使用单用户本地工作区，不提供注册、登录、登出或 Cookie session；
 数据库中的 `user_id` 暂作为兼容性工作区作用域键，启动时绑定已有数据所有者。
+
+## Desktop M1（2026-09-13）
+
+正式客户端已经实现为 Electron Main + sandboxed Renderer + 独立 Go Host：
+
+- `O.exe` 自动选择随机 loopback 端口、启动 Host、等待健康检查并管理退出；
+- 生产 Renderer 从 `oapp://app` 加载打包内静态资源，不依赖浏览器或前端服务器；
+- Preload 仅暴露经过校验的 API Origin、平台和 Electron 版本；
+- `nodeIntegration=false`、`contextIsolation=true`、`sandbox=true`；
+- 所有浏览器权限、弹窗和跨地址导航默认拒绝；
+- Renderer 仍通过同一 HTTP/SSE 协议访问 Host，Web 开发模式不复制业务逻辑；
+- stdin 生命周期通道让 Electron 退出时先触发 Go Host 的正常 shutdown；
+- Windows 构建同时输出 portable 应用目录与 Squirrel Setup。
+
+尚未进入 M1 的内容是代码签名、自动更新、系统托盘与安装后的协议关联。
