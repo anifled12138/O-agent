@@ -42,12 +42,18 @@ jobs:
           TEST_EXIT=$?
           cat test.log
           if [ $TEST_EXIT -ne 0 ]; then
-            echo "### ❌ Backend Test Failures" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -E "(FAIL|panic:|--- FAIL:)" -B 2 -A 8 test.log >> $GITHUB_STEP_SUMMARY || tail -n 60 test.log >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "(FAIL|panic:|--- FAIL:)" test.log | head -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
             exit $TEST_EXIT
           fi
+
+      - name: Upload Test Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-log
+          path: backend/test.log
 
       - name: Build Axiom Binary
         run: |
