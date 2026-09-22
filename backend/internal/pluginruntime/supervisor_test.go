@@ -16,7 +16,7 @@ import (
 )
 
 func TestWithinReleaseBoundary(t *testing.T) {
-	root := filepath.Join("D:\\", "plugins", "release")
+	root := filepath.Join(t.TempDir(), "plugins", "release")
 	if !within(root, filepath.Join(root, "backend", "plugin.exe")) {
 		t.Fatal("release artifact should be accepted")
 	}
@@ -26,7 +26,7 @@ func TestWithinReleaseBoundary(t *testing.T) {
 }
 
 func TestConcurrentFrontendActivationAndDeactivationRemainsConsistent(t *testing.T) {
-	supervisor, err := New(filepath.Clean("D:\\agent-harness"))
+	supervisor, err := New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,10 @@ func TestConcurrentFrontendActivationAndDeactivationRemainsConsistent(t *testing
 }
 
 func TestExportCollisionLeavesOriginalRegistryUntouched(t *testing.T) {
-	supervisor, _ := New(filepath.Clean("D:\\agent-harness"))
+	supervisor, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	manifest := func(pluginID string) pluginmanifest.Manifest {
 		return pluginmanifest.Manifest{SpecVersion: pluginmanifest.SpecV2, ID: pluginID, Name: pluginID, Version: "1.0.0", Description: "Skill", Exports: pluginmanifest.Exports{Skills: []pluginmanifest.SkillExport{{ID: "shared.guide", Summary: "Shared", Visibility: "discoverable", Entry: "skills/guide/SKILL.md"}}}}
 	}
@@ -70,7 +73,10 @@ func TestExportCollisionLeavesOriginalRegistryUntouched(t *testing.T) {
 }
 
 func TestTrustedHostExecutorNeedsNoSidecar(t *testing.T) {
-	supervisor, _ := New(filepath.Clean("D:\\agent-harness"))
+	supervisor, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	release := pluginforge.Release{ID: "rel_host", PluginID: "example.host", Version: "1.0.0", Manifest: pluginmanifest.Manifest{
 		SpecVersion: pluginmanifest.SpecV2, ID: "example.host", Name: "Host Tool", Version: "1.0.0", Description: "Trusted Host tool",
 		Exports: pluginmanifest.Exports{Tools: []pluginmanifest.ToolExport{{ID: "example.host.describe", Summary: "Describe mounted workspace", Visibility: "discoverable", Risk: "read-only", Executor: pluginmanifest.Executor{Kind: "host", Target: "host.workspace.describe"}, InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object","required":["mounted","resourceAccess"],"properties":{"mounted":{"type":"boolean"},"resourceAccess":{"type":"string"}}}`)}}},
@@ -88,7 +94,10 @@ func TestTrustedHostExecutorNeedsNoSidecar(t *testing.T) {
 }
 
 func TestActivationRejectsMissingDependenciesWithoutPublishingSurfaces(t *testing.T) {
-	supervisor, _ := New(filepath.Clean("D:\\agent-harness"))
+	supervisor, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	release := pluginforge.Release{ID: "rel_dependent", PluginID: "example.dependent", Version: "1.0.0", Manifest: pluginmanifest.Manifest{
 		SpecVersion: pluginmanifest.SpecV2, ID: "example.dependent", Name: "Dependent", Version: "1.0.0", Description: "Requires service",
 		UI:           &pluginmanifest.UI{Entry: "frontend/index.html", Sandbox: "strict"},
@@ -103,7 +112,10 @@ func TestActivationRejectsMissingDependenciesWithoutPublishingSurfaces(t *testin
 }
 
 func TestUIServiceCallRequiresDeclaredContractAndCarriesUIPrincipal(t *testing.T) {
-	supervisor, _ := New(filepath.Clean("D:\\agent-harness"))
+	supervisor, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	pluginInput, hostInput := io.Pipe()
 	pluginOutput, hostOutput := io.Pipe()
 	providerProcess := &process{stdin: hostInput, stdout: bufio.NewReader(pluginOutput), done: make(chan struct{})}
@@ -159,11 +171,12 @@ func TestVersionConstraints(t *testing.T) {
 }
 
 func TestPureUISurfaceActivatesWithoutBackend(t *testing.T) {
-	supervisor, err := New(filepath.Clean("D:\\agent-harness"))
+	workspace := t.TempDir()
+	supervisor, err := New(workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
-	release := pluginforge.Release{ID: "rel_ui", PluginID: "example.ui", Version: "1.0.0", BundleDir: filepath.Clean("D:\\agent-harness\\work\\ui"), Manifest: pluginmanifest.Manifest{
+	release := pluginforge.Release{ID: "rel_ui", PluginID: "example.ui", Version: "1.0.0", BundleDir: filepath.Join(workspace, "work", "ui"), Manifest: pluginmanifest.Manifest{
 		SpecVersion: pluginmanifest.SpecV2, ID: "example.ui", Name: "UI", Version: "1.0.0", Description: "Pure UI",
 		UI: &pluginmanifest.UI{Entry: "frontend/index.html", Assets: "frontend/**", Slots: []string{"workspace.main"}, Sandbox: "strict"},
 	}}
@@ -186,11 +199,12 @@ func TestPureUISurfaceActivatesWithoutBackend(t *testing.T) {
 }
 
 func TestSkillSurfaceIsRegisteredWithoutEnteringToolCatalog(t *testing.T) {
-	supervisor, err := New(filepath.Clean("D:\\agent-harness"))
+	workspace := t.TempDir()
+	supervisor, err := New(workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
-	release := pluginforge.Release{ID: "rel_skill", PluginID: "example.skill", Version: "1.0.0", BundleDir: filepath.Clean("D:\\agent-harness\\work\\skill"), Manifest: pluginmanifest.Manifest{
+	release := pluginforge.Release{ID: "rel_skill", PluginID: "example.skill", Version: "1.0.0", BundleDir: filepath.Join(workspace, "work", "skill"), Manifest: pluginmanifest.Manifest{
 		SpecVersion: pluginmanifest.SpecV2, ID: "example.skill", Name: "Skill", Version: "1.0.0", Description: "Lazy skill",
 		Exports: pluginmanifest.Exports{Skills: []pluginmanifest.SkillExport{{ID: "example.skill.guide", Summary: "Guide work", Visibility: "discoverable", Entry: "skills/guide/SKILL.md"}}},
 	}}

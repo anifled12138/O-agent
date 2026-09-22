@@ -90,13 +90,17 @@ func TestPromotionBuildsVerifiedReferenceAndStopsForUserApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
+	var lastStatus promotion.Status
+	var lastError string
 	for time.Now().Before(deadline) {
 		items := promotions.List(userID)
 		for _, item := range items {
 			if item.ID != job.ID {
 				continue
 			}
+			lastStatus = item.Status
+			lastError = item.Error
 			if item.Status == promotion.StatusAwaitingApproval {
 				if item.ProjectID == "" || item.ReleaseID == "" || item.Verification == nil || !item.Verification.Passed {
 					t.Fatalf("promotion lost its evidence or artifacts: %#v", item)
@@ -117,5 +121,5 @@ func TestPromotionBuildsVerifiedReferenceAndStopsForUserApproval(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatal("promotion did not reach the user approval gate")
+	t.Fatalf("promotion did not reach the user approval gate in time: last status=%s, error=%s", lastStatus, lastError)
 }

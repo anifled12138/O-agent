@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -25,7 +26,15 @@ func brokerRelease() pluginforge.Release {
 }
 
 func TestFilesystemBrokerEnforcesScopeAndTraversal(t *testing.T) {
-	broker, err := NewResourceBroker(filepath.Clean("D:\\agent-harness"), filepath.Clean("D:\\agent-harness\\work\\broker-test"), testSecrets{}, nil)
+	workspace := t.TempDir()
+	dataDir := filepath.Join(workspace, "work", "broker-test")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "README.md"), []byte("# test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	broker, err := NewResourceBroker(workspace, dataDir, testSecrets{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,10 +51,18 @@ func TestFilesystemBrokerEnforcesScopeAndTraversal(t *testing.T) {
 }
 
 func TestSecretAndProcessBrokersRequireExactGrants(t *testing.T) {
+	workspace := t.TempDir()
+	dataDir := filepath.Join(workspace, "work", "broker-test")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	commands := map[string]BrokerCommand{"trusted.inspect": func(context.Context, json.RawMessage) (json.RawMessage, error) {
 		return json.RawMessage(`{"ok":true}`), nil
 	}}
-	broker, _ := NewResourceBroker(filepath.Clean("D:\\agent-harness"), filepath.Clean("D:\\agent-harness\\work\\broker-test"), testSecrets{}, commands)
+	broker, err := NewResourceBroker(workspace, dataDir, testSecrets{}, commands)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if value, err := broker.Secret(context.Background(), "user", brokerRelease(), "example.token"); err != nil || string(value) != "resolved" {
 		t.Fatalf("secret grant failed: %v", err)
 	}
