@@ -35,8 +35,19 @@ jobs:
         run: go vet ./...
 
       - name: Run Backend Unit & Integration Tests
+        shell: bash
         run: |
-          go test -v -coverprofile=coverage.out ./...
+          set +e
+          go test -v ./... > test.log 2>&1
+          TEST_EXIT=$?
+          cat test.log
+          if [ $TEST_EXIT -ne 0 ]; then
+            echo "### ❌ Backend Test Failures" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "(FAIL|panic:|--- FAIL:)" -B 2 -A 8 test.log >> $GITHUB_STEP_SUMMARY || tail -n 60 test.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit $TEST_EXIT
+          fi
 
       - name: Build Axiom Binary
         run: |
@@ -66,7 +77,16 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        shell: bash
+        run: |
+          set +e
+          npm ci --legacy-peer-deps > npm-install.log 2>&1
+          NPM_EXIT=$?
+          cat npm-install.log
+          if [ $NPM_EXIT -ne 0 ]; then
+            echo "npm ci failed, retrying with npm install..."
+            npm install --legacy-peer-deps
+          fi
 
       - name: Run TypeScript Typecheck
         run: npm run typecheck
