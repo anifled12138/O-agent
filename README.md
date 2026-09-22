@@ -81,7 +81,7 @@ runtime implementation is documented in
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `O_ADDR` | `127.0.0.1:8080` | Backend listen address |
+| `O_ADDR` | `127.0.0.1:9171` | Backend listen address |
 | `O_DATA_DIR` | `../data` | SQLite database and encryption key directory |
 | `O_FRONTEND_ORIGIN` | `http://127.0.0.1:3000` | Allowed browser origin |
 | `O_WORKSPACE_ROOT` | `..` | Workspace exposed through approved Host brokers |

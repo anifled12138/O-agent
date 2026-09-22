@@ -125,7 +125,7 @@ ON CONFLICT(turn_id,ordinal) DO UPDATE SET status='running',attempt_count=agent_
 }
 
 func (s *Store) FinishAgentTurn(ctx context.Context, userID, turnID, status, stopReason string, output *domain.Message, details json.RawMessage) error {
-	if status != "completed" && status != "failed" && status != "cancelled" && status != "needs_reconciliation" {
+	if status != "completed" && status != "incomplete" && status != "failed" && status != "cancelled" && status != "needs_reconciliation" {
 		return domain.ErrInvalid
 	}
 	tx, err := s.db.BeginTx(ctx, nil)

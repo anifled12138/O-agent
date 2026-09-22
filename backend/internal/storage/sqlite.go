@@ -44,15 +44,23 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
 );
 CREATE TABLE IF NOT EXISTS providers (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL,
- kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
+ kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, context_window INTEGER NOT NULL DEFAULT 0,
  api_key_cipher BLOB NOT NULL, api_key_nonce BLOB NOT NULL,
  created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
  UNIQUE(user_id, name)
 );
+CREATE TABLE IF NOT EXISTS projects (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL,
+ instructions TEXT NOT NULL DEFAULT '', instructions_enabled INTEGER NOT NULL DEFAULT 0,
+ workdir TEXT NOT NULL DEFAULT '', remote_repo_url TEXT NOT NULL DEFAULT '',
+ remote_branch TEXT NOT NULL DEFAULT '',
+ created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, updated_at DESC);
 CREATE TABLE IF NOT EXISTS conversations (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), title TEXT NOT NULL,
- provider_id TEXT NOT NULL REFERENCES providers(id), created_at DATETIME NOT NULL,
- updated_at DATETIME NOT NULL
+ provider_id TEXT NOT NULL REFERENCES providers(id), project_id TEXT NOT NULL DEFAULT '',
+ created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
 CREATE TABLE IF NOT EXISTS messages (
@@ -135,7 +143,21 @@ CREATE TABLE IF NOT EXISTS eval_trials (
 CREATE INDEX IF NOT EXISTS idx_eval_trials_experiment ON eval_trials(experiment_id, created_at);
 `
 	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, migration := range []string{
+		`ALTER TABLE conversations ADD COLUMN project_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE projects ADD COLUMN instructions_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE projects ADD COLUMN remote_repo_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE projects ADD COLUMN remote_branch TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE providers ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, migrationErr := s.db.ExecContext(ctx, migration); migrationErr != nil && !strings.Contains(strings.ToLower(migrationErr.Error()), "duplicate column name") {
+			return migrationErr
+		}
+	}
+	return nil
 }
 
 func (s *Store) CreateUser(ctx context.Context, u domain.User, passwordHash string) error {
@@ -181,7 +203,7 @@ func (s *Store) EnsureLocalWorkspaceOwner(ctx context.Context) (string, error) {
 }
 
 func (s *Store) UpsertProvider(ctx context.Context, p domain.Provider, cipher, nonce []byte) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO providers(id,user_id,name,kind,base_url,model,api_key_cipher,api_key_nonce,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, p.ID, p.UserID, p.Name, p.Kind, p.BaseURL, p.Model, cipher, nonce, p.CreatedAt, p.UpdatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO providers(id,user_id,name,kind,base_url,model,context_window,api_key_cipher,api_key_nonce,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.UserID, p.Name, p.Kind, p.BaseURL, p.Model, p.ContextWindow, cipher, nonce, p.CreatedAt, p.UpdatedAt)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return domain.ErrConflict
 	}
@@ -189,7 +211,7 @@ func (s *Store) UpsertProvider(ctx context.Context, p domain.Provider, cipher, n
 }
 
 func (s *Store) UpdateProvider(ctx context.Context, p domain.Provider, cipher, nonce []byte) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,kind=?,base_url=?,model=?,api_key_cipher=?,api_key_nonce=?,updated_at=? WHERE id=? AND user_id=?`, p.Name, p.Kind, p.BaseURL, p.Model, cipher, nonce, p.UpdatedAt, p.ID, p.UserID)
+	result, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,kind=?,base_url=?,model=?,context_window=?,api_key_cipher=?,api_key_nonce=?,updated_at=? WHERE id=? AND user_id=?`, p.Name, p.Kind, p.BaseURL, p.Model, p.ContextWindow, cipher, nonce, p.UpdatedAt, p.ID, p.UserID)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return domain.ErrConflict
 	}
@@ -207,7 +229,7 @@ func (s *Store) UpdateProvider(ctx context.Context, p domain.Provider, cipher, n
 }
 
 func (s *Store) ListProviders(ctx context.Context, userID string) ([]domain.Provider, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,kind,base_url,model,length(api_key_cipher)>0,created_at,updated_at FROM providers WHERE user_id=? ORDER BY updated_at DESC`, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,kind,base_url,model,context_window,length(api_key_cipher)>0,created_at,updated_at FROM providers WHERE user_id=? ORDER BY updated_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +237,7 @@ func (s *Store) ListProviders(ctx context.Context, userID string) ([]domain.Prov
 	result := []domain.Provider{}
 	for rows.Next() {
 		var p domain.Provider
-		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &p.HasAPIKey, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &p.ContextWindow, &p.HasAPIKey, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, p)
@@ -226,7 +248,7 @@ func (s *Store) ListProviders(ctx context.Context, userID string) ([]domain.Prov
 func (s *Store) ProviderSecret(ctx context.Context, userID, id string) (domain.Provider, []byte, []byte, error) {
 	var p domain.Provider
 	var cipher, nonce []byte
-	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,name,kind,base_url,model,api_key_cipher,api_key_nonce,created_at,updated_at FROM providers WHERE id=? AND user_id=?`, id, userID).Scan(&p.ID, &p.UserID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &cipher, &nonce, &p.CreatedAt, &p.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,name,kind,base_url,model,context_window,api_key_cipher,api_key_nonce,created_at,updated_at FROM providers WHERE id=? AND user_id=?`, id, userID).Scan(&p.ID, &p.UserID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &p.ContextWindow, &cipher, &nonce, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, nil, nil, domain.ErrNotFound
 	}
@@ -235,7 +257,7 @@ func (s *Store) ProviderSecret(ctx context.Context, userID, id string) (domain.P
 }
 
 func (s *Store) CreateConversation(ctx context.Context, c domain.Conversation) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,created_at,updated_at) VALUES(?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.CreatedAt, c.UpdatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,project_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.ProjectID, c.CreatedAt, c.UpdatedAt)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "foreign key") {
 		return domain.ErrInvalid
 	}
@@ -248,7 +270,7 @@ func (s *Store) CreateConversationWithGeneration(ctx context.Context, c domain.C
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,created_at,updated_at) VALUES(?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.CreatedAt, c.UpdatedAt)
+	_, err = tx.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,project_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.ProjectID, c.CreatedAt, c.UpdatedAt)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "foreign key") {
 			return domain.ErrInvalid
@@ -268,7 +290,7 @@ SELECT ?,?,?,?,? FROM agent_generations WHERE id=? AND user_id=? AND definition_
 }
 
 func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.Conversation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.user_id=? ORDER BY c.updated_at DESC`, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.user_id=? ORDER BY c.updated_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +298,7 @@ func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.
 	result := []domain.Conversation{}
 	for rows.Next() {
 		var c domain.Conversation
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Title, &c.ProviderID, &c.AgentGenerationID, &c.AgentDefinitionDigest, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Title, &c.ProviderID, &c.AgentGenerationID, &c.AgentDefinitionDigest, &c.ProjectID, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -284,9 +306,147 @@ func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.
 	return result, rows.Err()
 }
 
+func (s *Store) UpdateConversationTitle(ctx context.Context, userID, id, title string) error {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return domain.ErrInvalid
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET title=?, updated_at=? WHERE id=? AND (user_id=? OR ?='')`, title, now, id, userID, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) UpdateConversationProject(ctx context.Context, userID, id, projectID string) error {
+	if projectID != "" {
+		var exists int
+		if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM projects WHERE id=? AND user_id=?`, projectID, userID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return domain.ErrNotFound
+		} else if err != nil {
+			return err
+		}
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET project_id=?, updated_at=? WHERE id=? AND (user_id=? OR ?='')`, projectID, now, id, userID, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) CreateProject(ctx context.Context, p domain.Project) error {
+	p.Name = strings.TrimSpace(p.Name)
+	if p.Name == "" {
+		return domain.ErrInvalid
+	}
+	instrEnabled := 0
+	if p.InstructionsEnabled {
+		instrEnabled = 1
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO projects(id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		p.ID, p.UserID, p.Name, p.Instructions, instrEnabled, p.Workdir, p.RemoteRepoURL, p.RemoteBranch, p.CreatedAt, p.UpdatedAt)
+	return err
+}
+
+func (s *Store) ListProjects(ctx context.Context, userID string) ([]domain.Project, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,created_at,updated_at FROM projects WHERE user_id=? ORDER BY updated_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []domain.Project{}
+	for rows.Next() {
+		var p domain.Project
+		var instrEnabled int
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Instructions, &instrEnabled, &p.Workdir, &p.RemoteRepoURL, &p.RemoteBranch, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		p.InstructionsEnabled = instrEnabled != 0
+		result = append(result, p)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) Project(ctx context.Context, userID, id string) (domain.Project, error) {
+	var p domain.Project
+	var instrEnabled int
+	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,created_at,updated_at FROM projects WHERE id=? AND user_id=?`, id, userID).
+		Scan(&p.ID, &p.UserID, &p.Name, &p.Instructions, &instrEnabled, &p.Workdir, &p.RemoteRepoURL, &p.RemoteBranch, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return p, domain.ErrNotFound
+	}
+	p.InstructionsEnabled = instrEnabled != 0
+	return p, err
+}
+
+func (s *Store) UpdateProject(ctx context.Context, userID string, p domain.Project) error {
+	p.Name = strings.TrimSpace(p.Name)
+	if p.Name == "" {
+		return domain.ErrInvalid
+	}
+	instrEnabled := 0
+	if p.InstructionsEnabled {
+		instrEnabled = 1
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE projects SET name=?, instructions=?, instructions_enabled=?, workdir=?, remote_repo_url=?, remote_branch=?, updated_at=? WHERE id=? AND (user_id=? OR ?='')`,
+		p.Name, p.Instructions, instrEnabled, p.Workdir, p.RemoteRepoURL, p.RemoteBranch, now, p.ID, userID, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteProject(ctx context.Context, userID, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `UPDATE conversations SET project_id='' WHERE project_id=? AND (user_id=? OR ?='')`, id, userID, userID)
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id=? AND (user_id=? OR ?='')`, id, userID, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return domain.ErrNotFound
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Conversation(ctx context.Context, userID, id string) (domain.ConversationDetail, error) {
 	var d domain.ConversationDetail
-	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.id=? AND c.user_id=?`, id, userID).Scan(&d.ID, &d.UserID, &d.Title, &d.ProviderID, &d.AgentGenerationID, &d.AgentDefinitionDigest, &d.CreatedAt, &d.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.id=? AND c.user_id=?`, id, userID).Scan(&d.ID, &d.UserID, &d.Title, &d.ProviderID, &d.AgentGenerationID, &d.AgentDefinitionDigest, &d.ProjectID, &d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, domain.ErrNotFound
 	}

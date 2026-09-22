@@ -24,15 +24,29 @@ type User struct {
 }
 
 type Provider struct {
-	ID        string    `json:"id"`
-	UserID    string    `json:"-"`
-	Name      string    `json:"name"`
-	Kind      string    `json:"kind"`
-	BaseURL   string    `json:"baseUrl"`
-	Model     string    `json:"model"`
-	HasAPIKey bool      `json:"hasApiKey"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID            string    `json:"id"`
+	UserID        string    `json:"-"`
+	Name          string    `json:"name"`
+	Kind          string    `json:"kind"`
+	BaseURL       string    `json:"baseUrl"`
+	Model         string    `json:"model"`
+	ContextWindow int       `json:"contextWindow"`
+	HasAPIKey     bool      `json:"hasApiKey"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+type Project struct {
+	ID                  string    `json:"id"`
+	UserID              string    `json:"-"`
+	Name                string    `json:"name"`
+	Instructions        string    `json:"instructions"`
+	InstructionsEnabled bool      `json:"instructionsEnabled"`
+	Workdir             string    `json:"workdir"`
+	RemoteRepoURL       string    `json:"remoteRepoUrl"`
+	RemoteBranch        string    `json:"remoteBranch"`
+	CreatedAt           time.Time `json:"createdAt"`
+	UpdatedAt           time.Time `json:"updatedAt"`
 }
 
 type Conversation struct {
@@ -42,6 +56,7 @@ type Conversation struct {
 	ProviderID            string    `json:"providerId"`
 	AgentGenerationID     string    `json:"agentGenerationId,omitempty"`
 	AgentDefinitionDigest string    `json:"agentDefinitionDigest,omitempty"`
+	ProjectID             string    `json:"projectId,omitempty"`
 	CreatedAt             time.Time `json:"createdAt"`
 	UpdatedAt             time.Time `json:"updatedAt"`
 }

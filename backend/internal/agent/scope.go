@@ -11,6 +11,7 @@ import (
 
 	"axiom.local/agent/internal/capability"
 	"axiom.local/agent/internal/capsule"
+	"axiom.local/agent/internal/coretools"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/provider"
 )
@@ -37,6 +38,8 @@ type turnScope struct {
 	turnID         string
 	evaluation     bool
 	lease          pluginforge.TurnLease
+	coreTools      map[string]coretools.Tool
+	forceCompact   bool
 	tools          map[string]pluginforge.CapabilityBinding
 	skills         map[string]pluginforge.SkillBinding
 	creator        map[string]provider.ToolDefinition
@@ -44,6 +47,7 @@ type turnScope struct {
 	loadedByID     map[string]string
 	loadedCreate   map[string]provider.ToolDefinition
 	loadedCapsules map[string]capsule.Manifest
+	contextTokens  int
 }
 
 func newTurnScope(owner *Service, userID, conversationID, turnID string) *turnScope {
@@ -60,7 +64,12 @@ func newScopedTurn(owner *Service, userID, conversationID, turnID string, evalua
 	if evaluation {
 		creator = map[string]provider.ToolDefinition{}
 	}
-	scope := &turnScope{owner: owner, userID: userID, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}}
+	scope := &turnScope{owner: owner, userID: userID, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}, coreTools: map[string]coretools.Tool{}}
+	if owner != nil {
+		for _, ct := range coretools.GetCoreTools(owner.workspaceRoot) {
+			scope.coreTools[ct.Definition.Function.Name] = ct
+		}
+	}
 	for _, binding := range lease.Capabilities() {
 		if evaluation && binding.Risk != "workspace-readonly" {
 			continue
@@ -76,6 +85,56 @@ func newScopedTurn(owner *Service, userID, conversationID, turnID string, evalua
 	return scope
 }
 
+func (s *turnScope) setWorkspaceRoot(root string) {
+	if strings.TrimSpace(root) != "" {
+		for _, ct := range coretools.GetCoreTools(root) {
+			s.coreTools[ct.Definition.Function.Name] = ct
+		}
+	}
+}
+
+func (s *turnScope) setContextWindow(tokens int) {
+	if tokens > 0 {
+		s.contextTokens = tokens
+	}
+}
+
+type turnCompaction struct {
+	Applied        bool
+	Forced         bool
+	OriginalChars  int
+	CompactedChars int
+}
+
+func messageChars(messages []provider.ChatMessage) int {
+	total := 0
+	for _, message := range messages {
+		total += len(message.Content)
+		for _, call := range message.ToolCalls {
+			total += len(call.Function.Name) + len(call.Function.Arguments)
+		}
+	}
+	return total
+}
+
+func (s *turnScope) prepareTurnMessages(messages []provider.ChatMessage, _ int) ([]provider.ChatMessage, turnCompaction) {
+	stats := turnCompaction{OriginalChars: messageChars(messages), Forced: s.forceCompact}
+	if s.owner == nil || s.owner.plugins == nil || !s.owner.plugins.IsContextCompactorEnabled() {
+		s.forceCompact = false
+		stats.CompactedChars = stats.OriginalChars
+		return messages, stats
+	}
+	contextTokens := s.contextTokens
+	if contextTokens <= 0 {
+		contextTokens = 131072
+	}
+	prepared := s.owner.plugins.ContextPlugin().PrepareTurnMessagesWithBudget(context.Background(), messages, contextTokens*2, s.forceCompact)
+	s.forceCompact = false
+	stats.CompactedChars = messageChars(prepared)
+	stats.Applied = stats.CompactedChars < stats.OriginalChars
+	return prepared, stats
+}
+
 func (s *turnScope) Close() {
 	if s.turnID != "" && s.owner != nil && s.owner.fragments != nil {
 		s.owner.fragments.DropTurn(s.userID, s.turnID)
@@ -88,6 +147,9 @@ func (s *turnScope) definitions() []provider.ToolDefinition {
 		tool("axiom_capability_search", "Search the compact capability index for relevant installed Agent tools, lazy skills, or creator actions. Results contain summaries only; call axiom_capability_load before use.", `{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}`),
 		tool("axiom_capability_load", "Load one exact capability from search results. Agent tools become callable with their exact schema; skills return their instructions lazily.", `{"type":"object","required":["capabilityId"],"properties":{"capabilityId":{"type":"string"}},"additionalProperties":false}`),
 	}
+	if s.owner != nil && s.owner.plugins != nil && s.owner.plugins.IsContextCompactorEnabled() {
+		result = append(result, contextCompactionTool())
+	}
 	if !s.evaluation {
 		result = append(result, fragmentTools()...)
 	}
@@ -96,6 +158,11 @@ func (s *turnScope) definitions() []provider.ToolDefinition {
 	}
 	for _, item := range s.loadedCreate {
 		result = append(result, item)
+	}
+	if s.owner != nil && s.owner.plugins != nil {
+		for _, at := range s.owner.plugins.ActiveTools() {
+			result = append(result, at)
+		}
 	}
 	for name, manifest := range s.loadedCapsules {
 		definition := provider.ToolDefinition{Type: "function"}
@@ -110,6 +177,18 @@ func (s *turnScope) definitions() []provider.ToolDefinition {
 
 func (s *turnScope) execute(ctx context.Context, name string, arguments json.RawMessage) json.RawMessage {
 	switch name {
+	case "axiom_compact_context":
+		var input struct {
+			Focus string `json:"focus"`
+		}
+		_ = json.Unmarshal(arguments, &input)
+		s.forceCompact = true
+		return toolOK(map[string]any{
+			"ok":               true,
+			"compactionQueued": true,
+			"focusPreserved":   input.Focus,
+			"message":          "下一次模型调用前会压缩较早的工具输出。该过程有损，但会保留近期完整步骤与当前请求。",
+		})
 	case "axiom_capability_search":
 		var input struct {
 			Query string `json:"query"`
@@ -139,10 +218,41 @@ func (s *turnScope) execute(ctx context.Context, name string, arguments json.Raw
 		return s.dropFragment(arguments)
 	case "axiom_capsule_save":
 		return s.saveCapsule(arguments)
-	case "axiom_capsule_promote":
-		return s.promoteCapsule(arguments)
-	case "axiom_promotion_status":
-		return s.promotionStatus(arguments)
+	}
+	if ct, ok := s.coreTools[name]; ok && s.owner != nil && s.owner.plugins != nil && s.owner.plugins.IsCoreToolEnabled(name) {
+		res, err := ct.Handler(ctx, arguments)
+		if err != nil {
+			return toolError(err.Error())
+		}
+		var value any
+		if raw, ok := res.(json.RawMessage); ok && json.Unmarshal(raw, &value) == nil {
+			return toolOK(value)
+		}
+		return toolOK(res)
+	}
+	if s.owner != nil && s.owner.plugins != nil {
+		res, handled, err := s.owner.plugins.ExecuteTool(ctx, name, arguments)
+		if handled {
+			if err != nil {
+				return toolError(err.Error())
+			}
+			var value any
+			if raw, ok := res.(json.RawMessage); ok && json.Unmarshal(raw, &value) == nil {
+				return toolOK(value)
+			}
+			return toolOK(res)
+		}
+	}
+	if ct, ok := s.coreTools[name]; ok {
+		res, err := ct.Handler(ctx, arguments)
+		if err != nil {
+			return toolError(err.Error())
+		}
+		var value any
+		if raw, ok := res.(json.RawMessage); ok && json.Unmarshal(raw, &value) == nil {
+			return toolOK(value)
+		}
+		return toolOK(res)
 	}
 	if manifest, ok := s.loadedCapsules[name]; ok {
 		output, _, err := s.owner.capsules.Invoke(ctx, manifest.ID, arguments)
@@ -240,7 +350,7 @@ func (s *turnScope) load(id string) (any, error) {
 	}
 	if definition, ok := s.creator[id]; ok {
 		s.loadedCreate[id] = definition
-		return map[string]any{"id": id, "kind": "creator-action", "functionName": id, "inputSchema": definition.Function.Parameters, "approvalBoundary": "The Agent may prepare releases; only the user can approve grants."}, nil
+		return map[string]any{"id": id, "kind": "creator-action", "functionName": id, "inputSchema": definition.Function.Parameters, "lifecycleBoundary": "Installing a tested release grants its declared permissions and activates it."}, nil
 	}
 	if s.owner != nil && s.owner.capsules != nil {
 		manifest, err := s.owner.capsules.Get(id)
@@ -373,7 +483,7 @@ func (s *turnScope) promoteCapsule(arguments json.RawMessage) json.RawMessage {
 	if err != nil {
 		return toolError(err.Error())
 	}
-	return toolOK(map[string]any{"job": job, "approvalBoundary": "The pipeline may verify and build a release, but only the user can approve and install it."})
+	return toolOK(map[string]any{"job": job, "lifecycleBoundary": "The pipeline verifies and builds a release; installation grants declared permissions and activates it."})
 }
 
 func (s *turnScope) promotionStatus(arguments json.RawMessage) json.RawMessage {
@@ -406,8 +516,6 @@ func fragmentTools() []provider.ToolDefinition {
 		tool("axiom_fragment_invoke", "Invoke one previously created fragment by opaque handle. Do not recreate a fragment when the same handle still applies.", `{"type":"object","required":["fragmentId","input"],"properties":{"fragmentId":{"type":"string"},"input":{"type":"object"}},"additionalProperties":false}`),
 		tool("axiom_fragment_drop", "Drop an ephemeral capability that is no longer useful.", `{"type":"object","required":["fragmentId"],"properties":{"fragmentId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_capsule_save", "Promote a successfully executed conversation fragment into an immutable workspace capsule with its real execution evidence. This does not install a global plugin.", `{"type":"object","required":["fragmentId"],"properties":{"fragmentId":{"type":"string"},"intent":{"type":"string"},"fallback":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_capsule_promote", "Queue a verified workspace Capsule for background promotion into a compiled reference plugin. The pipeline stops at the user approval boundary and never installs automatically.", `{"type":"object","required":["capsuleId"],"properties":{"capsuleId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_promotion_status", "Inspect background Capsule promotion jobs without waiting for them. Use the returned Forge project only after the job reaches user approval.", `{"type":"object","properties":{"jobId":{"type":"string"}},"additionalProperties":false}`),
 	}
 }
 
@@ -463,6 +571,10 @@ func toolOK(value any) json.RawMessage {
 	return raw
 }
 
+func contextCompactionTool() provider.ToolDefinition {
+	return tool("axiom_compact_context", "Compact older in-turn tool traces before the next model request. Use it after a tool-heavy milestone or when logs become noisy. Compaction is lossy: recent complete steps and the current request are retained, but omitted detail is not guaranteed.", `{"type":"object","properties":{"focus":{"type":"string","description":"Short reminder of the active goal or facts that must remain prominent"}},"additionalProperties":false}`)
+}
+
 func creatorTools() map[string]provider.ToolDefinition {
 	items := []provider.ToolDefinition{
 		tool("axiom_plugin_projects", "List Plugin Forge projects and lifecycle state.", `{"type":"object","properties":{},"additionalProperties":false}`),
@@ -475,9 +587,8 @@ func creatorTools() map[string]provider.ToolDefinition {
 		tool("axiom_plugin_apply_patch", "Apply a revision-checked Git patch to allowed plugin text sources. Deletion, rename, binary, mode, and out-of-contract changes are rejected.", `{"type":"object","required":["projectId","expectedRevision","patch"],"properties":{"projectId":{"type":"string"},"expectedRevision":{"type":"string"},"patch":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_begin_revision", "Begin an update while the active release keeps serving pinned turns.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_build", "Build and verify declared plugin surfaces into an immutable release.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_request_approval", "Move a tested release to user permission review; this never grants approval.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_install", "Activate only an already user-approved immutable plugin release.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_rollback", "Atomically roll an active plugin back to an approved release.", `{"type":"object","required":["projectId","releaseId"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_install", "Install a tested immutable plugin release. Installation grants the release's declared permissions and activates its runtime surfaces.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_rollback", "Atomically roll an active plugin back to a previously installed immutable release.", `{"type":"object","required":["projectId","releaseId"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"}},"additionalProperties":false}`),
 	}
 	result := map[string]provider.ToolDefinition{}
 	for _, item := range items {

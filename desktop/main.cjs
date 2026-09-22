@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, net, protocol, session } = require('electron');
+const { app, BrowserWindow, dialog, net, protocol, session, ipcMain, clipboard } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -11,6 +11,19 @@ protocol.registerSchemesAsPrivileged([
 
 const development = !app.isPackaged;
 const repositoryRoot = path.resolve(__dirname, '..');
+app.name = 'O';
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-software-rasterizer');
+app.commandLine.appendSwitch('in-process-gpu');
+
+// Ensure userData is in a guaranteed writable path (avoid Windows AppData permission / lock issues)
+const localUserData = path.join(repositoryRoot, 'data', 'electron-userdata');
+try {
+  fs.mkdirSync(localUserData, { recursive: true });
+  app.setPath('userData', localUserData);
+} catch {}
+
 let mainWindow;
 let backendProcess;
 let uiProcess;
@@ -101,11 +114,16 @@ async function developmentBackend() {
   const executable = path.join(runtimeDir, 'o-host.exe');
   fs.mkdirSync(runtimeDir, { recursive: true });
   const configuredGo = process.env.O_GO_EXE;
-  const localGo = 'D:\\DevTools\\go\\bin\\go.exe';
+  const localGo = 'D:\\agent-harness\\work\\toolchains\\go\\bin\\go.exe';
   const go = configuredGo || (fs.existsSync(localGo) ? localGo : 'go');
   await runProcess(go, ['build', '-trimpath', '-o', executable, './cmd/axiom'], {
     cwd: path.join(repositoryRoot, 'backend'),
-    env: process.env,
+    env: {
+      ...process.env,
+      CGO_ENABLED: '0',
+      GOCACHE: path.join(repositoryRoot, '.gocache'),
+      GOPATH: path.join(repositoryRoot, '.gopath'),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   return executable;
@@ -207,8 +225,39 @@ async function stopChildren() {
 app.whenReady().then(async () => {
   try {
     app.setAppUserModelId('local.o.agent');
-    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
-    session.defaultSession.setPermissionCheckHandler(() => false);
+    ipcMain.handle('o-clipboard-write', (_event, text) => {
+      if (typeof text === 'string') {
+        clipboard.writeText(text);
+        return true;
+      }
+      return false;
+    });
+    ipcMain.handle('o-select-directory', async (_event, options) => {
+      if (!mainWindow) return null;
+      const defaultPath = typeof options?.defaultPath === 'string' ? options.defaultPath : undefined;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: options?.title || '选择项目工作区目录',
+        defaultPath,
+        properties: ['openDirectory', 'createDirectory'],
+      });
+      if (result.canceled || !result.filePaths || result.filePaths.length === 0) {
+        return null;
+      }
+      return result.filePaths[0];
+    });
+    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+      if (permission === 'clipboard-sanitized-write' || permission === 'clipboard-read') {
+        callback(true);
+        return;
+      }
+      callback(false);
+    });
+    session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
+      if (permission === 'clipboard-sanitized-write' || permission === 'clipboard-read') {
+        return true;
+      }
+      return false;
+    });
     const windowURL = development ? await startDevelopmentUI() : 'oapp://app/index.html';
     if (!development) installLocalProtocol();
     await startBackend(development ? new URL(windowURL).origin : 'oapp://app');

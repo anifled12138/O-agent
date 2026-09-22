@@ -42,12 +42,33 @@ func TestContextWindowKeepsNewestMessages(t *testing.T) {
 		detail.Messages = append(detail.Messages, domain.Message{Role: "user", Content: strings.Repeat(string(rune('a'+index)), 7000)})
 	}
 	generation := domain.AgentGeneration{ID: "gen_test", DefinitionDigest: "sha256:test", Definition: domain.AgentDefinition{Spec: domain.AgentSpec{Strategy: "react.v1", SystemPrompt: "test system"}}}
-	messages, omitted := buildContext(detail, generation)
+	messages, omitted := buildContext(detail, generation, "", 16000)
 	if omitted == 0 {
 		t.Fatal("expected older context to be omitted")
 	}
 	if !strings.Contains(messages[len(messages)-1].Content, strings.Repeat("j", 100)) {
 		t.Fatal("newest message was not retained")
+	}
+}
+
+func TestCompactedMemoryIsBoundedAndValidUTF8(t *testing.T) {
+	messages := make([]domain.Message, 0, 30)
+	for i := 0; i < 30; i++ {
+		role := "assistant"
+		if i%2 == 0 {
+			role = "user"
+		}
+		messages = append(messages, domain.Message{Role: role, Content: strings.Repeat("中文目标与验证结果", 200)})
+	}
+	memory := compactMessages(messages, 512)
+	if !strings.Contains(memory, "User Request") || !strings.Contains(memory, "有损摘要") {
+		t.Fatalf("compacted memory lost its provenance markers: %q", memory)
+	}
+	if strings.Contains(memory, "�") {
+		t.Fatalf("compacted memory contains invalid UTF-8 replacement characters: %q", memory)
+	}
+	if runes := len([]rune(memory)); runes > 540 {
+		t.Fatalf("compacted memory exceeded its bounded envelope: %d runes", runes)
 	}
 }
 

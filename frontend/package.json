@@ -11,12 +11,23 @@
     "build": "vinext build",
     "build:desktop-ui": "vite build --config vite.desktop.config.ts",
     "start": "vinext start",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-desktop --ignore-pattern .next"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-desktop --ignore-pattern .next",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@types/dompurify": "^3.2.0",
+    "@types/markdown-it": "^14.2.0",
+    "dompurify": "^3.4.15",
+    "highlight.js": "^11.12.0",
+    "lucide-react": "^1.46.0",
+    "markdown-it": "^15.0.2",
+    "marked": "^18.0.13",
     "next": "^16.3.3",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.54.2",

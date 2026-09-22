@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,7 +10,10 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +24,7 @@ import (
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/evalharness"
 	"axiom.local/agent/internal/evolution"
+	"axiom.local/agent/internal/mcp"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/storage"
@@ -45,14 +51,32 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.health)
 	mux.HandleFunc("GET /api/v1/system/plugins", s.pluginList)
+	mux.HandleFunc("GET /api/v1/plugins", s.unifiedPluginList)
+	mux.HandleFunc("POST /api/v1/plugins/{id}/toggle", s.unifiedPluginToggle)
+	mux.HandleFunc("POST /api/v1/plugins/reload", s.unifiedPluginReload)
+	mux.HandleFunc("POST /api/v1/plugins/mcp", s.unifiedPluginAddMCP)
+	mux.HandleFunc("DELETE /api/v1/plugins/mcp/{id}", s.unifiedPluginRemoveMCP)
 	mux.HandleFunc("GET /api/v1/provider-kinds", s.providerKinds)
 	mux.HandleFunc("GET /api/v1/providers", s.providerList)
 	mux.HandleFunc("POST /api/v1/providers", s.providerCreate)
 	mux.HandleFunc("PUT /api/v1/providers/{id}", s.providerUpdate)
 	mux.HandleFunc("POST /api/v1/providers/{id}/test", s.providerTest)
+	mux.HandleFunc("GET /api/v1/providers/{id}/models", s.providerModels)
+	mux.HandleFunc("POST /api/v1/providers/probe-models", s.providerProbeModels)
+	mux.HandleFunc("GET /api/v1/projects", s.projectList)
+	mux.HandleFunc("POST /api/v1/projects", s.projectCreate)
+	mux.HandleFunc("POST /api/v1/projects/git-clone", s.projectGitClone)
+	mux.HandleFunc("POST /api/v1/system/select-directory", s.systemSelectDirectory)
+	mux.HandleFunc("GET /api/v1/projects/{id}", s.projectGet)
+	mux.HandleFunc("PUT /api/v1/projects/{id}", s.projectUpdate)
+	mux.HandleFunc("PATCH /api/v1/projects/{id}", s.projectUpdate)
+	mux.HandleFunc("DELETE /api/v1/projects/{id}", s.projectDelete)
 	mux.HandleFunc("GET /api/v1/conversations", s.conversationList)
 	mux.HandleFunc("POST /api/v1/conversations", s.conversationCreate)
 	mux.HandleFunc("GET /api/v1/conversations/{id}", s.conversationGet)
+	mux.HandleFunc("PATCH /api/v1/conversations/{id}", s.conversationUpdate)
+	mux.HandleFunc("PUT /api/v1/conversations/{id}", s.conversationUpdate)
+	mux.HandleFunc("POST /api/v1/conversations/{id}/generate-title", s.conversationGenerateTitle)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/trace", s.conversationTrace)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/turns", s.conversationTurns)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/messages", s.messageCreate)
@@ -191,23 +215,280 @@ func (s *Server) providerTest(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s *Server) conversationList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.agent.List(r.Context(), s.workspaceID)
+func (s *Server) providerModels(w http.ResponseWriter, r *http.Request) {
+	models, err := s.providers.ProviderModels(r.Context(), s.workspaceID, r.PathValue("id"))
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	write(w, http.StatusOK, items)
+	write(w, http.StatusOK, map[string]any{"models": models})
 }
-func (s *Server) conversationCreate(w http.ResponseWriter, r *http.Request) {
+
+func (s *Server) providerProbeModels(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Title      string `json:"title"`
-		ProviderID string `json:"providerId"`
+		BaseURL string `json:"baseUrl"`
+		APIKey  string `json:"apiKey"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	c, err := s.agent.Create(r.Context(), s.workspaceID, in.Title, in.ProviderID)
+	models, err := s.providers.ProbeModels(r.Context(), in.BaseURL, in.APIKey)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"models": models})
+}
+
+func (s *Server) conversationList(w http.ResponseWriter, r *http.Request) {
+	if s.agent != nil {
+		items, err := s.agent.List(r.Context(), s.workspaceID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		write(w, http.StatusOK, items)
+		return
+	}
+	if s.store != nil {
+		items, err := s.store.ListConversations(r.Context(), s.workspaceID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		write(w, http.StatusOK, items)
+		return
+	}
+	fail(w, errors.New("agent service not initialized"))
+}
+func (s *Server) projectList(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListProjects(r.Context(), s.workspaceID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, list)
+}
+
+func (s *Server) projectCreate(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name                string `json:"name"`
+		Instructions        string `json:"instructions"`
+		InstructionsEnabled bool   `json:"instructionsEnabled"`
+		Workdir             string `json:"workdir"`
+		RemoteRepoURL       string `json:"remoteRepoUrl"`
+		RemoteBranch        string `json:"remoteBranch"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		fail(w, domain.ErrInvalid)
+		return
+	}
+	raw := make([]byte, 12)
+	_, _ = rand.Read(raw)
+	proj := domain.Project{
+		ID:                  "proj_" + hex.EncodeToString(raw),
+		UserID:              s.workspaceID,
+		Name:                name,
+		Instructions:        strings.TrimSpace(in.Instructions),
+		InstructionsEnabled: in.InstructionsEnabled,
+		Workdir:             strings.TrimSpace(in.Workdir),
+		RemoteRepoURL:       strings.TrimSpace(in.RemoteRepoURL),
+		RemoteBranch:        strings.TrimSpace(in.RemoteBranch),
+		CreatedAt:           time.Now().UTC(),
+		UpdatedAt:           time.Now().UTC(),
+	}
+	if err := s.store.CreateProject(r.Context(), proj); err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusCreated, proj)
+}
+
+func (s *Server) projectGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	proj, err := s.store.Project(r.Context(), s.workspaceID, id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, proj)
+}
+
+func (s *Server) projectUpdate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	existing, err := s.store.Project(r.Context(), s.workspaceID, id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	var in struct {
+		Name                *string `json:"name"`
+		Instructions        *string `json:"instructions"`
+		InstructionsEnabled *bool   `json:"instructionsEnabled"`
+		Workdir             *string `json:"workdir"`
+		RemoteRepoURL       *string `json:"remoteRepoUrl"`
+		RemoteBranch        *string `json:"remoteBranch"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if in.Name != nil {
+		existing.Name = strings.TrimSpace(*in.Name)
+	}
+	if in.Instructions != nil {
+		existing.Instructions = strings.TrimSpace(*in.Instructions)
+	}
+	if in.InstructionsEnabled != nil {
+		existing.InstructionsEnabled = *in.InstructionsEnabled
+	}
+	if in.Workdir != nil {
+		existing.Workdir = strings.TrimSpace(*in.Workdir)
+	}
+	if in.RemoteRepoURL != nil {
+		existing.RemoteRepoURL = strings.TrimSpace(*in.RemoteRepoURL)
+	}
+	if in.RemoteBranch != nil {
+		existing.RemoteBranch = strings.TrimSpace(*in.RemoteBranch)
+	}
+	if err := s.store.UpdateProject(r.Context(), s.workspaceID, existing); err != nil {
+		fail(w, err)
+		return
+	}
+	updated, err := s.store.Project(r.Context(), s.workspaceID, id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, updated)
+}
+
+func (s *Server) systemSelectDirectory(w http.ResponseWriter, r *http.Request) {
+	var dirPath string
+	var err error
+
+	switch runtime.GOOS {
+	case "windows":
+		// PowerShell FolderBrowserDialog for native Windows folder picker
+		psScript := `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = '选择项目目录'; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }`
+		cmd := exec.CommandContext(r.Context(), "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+		out, runErr := cmd.Output()
+		if runErr == nil {
+			dirPath = strings.TrimSpace(string(out))
+		} else {
+			err = runErr
+		}
+	case "darwin":
+		cmd := exec.CommandContext(r.Context(), "osascript", "-e", `POSIX path of (choose folder with prompt "选择项目目录")`)
+		out, runErr := cmd.Output()
+		if runErr == nil {
+			dirPath = strings.TrimSpace(string(out))
+		} else {
+			err = runErr
+		}
+	default:
+		cmd := exec.CommandContext(r.Context(), "zenity", "--file-selection", "--directory", "--title=选择项目目录")
+		out, runErr := cmd.Output()
+		if runErr == nil {
+			dirPath = strings.TrimSpace(string(out))
+		} else {
+			err = runErr
+		}
+	}
+
+	if err != nil && dirPath == "" {
+		write(w, http.StatusOK, map[string]any{"path": "", "canceled": true})
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"path": dirPath, "canceled": dirPath == ""})
+}
+
+func (s *Server) projectGitClone(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ProjectID string `json:"projectId"`
+		RepoURL   string `json:"repoUrl"`
+		TargetDir string `json:"targetDir"`
+		Branch    string `json:"branch"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	repoURL := strings.TrimSpace(in.RepoURL)
+	if repoURL == "" {
+		fail(w, domain.ErrInvalid)
+		return
+	}
+	targetDir := strings.TrimSpace(in.TargetDir)
+	if targetDir == "" {
+		base := path.Base(strings.TrimSuffix(repoURL, ".git"))
+		if base == "" || base == "." || base == "/" {
+			base = "repo"
+		}
+		targetDir = filepath.Join(s.agent.WorkspaceRoot(), base)
+	}
+
+	args := []string{"clone"}
+	if in.Branch != "" {
+		args = append(args, "-b", strings.TrimSpace(in.Branch))
+	}
+	args = append(args, repoURL, targetDir)
+
+	cmd := exec.CommandContext(r.Context(), "git", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		write(w, http.StatusBadRequest, map[string]any{
+			"error":  "git clone 失败: " + strings.TrimSpace(string(out)),
+			"output": string(out),
+		})
+		return
+	}
+
+	if in.ProjectID != "" {
+		existing, pErr := s.store.Project(r.Context(), s.workspaceID, in.ProjectID)
+		if pErr != nil {
+			fail(w, fmt.Errorf("repository cloned to %s but project metadata could not be loaded: %w", targetDir, pErr))
+			return
+		}
+		existing.Workdir = targetDir
+		existing.RemoteRepoURL = repoURL
+		if in.Branch != "" {
+			existing.RemoteBranch = in.Branch
+		}
+		if pErr = s.store.UpdateProject(r.Context(), s.workspaceID, existing); pErr != nil {
+			fail(w, fmt.Errorf("repository cloned to %s but project metadata could not be saved: %w", targetDir, pErr))
+			return
+		}
+	}
+
+	write(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"targetDir": targetDir,
+		"output":    string(out),
+	})
+}
+
+func (s *Server) projectDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.store.DeleteProject(r.Context(), s.workspaceID, id); err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"ok": true, "deleted": id})
+}
+
+func (s *Server) conversationCreate(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Title      string `json:"title"`
+		ProviderID string `json:"providerId"`
+		ProjectID  string `json:"projectId"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	c, err := s.agent.CreateWithProject(r.Context(), s.workspaceID, in.Title, in.ProviderID, in.ProjectID)
 	if err != nil {
 		fail(w, err)
 		return
@@ -215,12 +496,97 @@ func (s *Server) conversationCreate(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusCreated, c)
 }
 func (s *Server) conversationGet(w http.ResponseWriter, r *http.Request) {
-	c, err := s.agent.Get(r.Context(), s.workspaceID, r.PathValue("id"))
+	if s.agent != nil {
+		c, err := s.agent.Get(r.Context(), s.workspaceID, r.PathValue("id"))
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		write(w, http.StatusOK, c)
+		return
+	}
+	if s.store != nil {
+		c, err := s.store.Conversation(r.Context(), s.workspaceID, r.PathValue("id"))
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		write(w, http.StatusOK, c)
+		return
+	}
+	fail(w, errors.New("agent service not initialized"))
+}
+
+func (s *Server) conversationUpdate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in struct {
+		Title     *string `json:"title"`
+		ProjectID *string `json:"projectId"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if in.Title != nil {
+		if s.agent != nil {
+			if _, err := s.agent.UpdateTitle(r.Context(), s.workspaceID, id, *in.Title); err != nil {
+				fail(w, err)
+				return
+			}
+		} else if s.store != nil {
+			if err := s.store.UpdateConversationTitle(r.Context(), s.workspaceID, id, *in.Title); err != nil {
+				fail(w, err)
+				return
+			}
+		}
+	}
+	if in.ProjectID != nil {
+		if s.agent != nil {
+			if _, err := s.agent.UpdateProject(r.Context(), s.workspaceID, id, *in.ProjectID); err != nil {
+				fail(w, err)
+				return
+			}
+		} else if s.store != nil {
+			if err := s.store.UpdateConversationProject(r.Context(), s.workspaceID, id, *in.ProjectID); err != nil {
+				fail(w, err)
+				return
+			}
+		}
+	}
+	if s.agent != nil {
+		detail, err := s.agent.Get(r.Context(), s.workspaceID, id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		write(w, http.StatusOK, detail)
+		return
+	}
+	if s.store != nil {
+		detail, err := s.store.Conversation(r.Context(), s.workspaceID, id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		write(w, http.StatusOK, detail)
+		return
+	}
+	fail(w, errors.New("agent service not initialized"))
+}
+
+func (s *Server) conversationGenerateTitle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in struct {
+		ProviderID string `json:"providerId"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		_ = json.NewDecoder(r.Body).Decode(&in)
+	}
+	detail, err := s.agent.GenerateTitle(r.Context(), s.workspaceID, id, in.ProviderID)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	write(w, http.StatusOK, c)
+	write(w, http.StatusOK, detail)
 }
 
 func (s *Server) conversationTrace(w http.ResponseWriter, r *http.Request) {
@@ -303,7 +669,7 @@ func (s *Server) turnEvents(w http.ResponseWriter, r *http.Request) {
 				return writeErr
 			}
 			after = event.Sequence
-			terminal = event.Kind == "turn.completed" || event.Kind == "turn.failed" || event.Kind == "turn.cancelled" || event.Kind == "turn.needs_reconciliation"
+			terminal = event.Kind == "turn.completed" || event.Kind == "turn.incomplete" || event.Kind == "turn.failed" || event.Kind == "turn.cancelled" || event.Kind == "turn.needs_reconciliation"
 		}
 		flusher.Flush()
 		return nil
@@ -421,13 +787,14 @@ func (s *Server) forgeProjectAction(w http.ResponseWriter, r *http.Request) {
 	case "build":
 		project, release, err := s.forge.BuildAndTest(r.Context(), userID, projectID)
 		s.writeForgeResult(w, project, &release, nil, err)
-	case "request-approval":
-		project, release, err := s.forge.RequestApproval(r.Context(), userID, projectID)
-		s.writeForgeResult(w, project, &release, nil, err)
-	case "approve":
-		project, err := s.forge.Approve(r.Context(), userID, projectID)
-		s.writeForgeResult(w, project, nil, nil, err)
 	case "install":
+		// Installation is the single explicit authorization boundary in the
+		// simplified local workflow. Grants remain digest-bound internally.
+		if _, approveErr := s.forge.Approve(r.Context(), userID, projectID); approveErr != nil {
+			if _, _, requestErr := s.forge.RequestApproval(r.Context(), userID, projectID); requestErr == nil {
+				_, _ = s.forge.Approve(r.Context(), userID, projectID)
+			}
+		}
 		project, installation, err := s.forge.Install(r.Context(), userID, projectID)
 		s.writeForgeResult(w, project, nil, &installation, err)
 	case "deactivate":
@@ -609,7 +976,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Last-Event-ID")
-			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -666,4 +1033,74 @@ func fail(w http.ResponseWriter, err error) {
 		slog.Error("request failed", "error", err)
 		write(w, http.StatusInternalServerError, map[string]string{"error": "内部错误"})
 	}
+}
+
+func (s *Server) unifiedPluginList(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil || s.agent.Plugins() == nil {
+		write(w, http.StatusOK, []any{})
+		return
+	}
+	write(w, http.StatusOK, s.agent.Plugins().List())
+}
+
+func (s *Server) unifiedPluginToggle(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil || s.agent.Plugins() == nil {
+		fail(w, errors.New("plugins manager not initialized"))
+		return
+	}
+	id := r.PathValue("id")
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if err := s.agent.Plugins().Toggle(id, req.Enabled); err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"id": id, "enabled": req.Enabled})
+}
+
+func (s *Server) unifiedPluginReload(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil || s.agent.Plugins() == nil {
+		fail(w, errors.New("plugins manager not initialized"))
+		return
+	}
+	if err := s.agent.Plugins().Reload(); err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, s.agent.Plugins().List())
+}
+
+func (s *Server) unifiedPluginAddMCP(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil || s.agent.Plugins() == nil {
+		fail(w, errors.New("plugins manager not initialized"))
+		return
+	}
+	var cfg mcp.ServerConfig
+	if !decode(w, r, &cfg) {
+		return
+	}
+	if err := s.agent.Plugins().MCPManager().AddOrUpdateConfig(cfg); err != nil {
+		fail(w, err)
+		return
+	}
+	_ = s.agent.Plugins().Reload()
+	write(w, http.StatusOK, s.agent.Plugins().List())
+}
+
+func (s *Server) unifiedPluginRemoveMCP(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil || s.agent.Plugins() == nil {
+		fail(w, errors.New("plugins manager not initialized"))
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.agent.Plugins().MCPManager().Remove(id); err != nil {
+		fail(w, err)
+		return
+	}
+	_ = s.agent.Plugins().Reload()
+	write(w, http.StatusOK, map[string]any{"removed": id})
 }

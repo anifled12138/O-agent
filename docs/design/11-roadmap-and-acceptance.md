@@ -56,11 +56,11 @@
 ### M6 · Agent 自举 Plugin
 
 - PluginSpec、独立 Git workspace、生成、构建、conformance；
-- 权限/Surface diff、用户 Grant、Canary、activate；
+- 权限/Surface diff、安装时 Grant、Canary、activate；
 - Skill/MCP/UI/backend/Tool 组合模板。
 
-验收：用户只描述能力，Agent 能准备可安装 Release；新增权限必须由用户批准，失败
-Release 不影响当前版本。
+验收：用户只描述能力，Agent 能准备可安装 Release；“安装并启用”明确展示并授予
+当前 Release 的权限，失败 Release 不影响当前版本。
 
 ### M7 · Generation Harness
 

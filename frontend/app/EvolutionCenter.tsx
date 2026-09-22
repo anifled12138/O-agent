@@ -1,7 +1,7 @@
-'use client';
-
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { X } from 'lucide-react';
 import { request } from './api';
+import { useDialogA11y } from './useDialogA11y';
 
 type Provider = { id: string; name: string; model: string };
 
@@ -13,6 +13,7 @@ type EvalReport = { baseline: EvalSummary; candidate: EvalSummary; frontierWins:
 type Experiment = { id: string; challengeId: string; baselineGenerationId: string; candidateGenerationId: string; providerId: string; status: string; report?: EvalReport; lastError?: string; updatedAt: string };
 
 export default function EvolutionCenter({ providers, onClose }: { providers: Provider[]; onClose: () => void }) {
+  const dialogRef = useDialogA11y(onClose);
   const [generations, setGenerations] = useState<Generation[]>([]);
   const [challenges, setChallenges] = useState<Challenge[]>([]);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
@@ -60,58 +61,179 @@ export default function EvolutionCenter({ providers, onClose }: { providers: Pro
     finally { setBusy(''); }
   }
 
-  async function bootstrap() {
-    if (!selectedChallenge || !providerId) return;
+  async function bootstrapCandidate() {
+    if (!selectedChallenge) return;
     setBusy('bootstrap'); setError('');
-    try { await request(`/evolution/challenges/${selectedChallenge.id}/bootstrap`, { method: 'POST', body: JSON.stringify({ providerId, count: 2 }) }); await refresh(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '候选方案生成失败'); }
-    finally { setBusy(''); }
-  }
-
-  async function evaluate() {
-    if (!selectedChallenge || !selectedCandidate || !providerId || !prompt.trim()) return;
-    setBusy('evaluate'); setError('');
     try {
-      await request('/evolution/experiments', { method: 'POST', body: JSON.stringify({ challengeId: selectedChallenge.id, baselineGenerationId: selectedChallenge.baselineGenerationId, candidateGenerationId: selectedCandidate.id, providerId, repetitions: 1, cases: [{ id: 'frontier-001', name: '能力边界验收', prompt, evaluator: expected.trim() ? 'contains' : 'nonempty', expected }] }) });
+      const created = await request<Generation>(`/evolution/challenges/${selectedChallenge.id}/bootstrap`, { method: 'POST', body: JSON.stringify({ providerId }) });
+      await refresh(); setSelectedCandidateId(created.id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '候选生成失败'); }
+    finally { setBusy(''); }
+  }
+
+  async function evaluateCandidate() {
+    if (!selectedChallenge || !selectedCandidate) return;
+    setBusy('eval'); setError('');
+    try {
+      await request<Experiment>('/evolution/experiments', { method: 'POST', body: JSON.stringify({ challengeId: selectedChallenge.id, candidateGenerationId: selectedCandidate.id, providerId, prompt, expected }) });
       await refresh();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法启动评测'); }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '启动评测失败'); }
     finally { setBusy(''); }
   }
 
-  async function promote(experiment: Experiment) {
-    setBusy(`promote:${experiment.id}`); setError('');
-    try { await request(`/evolution/generations/${experiment.candidateGenerationId}/promote`, { method: 'POST', body: JSON.stringify({ experimentId: experiment.id }) }); await refresh(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '无法晋升候选方案'); }
+  async function promoteCandidate() {
+    if (!selectedCandidate) return;
+    setBusy('promote'); setError('');
+    try {
+      await request<Generation>(`/evolution/generations/${selectedCandidate.id}/promote`, { method: 'POST' });
+      await refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '晋升失败'); }
     finally { setBusy(''); }
   }
 
-  return <div className="modal-backdrop evolution-backdrop"><section className="evolution-modal">
-    <header className="evolution-header"><div><span className="eyebrow">受控自举</span><h2>演化实验室</h2><p>将已测量的能力缺口转化为候选 Agent。没有成对评测证据和你的确认，任何方案都不会成为稳定版本。</p></div><button onClick={onClose}>×</button></header>
-    {error && <div className="evolution-error">{error}</div>}
-    <div className="evolution-grid">
-      <aside className="evolution-rail">
-        <form className="evolution-form" onSubmit={createChallenge}><span className="eyebrow">01 / 定义能力边界</span><label>标题<input name="title" required placeholder="长程任务容易偏离目标" /></label><label>目标<textarea name="objective" required placeholder="希望提升哪项能力？" /></label><label>观察到的失败<textarea name="failureEvidence" placeholder="填写具体轨迹或行为" /></label><label>通过条件<textarea name="successCriteria" required placeholder="可观察、可验证的成功条件" /></label><button disabled={!!busy}>{busy === 'challenge' ? '正在保存…' : '创建能力边界'}</button></form>
-        <div className="challenge-list"><p>能力边界</p>{challenges.map((item) => <button key={item.id} className={item.id === selectedChallengeId ? 'active' : ''} onClick={() => { setSelectedChallengeId(item.id); setSelectedCandidateId(''); }}><i className={`status-${item.status}`}/><span><b>{item.title}</b><small>{statusLabel(item.status)}</small></span></button>)}{!challenges.length && <small>还没有已测量的能力边界。</small>}</div>
-      </aside>
-      <main className="evolution-stage">
-        {!selectedChallenge ? <div className="evolution-empty"><b>定义第一个能力边界</b><span>先记录真实限制，再修改 Agent Loop。</span></div> : <>
-          <section className="frontier-summary"><div><span className="eyebrow">当前能力边界</span><h3>{selectedChallenge.title}</h3><p>{selectedChallenge.objective}</p></div><span className={`challenge-state status-${selectedChallenge.status}`}>{statusLabel(selectedChallenge.status)}</span></section>
-          <section className="evolution-flow"><div className="done"><span>1</span><b>界定</b><small>测量缺口</small></div><div className={candidates.length ? 'done' : ''}><span>2</span><b>生成</b><small>不可变候选</small></div><div className={relevantExperiments.length ? 'done' : ''}><span>3</span><b>评测</b><small>成对 A/B</small></div><div className={baseline?.status === 'superseded' ? 'done' : ''}><span>4</span><b>晋升</b><small>用户确认</small></div></section>
-          <section className="candidate-workbench"><div className="workbench-title"><div><span className="eyebrow">02 / 候选方案</span><h4>{baseline ? `基线 G${baseline.number} · ${baseline.definition.spec.strategy}` : '正在加载基线'}</h4></div><div className="bootstrap-actions"><select value={providerId} onChange={(event) => setProviderId(event.target.value)}><option value="">选择模型服务</option>{providers.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model}</option>)}</select><button onClick={bootstrap} disabled={!!busy || !providerId}>{busy === 'bootstrap' ? '正在生成…' : '让 Agent 生成'}</button></div></div>
-            <div className="candidate-cards">{candidates.map((item) => <button key={item.id} className={item.id === selectedCandidate?.id ? 'active' : ''} onClick={() => setSelectedCandidateId(item.id)}><span>G{item.number}</span><div><b>{item.definition.name}</b><small>{item.definition.description}</small></div><em>{item.definition.spec.strategy}<br/>{item.definition.spec.maxSteps} 步</em></button>)}{!candidates.length && <div className="candidate-empty">模型可以对提示词、Loop 策略或步数预算提出受控修改；生成后的方案默认不启用。</div>}</div>
-          </section>
-          {selectedCandidate && <section className="eval-workbench"><div><span className="eyebrow">03 / 成对评测</span><h4>基线 G{baseline?.number} 对比候选 G{selectedCandidate.number}</h4></div><div className="eval-inputs"><label>测试提示词<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label><label>期望包含的文本<input value={expected} onChange={(event) => setExpected(event.target.value)} placeholder="留空表示只要求非空回答" /></label><button onClick={evaluate} disabled={!!busy || !providerId}>{busy === 'evaluate' ? '正在启动…' : '运行 A/B'}</button></div></section>}
-          <section className="experiment-list"><span className="eyebrow">证据记录</span>{relevantExperiments.map((item) => <article key={item.id}><div className="experiment-head"><b>{item.status === 'completed' ? recommendationLabel(item.report?.recommendation) : statusLabel(item.status)}</b><span>{item.id.slice(-8)}</span></div>{item.report ? <><div className="score-grid"><div><small>基线</small><strong>{Math.round(item.report.baseline.successRate * 100)}%</strong><em>{Math.round(item.report.baseline.averageTokens)} token</em></div><div><small>候选</small><strong>{Math.round(item.report.candidate.successRate * 100)}%</strong><em>{Math.round(item.report.candidate.averageTokens)} token</em></div><div><small>成对差异</small><strong>+{item.report.frontierWins} / -{item.report.regressions}</strong><em>胜出 / 回退</em></div></div><p>{item.report.recommendationCause}</p>{item.report.recommendation === 'promote' && <button className="promote-button" disabled={!!busy} onClick={() => promote(item)}>{busy === `promote:${item.id}` ? '正在晋升…' : '将候选方案晋升为稳定版本'}</button>}</> : <div className="experiment-running"><i/><span>{item.lastError || '正在受限评测环境中运行测试…'}</span></div>}</article>)}{!relevantExperiments.length && <div className="ledger-empty">还没有评测证据。</div>}</section>
-        </>}
-      </main>
+  return (
+    <div className="modal-backdrop evolution-backdrop" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <section ref={dialogRef} className="evolution-modal" role="dialog" aria-modal="true" aria-labelledby="evolution-dialog-title" tabIndex={-1}>
+        <header className="evolution-header">
+          <div>
+            <span className="eyebrow">受控自举</span>
+            <h2 id="evolution-dialog-title">演化实验室</h2>
+            <p>将已测量的能力缺口转化为候选 Agent。没有成对评测证据和你的确认，任何方案都不会成为稳定版本。</p>
+          </div>
+          <button type="button" onClick={onClose} aria-label="关闭演化实验室" className="icon-button">
+            <X size={18} strokeWidth={2} aria-hidden="true" />
+          </button>
+        </header>
+        {error && <div className="evolution-error" role="alert">{error}</div>}
+        <div className="evolution-grid">
+          <aside className="evolution-rail">
+            <form onSubmit={createChallenge} className="evolution-form">
+              <span className="eyebrow">定义新边界</span>
+              <label>挑战标题<input name="title" placeholder="复杂工具递归恢复" required /></label>
+              <label>目标能力<textarea name="objective" placeholder="要求 Agent 能够定位深层错误并执行安全修复…" required /></label>
+              <label>失败证据<textarea name="failureEvidence" placeholder="在 turn_xxx 中，出现未知工具错误并停止…" /></label>
+              <label>成功标准<input name="successCriteria" placeholder="产生验证通过的补丁并通过构建测试" required /></label>
+              <button type="submit" disabled={busy === 'challenge'}>{busy === 'challenge' ? '正在提交…' : '创建能力边界'}</button>
+            </form>
+            <div className="challenge-list">
+              <p>能力边界 ({challenges.length})</p>
+              {challenges.length === 0 ? <small>暂无挑战，请在上方创建。</small> : challenges.map((item) => (
+                <button type="button" key={item.id} className={item.id === selectedChallengeId ? 'active' : ''} onClick={() => setSelectedChallengeId(item.id)}>
+                  <i className={`status-${item.status}`} />
+                  <span><b>{item.title}</b><small>{item.status}</small></span>
+                </button>
+              ))}
+            </div>
+          </aside>
+
+          <div className="evolution-stage">
+            {selectedChallenge ? (
+              <>
+                <div className="frontier-summary">
+                  <div>
+                    <span className="eyebrow">挑战详情</span>
+                    <h3>{selectedChallenge.title}</h3>
+                    <p>{selectedChallenge.objective}</p>
+                  </div>
+                  <span className={`challenge-state status-${selectedChallenge.status}`}>{selectedChallenge.status}</span>
+                </div>
+
+                <div className="evolution-flow">
+                  <div className="done"><span>1</span><div><b>测量缺口</b><small>基准 #{baseline?.number ?? 1}</small></div></div>
+                  <div className={selectedCandidate ? 'done' : ''}><span>2</span><div><b>生成候选</b><small>{selectedCandidate ? `#${selectedCandidate.number}` : '待生成'}</small></div></div>
+                  <div className={relevantExperiments.some((e) => e.status === 'completed') ? 'done' : ''}><span>3</span><div><b>成对评测</b><small>{relevantExperiments.length} 轮</small></div></div>
+                  <div className={selectedChallenge.status === 'solved' ? 'done' : ''}><span>4</span><div><b>人工批准</b><small>安全晋升</small></div></div>
+                </div>
+
+                <section className="candidate-workbench">
+                  <div className="workbench-title">
+                    <div>
+                      <span className="eyebrow">候选生成</span>
+                      <h4>候选 Agent 版本</h4>
+                    </div>
+                    <div className="bootstrap-actions">
+                      <select value={providerId} onChange={(e) => setProviderId(e.target.value)} aria-label="选择模型服务">
+                        {providers.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.model})</option>)}
+                      </select>
+                      <button type="button" disabled={busy === 'bootstrap'} onClick={bootstrapCandidate}>
+                        {busy === 'bootstrap' ? '正在生成…' : '基于基准生成候选'}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="candidate-cards">
+                    {candidates.length === 0 ? (
+                      <div className="candidate-empty">尚无生成的候选版本。请点击右上角按钮由模型生成候选 Spec。</div>
+                    ) : (
+                      candidates.map((item) => (
+                        <button type="button" key={item.id} className={item.id === selectedCandidate?.id ? 'active' : ''} onClick={() => setSelectedCandidateId(item.id)}>
+                          <span>#{item.number}</span>
+                          <div>
+                            <b>{item.definition.name}</b>
+                            <small>{item.definition.description || '无详细描述'}</small>
+                          </div>
+                          <em>{item.status}</em>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </section>
+
+                <section className="eval-workbench">
+                  <div>
+                    <span className="eyebrow">双盲评测</span>
+                    <h4>运行验证实验</h4>
+                    <p style={{ fontSize: '12px', color: 'var(--muted)', marginTop: '4px' }}>
+                      同时向基准与候选注入相同的目标与测试输入，收集成功率、步数与 Token 消耗。
+                    </p>
+                  </div>
+                  <div className="eval-inputs">
+                    <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="评测目标…" aria-label="评测目标" />
+                    <input value={expected} onChange={(e) => setExpected(e.target.value)} placeholder="期望产出…" aria-label="期望产出" />
+                    <button type="button" disabled={busy === 'eval' || !selectedCandidate} onClick={evaluateCandidate}>
+                      {busy === 'eval' ? '评测中…' : '执行评测'}
+                    </button>
+                  </div>
+                </section>
+
+                <section className="experiment-list">
+                  <span className="eyebrow">评测记录与成对证据</span>
+                  {relevantExperiments.length === 0 ? (
+                    <div className="ledger-empty">尚未对此挑战执行实验评测。</div>
+                  ) : (
+                    relevantExperiments.map((exp) => (
+                      <article key={exp.id}>
+                        <div className="experiment-head">
+                          <span>实验 #{exp.id.slice(0, 8)} · 状态: {exp.status}</span>
+                          {exp.report && <b>胜出率: {exp.report.frontierWins} / 净提升: {exp.report.frontierWins - exp.report.regressions}</b>}
+                        </div>
+                        {exp.report ? (
+                          <div className="score-grid">
+                            <div><small>基准成功率</small><strong>{Math.round(exp.report.baseline.successRate * 100)}%</strong><em>{exp.report.baseline.averageTokens} tok</em></div>
+                            <div><small>候选成功率</small><strong>{Math.round(exp.report.candidate.successRate * 100)}%</strong><em>{exp.report.candidate.averageTokens} tok</em></div>
+                            <div><small>建议结论</small><strong>{exp.report.recommendation === 'promote' ? '建议晋升' : '建议改进'}</strong><em>{exp.report.recommendationCause}</em></div>
+                          </div>
+                        ) : (
+                          <div className="experiment-running"><i />评测正在运行中，已完成部分试验…</div>
+                        )}
+                      </article>
+                    ))
+                  )}
+                  {selectedCandidate && (
+                    <button type="button" className="promote-button" disabled={busy === 'promote'} onClick={promoteCandidate}>
+                      {busy === 'promote' ? '正在应用…' : `批准并晋升候选 #${selectedCandidate.number} 为稳定版`}
+                    </button>
+                  )}
+                </section>
+              </>
+            ) : (
+              <div className="evolution-empty">
+                <b>选择或创建一个能力边界</b>
+                <span>系统将针对具体的失败案例实施闭环自举。</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
     </div>
-  </section></div>;
-}
-
-function statusLabel(value: string) {
-  return ({ queued: '排队中', running: '运行中', completed: '已完成', failed: '失败', open: '待处理', evaluating: '评测中', candidate_selected: '已选候选', solved: '已解决', stable: '稳定', candidate: '候选', superseded: '已替代' } as Record<string, string>)[value] ?? value;
-}
-
-function recommendationLabel(value?: string) {
-  return ({ promote: '建议晋升', reject: '建议拒绝', inconclusive: '证据不足', keep_baseline: '保留基线' } as Record<string, string>)[value ?? ''] ?? '评测完成';
+  );
 }

@@ -18,11 +18,12 @@ import (
 )
 
 type Input struct {
-	Name    string `json:"name"`
-	Kind    string `json:"kind"`
-	BaseURL string `json:"baseUrl"`
-	Model   string `json:"model"`
-	APIKey  string `json:"apiKey"`
+	Name          string `json:"name"`
+	Kind          string `json:"kind"`
+	BaseURL       string `json:"baseUrl"`
+	Model         string `json:"model"`
+	APIKey        string `json:"apiKey"`
+	ContextWindow int    `json:"contextWindow"`
 }
 type ChatMessage struct {
 	Role       string     `json:"role"`
@@ -76,7 +77,8 @@ func (s *Service) Create(ctx context.Context, userID string, in Input) (domain.P
 	in.Kind, ok = normalizeKind(in.Kind)
 	in.Model = strings.TrimSpace(in.Model)
 	baseURL, validURL := canonicalBaseURL(in.BaseURL)
-	if in.Name == "" || in.Model == "" || in.APIKey == "" || !ok || !validURL {
+	allowsBlankKey := in.Kind == KindOllama || in.Kind == KindVLLM || in.Kind == KindOpenAICompatible
+	if in.Name == "" || in.Model == "" || (!allowsBlankKey && in.APIKey == "") || !ok || !validURL || in.ContextWindow < 0 || in.ContextWindow > 2_000_000 {
 		return domain.Provider{}, domain.ErrInvalid
 	}
 	in.BaseURL = baseURL
@@ -85,7 +87,7 @@ func (s *Service) Create(ctx context.Context, userID string, in Input) (domain.P
 		return domain.Provider{}, err
 	}
 	now := time.Now().UTC()
-	p := domain.Provider{ID: newID(), UserID: userID, Name: in.Name, Kind: in.Kind, BaseURL: in.BaseURL, Model: in.Model, HasAPIKey: true, CreatedAt: now, UpdatedAt: now}
+	p := domain.Provider{ID: newID(), UserID: userID, Name: in.Name, Kind: in.Kind, BaseURL: in.BaseURL, Model: in.Model, ContextWindow: in.ContextWindow, HasAPIKey: len(cipher) > 0, CreatedAt: now, UpdatedAt: now}
 	return p, s.store.UpsertProvider(ctx, p, cipher, nonce)
 }
 
@@ -102,7 +104,7 @@ func (s *Service) Update(ctx context.Context, userID, id string, in Input) (doma
 	in.Kind, validKind = normalizeKind(in.Kind)
 	in.Model = strings.TrimSpace(in.Model)
 	baseURL, ok := canonicalBaseURL(in.BaseURL)
-	if in.Name == "" || in.Model == "" || !ok || !validKind {
+	if in.Name == "" || in.Model == "" || !ok || !validKind || in.ContextWindow < 0 || in.ContextWindow > 2_000_000 {
 		return domain.Provider{}, domain.ErrInvalid
 	}
 	if in.APIKey != "" {
@@ -115,6 +117,9 @@ func (s *Service) Update(ctx context.Context, userID, id string, in Input) (doma
 	existing.Kind = in.Kind
 	existing.BaseURL = baseURL
 	existing.Model = in.Model
+	if in.ContextWindow > 0 {
+		existing.ContextWindow = in.ContextWindow
+	}
 	existing.HasAPIKey = len(cipher) > 0
 	existing.UpdatedAt = time.Now().UTC()
 	return existing, s.store.UpdateProvider(ctx, existing, cipher, nonce)
@@ -157,6 +162,25 @@ func (s *Service) Test(ctx context.Context, userID, id string) error {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
+	var ollamaTags struct {
+		Models []struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &ollamaTags); err == nil && len(ollamaTags.Models) > 0 {
+		for _, m := range ollamaTags.Models {
+			id := m.Name
+			if id == "" {
+				id = m.Model
+			}
+			if id != "" {
+				models.Data = append(models.Data, struct {
+					ID string `json:"id"`
+				}{ID: id})
+			}
+		}
+	}
 	if err := json.Unmarshal(body, &models); err == nil && len(models.Data) > 0 {
 		available := make([]string, 0, len(models.Data))
 		found := false
@@ -169,6 +193,78 @@ func (s *Service) Test(ctx context.Context, userID, id string) error {
 		}
 	}
 	return nil
+}
+
+func (s *Service) ProviderModels(ctx context.Context, userID, id string) ([]string, error) {
+	p, key, err := s.secret(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	return s.ProbeModels(ctx, p.BaseURL, key)
+}
+
+func (s *Service) ProbeModels(ctx context.Context, rawBaseURL, key string) ([]string, error) {
+	baseURL, ok := canonicalBaseURL(rawBaseURL)
+	if !ok {
+		return nil, domain.ErrInvalid
+	}
+	endpoint := strings.TrimRight(baseURL, "/") + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	bearer(req, key)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, transportError(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, httpProviderError(resp, body)
+	}
+	if !json.Valid(body) {
+		return nil, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, SafeDetail: fmt.Sprintf("provider returned non-JSON content from %s (%s); check the API base URL", req.URL.String(), responseType(resp))}
+	}
+	var models struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	var ollamaTags struct {
+		Models []struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &ollamaTags); err == nil && len(ollamaTags.Models) > 0 {
+		for _, m := range ollamaTags.Models {
+			id := m.Name
+			if id == "" {
+				id = m.Model
+			}
+			if id != "" {
+				models.Data = append(models.Data, struct {
+					ID string `json:"id"`
+				}{ID: id})
+			}
+		}
+	}
+	_ = json.Unmarshal(body, &models)
+	var list []string
+	seen := make(map[string]bool)
+	for _, m := range models.Data {
+		name := strings.TrimSpace(m.ID)
+		if name != "" && !seen[name] {
+			seen[name] = true
+			list = append(list, name)
+		}
+	}
+	sort.Strings(list)
+	return list, nil
 }
 
 func (s *Service) Complete(ctx context.Context, userID, id string, messages []ChatMessage) (string, error) {

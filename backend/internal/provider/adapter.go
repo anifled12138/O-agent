@@ -24,14 +24,14 @@ func adapterFor(kind string) (wireAdapter, error) {
 		return nil, fmt.Errorf("unsupported provider kind %q", kind)
 	}
 	switch normalized {
-	case KindOpenAICompatible, KindDeepSeekChat:
-		return openAIChatAdapter{}, nil
 	case KindOpenAIResponses:
 		return openAIResponsesAdapter{}, nil
 	case KindAnthropicMessages:
 		return anthropicMessagesAdapter{}, nil
+	case KindNewAPI, KindOneAPI, KindOpenAICompatible, KindDeepSeekChat, KindOllama, KindVLLM:
+		return openAIChatAdapter{}, nil
 	default:
-		return nil, fmt.Errorf("unsupported provider kind %q", kind)
+		return openAIChatAdapter{}, nil
 	}
 }
 
@@ -53,7 +53,12 @@ func jsonRequest(ctx context.Context, method, endpoint string, payload any) (*ht
 	return req, err
 }
 
-func bearer(req *http.Request, key string) { req.Header.Set("Authorization", "Bearer "+key) }
+func bearer(req *http.Request, key string) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed != "" {
+		req.Header.Set("Authorization", "Bearer "+trimmed)
+	}
+}
 
 func normalizeCompletion(completion Completion) (Completion, error) {
 	for index := range completion.ToolCalls {

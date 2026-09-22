@@ -16,11 +16,13 @@ import (
 	"axiom.local/agent/internal/bootstrap"
 	"axiom.local/agent/internal/config"
 	"axiom.local/agent/internal/core"
+	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/evalharness"
 	"axiom.local/agent/internal/evolution"
 	"axiom.local/agent/internal/httpapi"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/pluginruntime"
+	pluginsInternal "axiom.local/agent/internal/plugins"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/scriptruntime"
 	"axiom.local/agent/internal/secure"
@@ -128,7 +130,7 @@ func run() error {
 		}
 		return h.Provide("agent", agentService)
 	}})
-	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.plugin-forge.v1", Version: "0.1.0", Description: "User-controlled full-stack plugin forge and sidecar runtime", Requires: []string{"core.storage.sqlite"}, Capabilities: []string{"plugin.generate", "plugin.build", "plugin.approve", "plugin.install", "plugin.invoke"}}, InitFn: func(ctx context.Context, h *core.Host) error {
+	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.plugin-forge.v1", Version: "0.1.0", Description: "User-controlled full-stack plugin forge and sidecar runtime", Requires: []string{"core.storage.sqlite"}, Capabilities: []string{"plugin.generate", "plugin.build", "plugin.install", "plugin.invoke"}}, InitFn: func(ctx context.Context, h *core.Host) error {
 		var err error
 		forgeRepo, err = pluginforge.OpenRepository(cfg.DataDir)
 		if err != nil {
@@ -156,14 +158,16 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		agentService, err := core.Service[*agent.Service](h, "agent")
+		runtimeAgent, err := core.Service[*agent.Service](h, "agent")
 		if err != nil {
 			return err
 		}
-		evalService = evalharness.New(st, evolutionService, agentService)
+		evalService = evalharness.New(st, evolutionService, runtimeAgent)
 		return h.Provide("eval-harness", evalService)
 	}, StopFn: func(context.Context) error {
-		evalService.Close()
+		if evalService != nil {
+			evalService.Close()
+		}
 		return nil
 	}})
 	register(plugins, &core.Component{Info: core.Manifest{ID: "runtime.bootstrap.v1", Version: "0.1.0", Description: "Model-assisted bounded Agent Definition candidate generation", Requires: []string{"provider.gateway.v1", "runtime.evolution.v1"}, Capabilities: []string{"agent.self-bootstrap", "agent.candidate-generation"}}, InitFn: func(ctx context.Context, h *core.Host) error {
@@ -194,6 +198,13 @@ func run() error {
 	evalHarnessService, _ := core.Service[*evalharness.Service](host, "eval-harness")
 	bootstrapService, _ := core.Service[*bootstrap.Service](host, "bootstrap")
 	forgeService, _ := core.Service[*pluginforge.Service](host, "plugin-forge")
+	unifiedPlugins := pluginsInternal.NewManager(cfg.WorkspaceRoot)
+	if providerService != nil {
+		unifiedPlugins.SetProviderLister(func(ctx context.Context) ([]domain.Provider, error) {
+			return providerService.List(ctx, workspaceID)
+		})
+	}
+	agentService.SetPlugins(unifiedPlugins)
 	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(workspaceID, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErrors := make(chan error, 1)
 	go func() {

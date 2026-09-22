@@ -81,6 +81,30 @@ func TestUnifiedPluginList(t *testing.T) {
 	if !foundSkill {
 		t.Errorf("expected to find HTTP Test Skill in list")
 	}
+
+	foundConvTitle := false
+	foundRunInspector := false
+	for _, p := range list {
+		if p.ID == "core:conversation_title" {
+			foundConvTitle = true
+			if p.Type != plugins.TypeCore {
+				t.Errorf("expected core:conversation_title to be TypeCore, got %s", p.Type)
+			}
+			break
+		}
+		if p.ID == "core:run_inspector" {
+			foundRunInspector = true
+			if p.Type != plugins.TypeCore || p.Status != plugins.StatusEnabled {
+				t.Errorf("expected enabled core run inspector, got type=%s status=%s", p.Type, p.Status)
+			}
+		}
+	}
+	if !foundConvTitle {
+		t.Errorf("expected to find core:conversation_title in list")
+	}
+	if !foundRunInspector {
+		t.Errorf("expected to find core:run_inspector in list")
+	}
 }
 
 func TestUnifiedPluginToggle(t *testing.T) {
@@ -115,6 +139,29 @@ func TestUnifiedPluginToggle(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Toggle conversation_title off and on
+	body, _ = json.Marshal(map[string]bool{"enabled": false})
+	req = httptest.NewRequest("POST", "/api/v1/plugins/core:conversation_title/toggle", bytes.NewReader(body))
+	req.SetPathValue("id", "core:conversation_title")
+	w = httptest.NewRecorder()
+	srv.unifiedPluginToggle(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if pm.IsConversationTitleEnabled() {
+		t.Fatalf("expected conversation_title to be disabled")
+	}
+
+	// The run inspector is a real execution-path plugin, not a presentation-only flag.
+	body, _ = json.Marshal(map[string]bool{"enabled": false})
+	req = httptest.NewRequest("POST", "/api/v1/plugins/core:run_inspector/toggle", bytes.NewReader(body))
+	req.SetPathValue("id", "core:run_inspector")
+	w = httptest.NewRecorder()
+	srv.unifiedPluginToggle(w, req)
+	if w.Code != http.StatusOK || pm.IsRunInspectorEnabled() {
+		t.Fatalf("expected run inspector to be durably disabled, status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -163,7 +210,7 @@ func TestUnifiedPluginMCPManagement(t *testing.T) {
 		Description: "MCP for testing HTTP endpoints",
 		Command:     "node",
 		Args:        []string{"server.js"},
-		Enabled: false,
+		Enabled:     false,
 	}
 
 	body, _ := json.Marshal(cfg)
@@ -206,4 +253,3 @@ func TestUnifiedPluginMCPManagement(t *testing.T) {
 		}
 	}
 }
-

@@ -1,158 +1,790 @@
 'use client';
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import EvolutionCenter from './EvolutionCenter';
-import { API, API_V2, ASSET_ORIGIN, request } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Plus, MessageSquare, Layers, Settings as SettingsIcon, ArrowUp, Square, Sparkles, KeyRound, AlertCircle, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight } from 'lucide-react';
+import UnifiedPluginCenter from './UnifiedPluginCenter';
+import { Settings } from './SettingsModal';
+import ProjectModal from './ProjectModal';
+import { MarkdownView } from './MarkdownView';
+import { API_V2, request, UnifiedPlugin, getUnifiedPlugins, updateConversationTitle, generateConversationTitle, Project, getProjects, updateConversationProject } from './api';
 
-export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; hasApiKey: boolean };
-type ProviderKind = { kind: string; label: string; description: string; defaultBaseUrl: string };
-type Conversation = { id: string; title: string; providerId: string; agentGenerationId?: string; agentDefinitionDigest?: string; updatedAt: string };
+export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; contextWindow: number; hasApiKey: boolean };
+type Conversation = { id: string; title: string; providerId: string; agentGenerationId?: string; agentDefinitionDigest?: string; projectId?: string; updatedAt: string };
 type Message = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string };
 type ConversationDetail = Conversation & { messages: Message[] };
-type Plugin = { id: string; version: string; description: string; state: string; capabilities: string[] };
-type PermissionSet = { filesystem?: { read?: string[]; write?: string[] }; network?: string[]; secrets?: string[]; process?: boolean; background?: boolean };
-type Release = { id: string; projectId: string; pluginId: string; version: string; digest: string; permissionHash: string; sourceVersion: 'v1' | 'v2'; manifest: { name: string; description: string; permissions: PermissionSet; ui?: { entry: string; slots?: string[] }; exports?: { tools?: Capability[]; services?: unknown[]; skills?: unknown[] } } };
-type ForgeProject = { id: string; name: string; slug: string; description: string; state: string; lastError?: string; updatedAt: string; latestRelease?: Release; releases: Release[] };
-type Installation = { id: string; pluginId: string; projectId: string; activeReleaseId: string; status: string };
-type Capability = { id: string; summary: string; risk: string; pluginId?: string; releaseId?: string; version?: string };
-type SurfaceState = { pluginId: string; releaseId: string; kind: string; surfaceId: string; status: string; registryEpoch: number };
 type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; details: Record<string, unknown>; createdAt: string };
-type AgentTurn = { id: string; conversationId: string; status: string; stopReason?: string; recoveryClass?: string; cancelRequested: boolean; lastSequence: number; startedAt: string; completedAt?: string };
+type AgentTurn = { id: string; conversationId: string; inputMessageId: string; resultMessageId?: string; providerId: string; status: string; stopReason?: string; recoveryClass?: string; cancelRequested: boolean; lastSequence: number; startedAt: string; completedAt?: string };
 type TurnReceipt = { turnId: string; conversationId: string; inputMessageId: string; status: string };
+
+export function cleanTitleString(rawTitle?: string): string {
+  if (!rawTitle) return '';
+  let trimmed = rawTitle.trim();
+  const chineseMatch = trimmed.match(/^【(.*?)】\s*(.*)$/);
+  if (chineseMatch) {
+    trimmed = chineseMatch[2].trim() || chineseMatch[1].trim();
+  } else {
+    const englishMatch = trimmed.match(/^\[(.*?)\]\s*(.*)$/);
+    if (englishMatch) {
+      trimmed = englishMatch[2].trim() || englishMatch[1].trim();
+    }
+  }
+  trimmed = trimmed.replace(/^(?:会话标题|标题|Title|title)[:：]\s*/, '');
+  return trimmed.trim();
+}
+
+export function shouldAutoTitle(title?: string): boolean {
+  if (!title) return true;
+  const t = title.trim();
+  if (t === '新对话' || t === 'New mission' || t === '新的工作区' || t === '新任务') return true;
+  if (t.startsWith('【') || t.startsWith('[')) return true;
+  return false;
+}
 
 export default function OApp() {
   const [loading, setLoading] = useState(true);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [active, setActive] = useState<ConversationDetail | null>(null);
+  const [selectedProviderId, setSelectedProviderId] = useState<string>('');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [pluginsOpen, setPluginsOpen] = useState(false);
-  const [evolutionOpen, setEvolutionOpen] = useState(false);
-  const [sending, setSending] = useState(false);
+  const [pluginsOpen, setPluginsOpen] = useState<false | 'all' | 'mcp' | 'skill' | 'core' | 'release'>(false);
+  const [unifiedPlugins, setUnifiedPlugins] = useState<UnifiedPlugin[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [editingProject, setEditingProject] = useState<Project | null | undefined>(undefined);
+
+  const isProjectPluginEnabled = useMemo(() => {
+    const p = unifiedPlugins.find((item) => item.id === 'core:project_workspace');
+    return p ? p.status === 'enabled' : true;
+  }, [unifiedPlugins]);
+
+  const activeProject = useMemo(() => {
+    if (!active?.projectId) return null;
+    return projects.find((p) => p.id === active.projectId) || null;
+  }, [active?.projectId, projects]);
+
+  const [headerProjectMenuOpen, setHeaderProjectMenuOpen] = useState(false);
+
+  useEffect(() => {
+    if (!headerProjectMenuOpen) return;
+    function handleOutside(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (!target.closest('.header-project-dropdown') && !target.closest('.project-header-badge')) {
+        setHeaderProjectMenuOpen(false);
+      }
+    }
+    window.addEventListener('click', handleOutside);
+    return () => window.removeEventListener('click', handleOutside);
+  }, [headerProjectMenuOpen]);
+
+  const refreshPlugins = useCallback(async () => {
+    try {
+      const [list, projList] = await Promise.all([
+        getUnifiedPlugins(),
+        getProjects().catch(() => [] as Project[]),
+      ]);
+      setUnifiedPlugins(list);
+      if (projList) setProjects(projList);
+    } catch {}
+  }, []);
+
+  // Per-conversation running state: conversationId -> { turnId: string, trace: TraceEvent[] }
+  const [runningConvos, setRunningConvos] = useState<Record<string, { turnId: string; trace: TraceEvent[] }>>({});
+  const runningConvosRef = useRef<Record<string, { turnId: string; trace: TraceEvent[] }>>({});
+  runningConvosRef.current = runningConvos;
+
+  const observersRef = useRef<Map<string, { turnId: string; controller: AbortController; promise: Promise<void> }>>(new Map());
+
   const [notice, setNotice] = useState('');
   const [trace, setTrace] = useState<TraceEvent[]>([]);
+  const [turns, setTurns] = useState<AgentTurn[]>([]);
   const activeIdRef = useRef('');
-  const observationRef = useRef<{ turnId: string; controller: AbortController; promise: Promise<void> } | null>(null);
+  const activeRef = useRef<ConversationDetail | null>(null);
+  activeRef.current = active;
 
-  useEffect(() => () => observationRef.current?.controller.abort(), []);
+  // Title editing state
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState('');
+  const titleInputRef = useRef<HTMLInputElement>(null);
+  const isSavingTitleRef = useRef(false);
+  const isCancellingTitleRef = useRef(false);
+
+  useEffect(() => {
+    if (editingTitle && titleInputRef.current) {
+      titleInputRef.current.focus();
+      titleInputRef.current.select();
+    }
+  }, [editingTitle]);
+
+  const isTitlePluginEnabled = useMemo(() => {
+    const p = unifiedPlugins.find((item) => item.id === 'core:conversation_title');
+    return p ? p.status === 'enabled' : true;
+  }, [unifiedPlugins]);
+
+  const autoUpdateTitle = useCallback(async (conversationId: string, providerId?: string) => {
+    try {
+      const updated = await generateConversationTitle<ConversationDetail>(conversationId, providerId);
+      if (updated?.title) {
+        const cleaned = cleanTitleString(updated.title);
+        if (activeIdRef.current === conversationId) {
+          setActive((prev) => (prev && prev.id === conversationId ? { ...prev, title: cleaned } : prev));
+        }
+        setConversations((items) => items.map((c) => (c.id === conversationId ? { ...c, title: cleaned } : c)));
+      }
+    } catch {}
+  }, []);
+
+  async function handleSaveTitle(newTitle: string, targetId?: string) {
+    if (isCancellingTitleRef.current) {
+      isCancellingTitleRef.current = false;
+      return;
+    }
+    const convoId = targetId || activeRef.current?.id;
+    if (!convoId) {
+      setEditingTitle(false);
+      return;
+    }
+    const trimmed = newTitle.trim();
+    if (!trimmed) {
+      setEditingTitle(false);
+      return;
+    }
+    const currentTitle = activeRef.current?.title ? cleanTitleString(activeRef.current.title) : '';
+    if (trimmed === currentTitle) {
+      setEditingTitle(false);
+      return;
+    }
+    if (isSavingTitleRef.current) return;
+    isSavingTitleRef.current = true;
+    try {
+      const cleaned = cleanTitleString(trimmed) || trimmed;
+      if (activeRef.current?.id === convoId) {
+        setActive((prev) => (prev && prev.id === convoId ? { ...prev, title: cleaned } : prev));
+      }
+      setConversations((items) => items.map((c) => (c.id === convoId ? { ...c, title: cleaned } : c)));
+
+      const updated = await updateConversationTitle<ConversationDetail>(convoId, cleaned);
+      const serverCleaned = cleanTitleString(updated.title) || cleaned;
+      if (activeRef.current?.id === convoId) {
+        setActive((prev) => (prev && prev.id === convoId ? { ...prev, title: serverCleaned } : prev));
+      }
+      setConversations((items) => items.map((c) => (c.id === convoId ? { ...c, title: serverCleaned } : c)));
+      setNotice('会话标题已更新');
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '更新标题失败');
+    } finally {
+      isSavingTitleRef.current = false;
+      setEditingTitle(false);
+    }
+  }
+
+  useEffect(() => {
+	const observers = observersRef.current;
+    return () => {
+	  for (const obs of observers.values()) {
+        obs.controller.abort();
+      }
+	  observers.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'n') {
+        e.preventDefault();
+        newConversation();
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     void Promise.all([
       request<Provider[]>('/providers'),
       request<Conversation[]>('/conversations'),
-      request<Plugin[]>('/system/plugins'),
-    ]).then(([providerList, conversationList, pluginList]) => {
-      setProviders(providerList); setConversations(conversationList); setPlugins(pluginList);
-    }).catch((error) => setNotice(error instanceof Error ? error.message : '无法连接本地运行时')).finally(() => setLoading(false));
+      getUnifiedPlugins().catch(() => [] as UnifiedPlugin[]),
+      getProjects().catch(() => [] as Project[]),
+    ])
+      .then(([providerList, conversationList, pluginList, projectList]) => {
+        setProviders(providerList);
+        setConversations(conversationList);
+        if (pluginList.length > 0) setUnifiedPlugins(pluginList);
+        if (projectList) setProjects(projectList);
+      })
+      .catch((error) => setNotice(error instanceof Error ? error.message : '无法连接本地运行时'))
+      .finally(() => setLoading(false));
   }, []);
-  function observeTurn(turnId: string, conversationId: string) {
-    if (observationRef.current?.turnId === turnId) return observationRef.current.promise;
-    observationRef.current?.controller.abort();
+
+  function observeTurn(turnId: string, conversationId: string): Promise<void> {
+    const existing = observersRef.current.get(conversationId);
+    if (existing && existing.turnId === turnId) {
+      return existing.promise;
+    }
+    existing?.controller.abort();
+
     const controller = new AbortController();
-    const promise = waitForTurn(turnId, (event) => {
-      if (activeIdRef.current !== conversationId) return;
-      setTrace((items) => items.some((item) => item.id === event.id) ? items : [...items, event]);
-      if (event.kind === 'turn.failed') setNotice(typeof event.details.error === 'string' ? event.details.error : 'Agent 运行失败');
-      if (event.kind === 'turn.cancelled') setNotice('任务已停止，已完成的过程仍保留在运行记录中。');
-      if (event.kind === 'turn.needs_reconciliation') setNotice('任务产生了需要确认的外部影响，处理后才能重试。');
-    }, controller.signal).finally(() => {
-      if (observationRef.current?.turnId === turnId) observationRef.current = null;
-    });
-    observationRef.current = { turnId, controller, promise };
+    setRunningConvos((prev) => ({
+      ...prev,
+      [conversationId]: { turnId, trace: prev[conversationId]?.trace || [] },
+    }));
+
+    const promise = waitForTurn(
+      turnId,
+      (event) => {
+        setRunningConvos((prev) => {
+          const item = prev[conversationId] || { turnId, trace: [] };
+          if (item.trace.some((t) => t.id === event.id)) return prev;
+          return {
+            ...prev,
+            [conversationId]: { turnId, trace: [...item.trace, event] },
+          };
+        });
+        if (activeIdRef.current === conversationId) {
+          setTrace((items) => (items.some((item) => item.id === event.id) ? items : [...items, event]));
+        }
+        if (event.kind === 'turn.failed') {
+          const errText = typeof event.details.error === 'string' ? event.details.error : 'Agent 运行失败';
+          if (/image|vision|multimodal|400 Bad Request/i.test(errText)) {
+            setNotice('模型调用失败：上游接口返回「' + errText + '」。若该模型不支持图片输入，可在左下角「模型设置」中将其标记为纯文本，或在右下角切换为支持多模态的模型。');
+          } else {
+            setNotice(errText);
+          }
+        }
+		if (event.kind === 'turn.cancelled') setNotice('任务已停止，已完成的过程仍保留在运行记录中。');
+		if (event.kind === 'turn.incomplete') setNotice('任务已达到执行步数上限；当前总结和已完成过程已保留，但任务尚未完成。');
+		if (event.kind === 'turn.needs_reconciliation') setNotice('任务产生了需要确认的外部影响，处理后才能重试。');
+      },
+      controller.signal
+    )
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setNotice(error instanceof Error ? error.message : '运行异常中断');
+        }
+      })
+      .finally(() => {
+        observersRef.current.delete(conversationId);
+        setRunningConvos((prev) => {
+          const next = { ...prev };
+          delete next[conversationId];
+          return next;
+        });
+        void refreshConversation(conversationId).then((refreshed) => {
+          if (refreshed && shouldAutoTitle(refreshed.title) && refreshed.messages.length >= 1 && isTitlePluginEnabled) {
+            void autoUpdateTitle(conversationId, refreshed.providerId || selectedProviderId);
+          }
+        });
+      });
+
+    observersRef.current.set(conversationId, { turnId, controller, promise });
     return promise;
   }
 
-  async function refreshConversation(id: string) {
-    const [detail, events] = await Promise.all([request<ConversationDetail>(`/conversations/${id}`), request<TraceEvent[]>(`/conversations/${id}/trace`)]);
-    if (activeIdRef.current === id) { setActive(detail); setTrace(events); }
-    setConversations((items) => items.map((item) => item.id === detail.id ? detail : item));
+  async function refreshConversation(id: string): Promise<ConversationDetail | null> {
+    try {
+    const [detail, events, conversationTurns] = await Promise.all([
+      request<ConversationDetail>(`/conversations/${id}`),
+      request<TraceEvent[]>(`/conversations/${id}/trace`),
+      request<AgentTurn[]>(`/conversations/${id}/turns`),
+    ]);
+    if (activeIdRef.current === id) {
+      setActive(detail);
+      setTrace(events);
+      setTurns(conversationTurns);
+      }
+      setConversations((items) => items.map((item) => (item.id === detail.id ? detail : item)));
+      return detail;
+    } catch {
+      return null;
+    }
   }
 
   async function openConversation(id: string) {
-    observationRef.current?.controller.abort();
-    observationRef.current = null;
+    setEditingTitle(false);
     activeIdRef.current = id;
-    const [detail, events, turns] = await Promise.all([request<ConversationDetail>(`/conversations/${id}`), request<TraceEvent[]>(`/conversations/${id}/trace`), request<AgentTurn[]>(`/conversations/${id}/turns`)]);
+    const [detail, events, turns] = await Promise.all([
+      request<ConversationDetail>(`/conversations/${id}`),
+      request<TraceEvent[]>(`/conversations/${id}/trace`),
+      request<AgentTurn[]>(`/conversations/${id}/turns`),
+    ]);
     if (activeIdRef.current !== id) return;
-    setActive(detail); setTrace(events); setNotice('');
+    setActive(detail);
+    setTurns(turns);
+    setNotice('');
+
+    const runningItem = runningConvosRef.current[id];
+    if (runningItem) {
+      setTrace(runningItem.trace);
+    } else {
+      setTrace(events);
+    }
+
+    if (shouldAutoTitle(detail.title) && detail.messages && detail.messages.length >= 1 && isTitlePluginEnabled) {
+      void autoUpdateTitle(id, detail.providerId || selectedProviderId);
+    }
+
     const running = turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling');
     if (running) {
-      setSending(true);
-      void observeTurn(running.id, id).then(() => refreshConversation(id)).catch((error) => setNotice(error instanceof Error ? error.message : '无法恢复任务事件')).finally(() => {
-        if (activeIdRef.current === id) setSending(false);
-      });
-    } else {
-      setSending(false);
+      void observeTurn(running.id, id);
     }
   }
-  async function newConversation() {
-    if (!providers.length) { setSettingsOpen(true); return; }
-    observationRef.current?.controller.abort();
-    observationRef.current = null;
-    const created = await request<Conversation>('/conversations', { method: 'POST', body: JSON.stringify({ title: '新对话', providerId: providers[0].id }) });
-    activeIdRef.current = created.id; setConversations((items) => [created, ...items]); setActive({ ...created, messages: [] }); setTrace([]);
+
+  const handleMoveConversation = useCallback(async (conversationId: string, projectId: string) => {
+    try {
+      await updateConversationProject(conversationId, projectId);
+      setConversations((items) =>
+        items.map((c) => (c.id === conversationId ? { ...c, projectId: projectId || undefined } : c))
+      );
+      if (activeIdRef.current === conversationId) {
+        setActive((prev) => (prev && prev.id === conversationId ? { ...prev, projectId: projectId || undefined } : prev));
+      }
+      const targetProject = projects.find((p) => p.id === projectId);
+      setNotice(projectId ? `对话已归入「${targetProject?.name || '项目'}」` : '对话已移出项目');
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '转移项目失败');
+    }
+  }, [projects]);
+
+  async function handleNewInProject(projectId: string) {
+    if (!providers.length) {
+      setSettingsOpen(true);
+      return;
+    }
+    try {
+      const created = await request<Conversation>('/conversations', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: '新对话',
+          providerId: selectedProviderId || providers[0]?.id,
+          projectId,
+        }),
+      });
+      setConversations((items) => [created, ...items]);
+      await openConversation(created.id);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '创建对话失败');
+    }
   }
+
+  function newConversation() {
+    // 1. 若当前已经是未发消息的新会话草稿状态，直接保持当前界面，不重复创建
+    if (!activeRef.current || (activeRef.current.messages && activeRef.current.messages.length === 0)) {
+      return;
+    }
+    // 2. 如果列表中已存在未发消息或标题为“新对话”的会话，直接切换过去，不新建多余会话
+    const existingNew = conversations.find(
+      (item) => cleanTitleString(item.title) === '新对话' || !cleanTitleString(item.title)
+    );
+    if (existingNew) {
+      void openConversation(existingNew.id);
+      return;
+    }
+    // 3. 否则切换到草稿态（待发送首条消息时再持久化）
+    setEditingTitle(false);
+    activeIdRef.current = '';
+    setActive(null);
+    setTrace([]);
+    setTurns([]);
+    setNotice('');
+  }
+
   async function send(content: string) {
-    if (!content.trim() || sending) return;
-    setSending(true); setNotice('');
-    let targetId = active?.id ?? '';
+    if (!content.trim()) return;
+    if (active && runningConvosRef.current[active.id]) return;
+
+    setNotice('');
     try {
       let target = active;
       if (!target) {
-        if (!providers.length) { setSettingsOpen(true); return; }
-        const created = await request<Conversation>('/conversations', { method: 'POST', body: JSON.stringify({ title: content.trim().slice(0, 42), providerId: providers[0].id }) });
-        target = { ...created, messages: [] }; targetId = created.id; activeIdRef.current = created.id; setConversations((items) => [created, ...items]);
+        if (!providers.length) {
+          setSettingsOpen(true);
+          return;
+        }
+        const created = await request<Conversation>('/conversations', {
+          method: 'POST',
+          body: JSON.stringify({ title: '新对话', providerId: selectedProviderId || providers[0]?.id }),
+        });
+        target = { ...created, messages: [] };
+        activeIdRef.current = created.id;
+        setConversations((items) => [created, ...items]);
+        setActive(target);
       }
       const pending: Message = { id: `pending-${Date.now()}`, role: 'user', content, createdAt: new Date().toISOString() };
       setActive({ ...target, messages: [...target.messages, pending] });
-      const receipt = await request<TurnReceipt>(`${API_V2}/agent/conversations/${target.id}/turns`, { method: 'POST', body: JSON.stringify({ content }) });
-      await observeTurn(receipt.turnId, target.id);
-    } catch (error) { setNotice(error instanceof Error ? error.message : 'Agent 运行失败'); }
-    finally {
-      if (targetId) {
-        const [refreshed, events] = await Promise.all([request<ConversationDetail>(`/conversations/${targetId}`), request<TraceEvent[]>(`/conversations/${targetId}/trace`)]).catch(() => [null, null] as const);
-        if (refreshed && events) {
-          if (activeIdRef.current === targetId) { setTrace(events); setActive(refreshed); }
-          setConversations((items) => items.map((item) => item.id === refreshed.id ? refreshed : item));
-        }
-      }
-      if (activeIdRef.current === targetId) setSending(false);
+      const receipt = await request<TurnReceipt>(`${API_V2}/agent/conversations/${target.id}/turns`, {
+        method: 'POST',
+        body: JSON.stringify({ content }),
+      });
+      void observeTurn(receipt.turnId, target.id);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Agent 运行失败');
     }
   }
 
   async function cancelTurn() {
-    if (!active || !sending) return;
+    if (!active) return;
+    const runningItem = runningConvosRef.current[active.id];
+    if (!runningItem) return;
     try {
-      const turns = await request<AgentTurn[]>(`/conversations/${active.id}/turns`);
-      const running = turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling');
-      if (!running) { setNotice('当前没有正在运行的任务。'); return; }
-      await request(`/agent/turns/${running.id}/cancel`, { method: 'POST', body: JSON.stringify({ reason: 'user_requested' }) });
+      await request(`/agent/turns/${runningItem.turnId}/cancel`, { method: 'POST', body: JSON.stringify({ reason: 'user_requested' }) });
       setNotice('正在安全停止当前任务…');
-    } catch (error) { setNotice(error instanceof Error ? error.message : '无法停止当前任务'); }
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '无法停止当前任务');
+    }
   }
 
+
+  const isCurrentSending = active ? !!runningConvos[active.id] : false;
+  const currentTrace = active ? (runningConvos[active.id]?.trace ?? trace) : [];
+  const backgroundRunningCount = useMemo(() => {
+    return Object.keys(runningConvos).filter((id) => id !== active?.id).length;
+  }, [runningConvos, active?.id]);
+
   if (loading) return <Splash />;
-  return <main className="app-shell">
-    <Sidebar conversations={conversations} activeId={active?.id} onNew={newConversation} onOpen={openConversation} onEvolution={() => setEvolutionOpen(true)} onPlugins={() => setPluginsOpen(true)} onSettings={() => setSettingsOpen(true)} />
-    <section className="workspace"><header className="workspace-header"><div><span className="eyebrow">本地 AGENT / 对话</span><h1>{active?.title ?? '新的工作区'}</h1></div><div className="header-actions"><span className={`status-pill${sending ? ' active' : ''}`}><i /> {sending ? '运行中' : '就绪'}</span><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="打开设置">⌘</button></div></header>
-      <div className="workspace-grid"><Chat active={active} providers={providers} sending={sending} notice={notice} trace={trace} onSend={send} onCancel={cancelTurn} onConfigure={() => setSettingsOpen(true)} /><RuntimePanel plugins={plugins} provider={providers.find((p) => p.id === active?.providerId) ?? providers[0]} messageCount={active?.messages.length ?? 0} trace={trace} /></div>
-    </section>
-    {settingsOpen && <Settings providers={providers} onClose={() => setSettingsOpen(false)} onSaved={(next) => { setProviders((items) => items.some((item) => item.id === next.id) ? items.map((item) => item.id === next.id ? next : item) : [next, ...items]); setNotice('模型服务已保存'); }} />}
-    {evolutionOpen && <EvolutionCenter providers={providers} onClose={() => setEvolutionOpen(false)} />}
-    {pluginsOpen && <PluginCenter onClose={() => setPluginsOpen(false)} />}
-  </main>;
+  return (
+    <main className="app-shell">
+      <Sidebar
+        conversations={conversations}
+        projects={projects}
+        activeId={active?.id}
+        runningConvos={runningConvos}
+        isProjectPluginEnabled={isProjectPluginEnabled}
+        onNew={newConversation}
+        onNewInProject={handleNewInProject}
+        onOpen={openConversation}
+        onPlugins={() => setPluginsOpen('all')}
+        onSettings={() => setSettingsOpen(true)}
+        onCreateProject={() => setEditingProject(null)}
+        onEditProject={(proj) => setEditingProject(proj)}
+        onMoveConversation={handleMoveConversation}
+      />
+      <section className="workspace">
+        <header className="workspace-header">
+          {!active ? (
+            <div className="header-title-static">
+              <h1 className="header-title-text">新对话</h1>
+            </div>
+          ) : editingTitle ? (
+            <div className="header-title-edit-container">
+              <form
+                className="header-title-edit-form"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void handleSaveTitle(titleDraft);
+                }}
+              >
+                <input
+                  ref={titleInputRef}
+                  type="text"
+                  className="header-title-inline-input"
+                  value={titleDraft}
+                  onChange={(e) => setTitleDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      e.preventDefault();
+                      isCancellingTitleRef.current = true;
+                      setEditingTitle(false);
+                    }
+                  }}
+                  onBlur={() => {
+                    if (!isCancellingTitleRef.current) {
+                      void handleSaveTitle(titleDraft);
+                    }
+                  }}
+                  placeholder="输入标题"
+                  maxLength={50}
+                  autoFocus
+                />
+                <button
+                  type="submit"
+                  className="header-title-btn-confirm"
+                  onMouseDown={(e) => e.preventDefault()}
+                  title="确认保存 (Enter)"
+                  aria-label="确认保存标题"
+                >
+                  <Check size={13} strokeWidth={2.5} />
+                </button>
+                <button
+                  type="button"
+                  className="header-title-btn-cancel"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    isCancellingTitleRef.current = true;
+                  }}
+                  onClick={() => {
+                    isCancellingTitleRef.current = true;
+                    setEditingTitle(false);
+                  }}
+                  title="取消 (Esc)"
+                  aria-label="取消编辑"
+                >
+                  <X size={13} strokeWidth={2.5} />
+                </button>
+              </form>
+            </div>
+          ) : (
+            <div className="header-title-display-container">
+              <div className="header-title-main-row">
+                <div
+                  className="header-title-interactive-block"
+                  onClick={() => {
+                    setTitleDraft(cleanTitleString(active.title) || '新对话');
+                    setEditingTitle(true);
+                  }}
+                  title="点击修改会话标题"
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      setTitleDraft(cleanTitleString(active.title) || '新对话');
+                      setEditingTitle(true);
+                    }
+                  }}
+                >
+                  <h1 className="header-title-text">{cleanTitleString(active.title) || '新对话'}</h1>
+                  <span className="header-title-hover-icon" aria-hidden="true" title="点击修改标题">
+                    <Pencil size={12} strokeWidth={2} />
+                  </span>
+                </div>
+                {isProjectPluginEnabled && (
+                  <div className="header-project-dropdown" style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
+                    {activeProject ? (
+                      <button
+                        type="button"
+                        className="project-header-badge"
+                        onClick={() => setHeaderProjectMenuOpen((prev) => !prev)}
+                        title="点击选择归属项目或配置"
+                      >
+                        <Folder size={12} />
+                        <span>{activeProject.name}</span>
+                        {activeProject.instructionsEnabled && (
+                          <span
+                            title="已开启共享上下文设定"
+                            style={{
+                              width: 5,
+                              height: 5,
+                              borderRadius: '50%',
+                              background: '#10b981',
+                              display: 'inline-block',
+                              marginLeft: 2,
+                            }}
+                          />
+                        )}
+                        <ChevronDown size={11} strokeWidth={2} style={{ opacity: 0.6 }} />
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="project-header-badge unassigned"
+                        onClick={() => setHeaderProjectMenuOpen((prev) => !prev)}
+                        title="点击选择归属项目"
+                      >
+                        <Folder size={12} />
+                        <span>未分配项目</span>
+                        <ChevronDown size={11} strokeWidth={2} style={{ opacity: 0.6 }} />
+                      </button>
+                    )}
+
+                    {headerProjectMenuOpen && (
+                      <div
+                        className="sidebar-popover-menu"
+                        style={{ top: '100%', left: 0, right: 'auto', marginTop: 4, minWidth: 170 }}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {projects.length > 0 ? (
+                          projects.map((p) => {
+                            const isSelected = active.projectId === p.id;
+                            return (
+                              <button
+                                key={p.id}
+                                type="button"
+                                className={`sidebar-popover-item${isSelected ? ' active' : ''}`}
+                                onClick={() => {
+                                  if (!isSelected) handleMoveConversation(active.id, p.id);
+                                  setHeaderProjectMenuOpen(false);
+                                }}
+                              >
+                                <Folder size={13} />
+                                <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
+                                {isSelected && <Check size={12} strokeWidth={2.2} />}
+                              </button>
+                            );
+                          })
+                        ) : (
+                          <div className="sidebar-popover-empty">暂无可用项目</div>
+                        )}
+                        <div className="sidebar-popover-divider" />
+                        {activeProject && (
+                          <>
+                            <button
+                              type="button"
+                              className="sidebar-popover-item"
+                              onClick={() => {
+                                setEditingProject(activeProject);
+                                setHeaderProjectMenuOpen(false);
+                              }}
+                            >
+                              <SettingsIcon size={13} />
+                              <span>项目配置...</span>
+                            </button>
+                            <button
+                              type="button"
+                              className="sidebar-popover-item danger"
+                              onClick={() => {
+                                handleMoveConversation(active.id, '');
+                                setHeaderProjectMenuOpen(false);
+                              }}
+                            >
+                              <LogOut size={13} />
+                              <span>移出项目</span>
+                            </button>
+                            <div className="sidebar-popover-divider" />
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          className="sidebar-popover-item"
+                          onClick={() => {
+                            setEditingProject(null);
+                            setHeaderProjectMenuOpen(false);
+                          }}
+                        >
+                          <FolderPlus size={13} />
+                          <span>新建项目</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          <div className="header-actions">
+            {isCurrentSending ? (
+              <span className="status-pill active" aria-live="polite">
+                <i className="status-dot" aria-hidden="true" />
+                <span>任务运行中</span>
+              </span>
+            ) : backgroundRunningCount > 0 ? (
+              <span className="status-pill background" aria-live="polite" title="后台任务运行中">
+                <i className="status-dot" aria-hidden="true" />
+                <span>后台 {backgroundRunningCount} 个任务运行中</span>
+              </span>
+            ) : (
+              <span className="status-pill" aria-live="polite">
+                <i className="status-dot" aria-hidden="true" />
+                <span>就绪</span>
+              </span>
+            )}
+          </div>
+        </header>
+        <div className="workspace-grid">
+          <Chat
+            active={active}
+            providers={providers}
+            selectedProviderId={selectedProviderId}
+            onSelectProvider={(id) => {
+              setSelectedProviderId(id);
+              if (active) {
+                setActive((prev) => prev ? { ...prev, providerId: id } : null);
+                setConversations((items) => items.map((c) => c.id === active.id ? { ...c, providerId: id } : c));
+              }
+            }}
+            sending={isCurrentSending}
+            notice={notice}
+            trace={trace}
+            liveTrace={currentTrace}
+            turns={turns}
+            unifiedPlugins={unifiedPlugins}
+            onNotice={setNotice}
+            onSend={send}
+            onCancel={cancelTurn}
+            onConfigure={() => setSettingsOpen(true)}
+            onOpenPlugins={(type) => setPluginsOpen(type || 'all')}
+          />
+        </div>
+      </section>
+
+      {settingsOpen && (
+        <Settings
+          providers={providers}
+          onClose={() => setSettingsOpen(false)}
+          onSaved={(next) => {
+            setProviders((items) =>
+              items.some((item) => item.id === next.id)
+                ? items.map((item) => (item.id === next.id ? next : item))
+                : [next, ...items]
+            );
+            setNotice('模型服务已保存');
+          }}
+          onDeleted={(providerId) => {
+            setProviders((items) => items.filter((item) => item.id !== providerId));
+            setNotice('模型已停用并删除');
+          }}
+        />
+      )}
+
+      {pluginsOpen && (
+        <UnifiedPluginCenter
+          initialType={pluginsOpen || 'all'}
+          onClose={() => {
+            setPluginsOpen(false);
+            void refreshPlugins();
+          }}
+          onPluginsChanged={refreshPlugins}
+        />
+      )}
+
+      {editingProject !== undefined && (
+        <ProjectModal
+          project={editingProject}
+          onClose={() => setEditingProject(undefined)}
+          onSaved={(savedProj) => {
+            setProjects((items) =>
+              items.some((p) => p.id === savedProj.id)
+                ? items.map((p) => (p.id === savedProj.id ? savedProj : p))
+                : [savedProj, ...items]
+            );
+            setNotice(editingProject ? '项目设置已保存' : '项目已创建');
+          }}
+          onDeleted={(deletedId) => {
+            setProjects((items) => items.filter((p) => p.id !== deletedId));
+            setConversations((items) =>
+              items.map((c) => (c.projectId === deletedId ? { ...c, projectId: undefined } : c))
+            );
+            if (active?.projectId === deletedId) {
+              setActive((prev) => (prev ? { ...prev, projectId: undefined } : prev));
+            }
+            setNotice('项目已删除，其下对话已移至普通列表');
+          }}
+        />
+      )}
+    </main>
+  );
 }
 
 function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const source = new EventSource(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/events`);
-    signal?.addEventListener('abort', () => { source.close(); resolve(); }, { once: true });
+    signal?.addEventListener(
+      'abort',
+      () => {
+        source.close();
+        resolve();
+      },
+      { once: true }
+    );
     source.onmessage = (message) => {
       try {
         const event = JSON.parse(message.data) as TraceEvent;
         onEvent(event);
-        if (event.kind === 'turn.completed' || event.kind === 'turn.failed' || event.kind === 'turn.cancelled' || event.kind === 'turn.needs_reconciliation') {
+        if (
+		  event.kind === 'turn.completed' ||
+		  event.kind === 'turn.incomplete' ||
+		  event.kind === 'turn.failed' ||
+          event.kind === 'turn.cancelled' ||
+          event.kind === 'turn.needs_reconciliation'
+        ) {
           source.close();
           resolve();
         }
@@ -167,38 +799,1187 @@ function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void, signa
   });
 }
 
-function Splash() { return <div className="splash"><div className="brand-mark">O</div><span>正在启动插件运行时…</span></div>; }
-
-function Sidebar({ conversations, activeId, onNew, onOpen, onEvolution, onPlugins, onSettings }: { conversations: Conversation[]; activeId?: string; onNew: () => void; onOpen: (id: string) => void; onEvolution: () => void; onPlugins: () => void; onSettings: () => void }) {
-  return <aside className="sidebar"><div className="brand"><div className="brand-mark">O</div><span>O</span><small>0.2</small></div><button className="new-button" onClick={onNew}><span>＋</span> 新对话 <kbd>⌘ N</kbd></button><nav><p>对话</p>{conversations.length === 0 ? <div className="empty-nav">还没有对话。<br/>从一个目标开始。</div> : conversations.map((item) => <button key={item.id} className={item.id === activeId ? 'active' : ''} onClick={() => onOpen(item.id)}><i>◫</i><span>{item.title}</span></button>)}</nav><div className="sidebar-foot"><button onClick={onEvolution}><i>⌁</i><span>演化实验室</span></button><button onClick={onPlugins}><i>◇</i><span>插件工坊</span></button><button onClick={onSettings}><i>⚙</i><span>模型设置</span></button></div></aside>;
+function Splash() {
+  return (
+    <div className="splash">
+      <div className="brand-mark">O</div>
+      <span>正在启动插件运行时…</span>
+    </div>
+  );
 }
 
-function Chat({ active, providers, sending, notice, trace, onSend, onCancel, onConfigure }: { active: ConversationDetail | null; providers: Provider[]; sending: boolean; notice: string; trace: TraceEvent[]; onSend: (content: string) => void; onCancel: () => void; onConfigure: () => void }) {
-  const [draft, setDraft] = useState('');
-  const [activityOpen, setActivityOpen] = useState(false);
+function deduplicateNewChats(list: Conversation[]): Conversation[] {
+  const result: Conversation[] = [];
+  let hasDefault = false;
+  for (const item of list) {
+    const displayTitle = cleanTitleString(item.title) || '新对话';
+    if (displayTitle === '新对话') {
+      if (!hasDefault) {
+        result.push(item);
+        hasDefault = true;
+      }
+    } else {
+      result.push(item);
+    }
+  }
+  return result;
+}
+
+function Sidebar({
+  conversations,
+  projects,
+  activeId,
+  runningConvos,
+  isProjectPluginEnabled,
+  onNew,
+  onNewInProject,
+  onOpen,
+  onPlugins,
+  onSettings,
+  onCreateProject,
+  onEditProject,
+  onMoveConversation,
+}: {
+  runningConvos?: Record<string, unknown>;
+  conversations: Conversation[];
+  projects: Project[];
+  activeId?: string;
+  isProjectPluginEnabled: boolean;
+  onNew: () => void;
+  onNewInProject: (projectId: string) => void;
+  onOpen: (id: string) => void;
+  onPlugins: () => void;
+  onSettings: () => void;
+  onCreateProject: () => void;
+  onEditProject: (project: Project) => void;
+  onMoveConversation: (conversationId: string, projectId: string) => void;
+}) {
+  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
+  const [popoverConvoId, setPopoverConvoId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!popoverConvoId) return;
+    function handleOutside(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (!target.closest('.sidebar-popover-menu') && !target.closest('.sidebar-convo-action-btn')) {
+        setPopoverConvoId(null);
+      }
+    }
+    window.addEventListener('click', handleOutside);
+    return () => window.removeEventListener('click', handleOutside);
+  }, [popoverConvoId]);
+
+  const toggleProjectCollapse = (projectId: string) => {
+    setCollapsedProjects((prev) => ({
+      ...prev,
+      [projectId]: !prev[projectId],
+    }));
+  };
+
+  const unassignedConversations = useMemo(() => {
+    const raw = isProjectPluginEnabled ? conversations.filter((item) => !item.projectId) : conversations;
+    return deduplicateNewChats(raw);
+  }, [conversations, isProjectPluginEnabled]);
+
+  return (
+    <aside className="sidebar">
+      <div className="brand">
+        <div className="brand-mark">
+          <Sparkles size={13} strokeWidth={2.2} />
+        </div>
+        <span className="brand-name">O Agent</span>
+        <span className="brand-badge">0.2</span>
+      </div>
+      <button
+        type="button"
+        className={`new-button${!activeId ? ' active' : ''}`}
+        onClick={onNew}
+        aria-label="新建对话"
+      >
+        <Plus size={16} strokeWidth={2} aria-hidden="true" />
+        <span className="new-button-label">新对话</span>
+        <kbd aria-hidden="true">⌘ N</kbd>
+      </button>
+
+      <div className="sidebar-scroll-area">
+        {/* 项目文件夹区域（置于对话栏上方，以“项目”命名） */}
+        {isProjectPluginEnabled && (
+          <section className="sidebar-section" aria-label="项目列表">
+            <div className="sidebar-section-header">
+              <span className="sidebar-section-title">项目</span>
+              <button
+                type="button"
+                className="sidebar-section-action"
+                onClick={onCreateProject}
+                title="新建项目文件夹"
+                aria-label="新建项目"
+              >
+                <Plus size={13} strokeWidth={2} />
+              </button>
+            </div>
+
+            {projects.length === 0 ? (
+              <button
+                type="button"
+                className="sidebar-project-empty-btn"
+                onClick={onCreateProject}
+                title="点击创建第一个项目文件夹"
+              >
+                <FolderPlus size={13} />
+                <span>新建项目文件夹</span>
+              </button>
+            ) : (
+              projects.map((proj) => {
+                const isCollapsed = Boolean(collapsedProjects[proj.id]);
+                const projConvos = deduplicateNewChats(conversations.filter((c) => c.projectId === proj.id));
+
+                return (
+                  <div key={proj.id} className="sidebar-project-item">
+                    <div
+                      className="sidebar-project-header"
+                      onClick={() => toggleProjectCollapse(proj.id)}
+                      title={`${proj.name}${proj.workdir ? ` (${proj.workdir})` : ''}`}
+                    >
+                      <span className={`sidebar-project-chevron${!isCollapsed ? ' expanded' : ''}`}>
+                        <ChevronRight size={12} strokeWidth={2.2} />
+                      </span>
+                      <span className="sidebar-project-icon">
+                        <Folder size={14} />
+                      </span>
+                      <span className="sidebar-project-name">{proj.name}</span>
+                      <span className="sidebar-project-count" title={`${projConvos.length} 个对话`}>
+                        {projConvos.length}
+                      </span>
+
+                      <div className="sidebar-project-actions" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          className="sidebar-project-action-btn"
+                          onClick={() => {
+                            setCollapsedProjects((prev) => ({ ...prev, [proj.id]: false }));
+                            onNewInProject(proj.id);
+                          }}
+                          title="在该项目新建对话"
+                          aria-label="新建对话"
+                        >
+                          <Plus size={13} strokeWidth={2} />
+                        </button>
+                        <button
+                          type="button"
+                          className="sidebar-project-action-btn"
+                          onClick={() => onEditProject(proj)}
+                          title="项目设置与共享设定"
+                          aria-label="项目设置"
+                        >
+                          <SettingsIcon size={12} strokeWidth={2} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {!isCollapsed && (
+                      <div className="sidebar-project-children">
+                        {projConvos.length === 0 ? (
+                          <div
+                            className="sidebar-project-empty-hint"
+                            onClick={() => onNewInProject(proj.id)}
+                          >
+                            暂无对话，点击 + 开始
+                          </div>
+                        ) : (
+                          projConvos.map((item) => {
+                            const displayTitle = cleanTitleString(item.title) || '新对话';
+                            const isMenuOpen = popoverConvoId === item.id;
+
+                            return (
+                              <div
+                                key={item.id}
+                                className={`sidebar-convo-row${item.id === activeId ? ' active' : ''}`}
+                              >
+                                <button
+                                  type="button"
+                                  className="sidebar-convo-btn"
+                                  onClick={() => onOpen(item.id)}
+                                  title={displayTitle}
+                                >
+                                  <MessageSquare size={13} strokeWidth={1.75} aria-hidden="true" />
+                                  <span className="sidebar-convo-title">{displayTitle}</span>
+                                  {!!runningConvos?.[item.id] && <span className="sidebar-running-dot" title="任务运行中" />}
+                                </button>
+
+                                <div className="sidebar-convo-tools">
+                                  <button
+                                    type="button"
+                                    className="sidebar-convo-action-btn"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setPopoverConvoId(isMenuOpen ? null : item.id);
+                                    }}
+                                    title="设置项目"
+                                    aria-label="设置项目"
+                                  >
+                                    <MoreHorizontal size={13} />
+                                  </button>
+                                </div>
+
+                                {isMenuOpen && (
+                                  <div className="sidebar-popover-menu" onClick={(e) => e.stopPropagation()}>
+                                    {projects.map((p) => {
+                                      const isSelected = item.projectId === p.id;
+                                      return (
+                                        <button
+                                          key={p.id}
+                                          type="button"
+                                          className={`sidebar-popover-item${isSelected ? ' active' : ''}`}
+                                          onClick={() => {
+                                            if (!isSelected) {
+                                              onMoveConversation(item.id, p.id);
+                                            }
+                                            setPopoverConvoId(null);
+                                          }}
+                                        >
+                                          <Folder size={13} />
+                                          <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
+                                          {isSelected && <Check size={12} strokeWidth={2.2} />}
+                                        </button>
+                                      );
+                                    })}
+                                    <div className="sidebar-popover-divider" />
+                                    <button
+                                      type="button"
+                                      className="sidebar-popover-item danger"
+                                      onClick={() => {
+                                        onMoveConversation(item.id, '');
+                                        setPopoverConvoId(null);
+                                      }}
+                                    >
+                                      <LogOut size={13} />
+                                      <span>移出项目</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="sidebar-popover-item"
+                                      onClick={() => {
+                                        onCreateProject();
+                                        setPopoverConvoId(null);
+                                      }}
+                                    >
+                                      <FolderPlus size={13} />
+                                      <span>新建项目</span>
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </section>
+        )}
+
+        {/* 对话列表区域 */}
+        <nav className="sidebar-section" aria-label="对话列表">
+          <div className="sidebar-section-header">
+            <span className="sidebar-section-title">对话</span>
+          </div>
+          {unassignedConversations.length === 0 ? (
+            <div className="empty-nav">
+              还没有对话。<br />
+              从一个目标开始。
+            </div>
+          ) : (
+            unassignedConversations.map((item) => {
+              const displayTitle = cleanTitleString(item.title) || '新对话';
+              const isMenuOpen = popoverConvoId === item.id;
+
+              return (
+                <div
+                  key={item.id}
+                  className={`sidebar-convo-row${item.id === activeId ? ' active' : ''}`}
+                >
+                  <button
+                    type="button"
+                    className="sidebar-convo-btn"
+                    onClick={() => onOpen(item.id)}
+                    title={displayTitle}
+                  >
+                    <MessageSquare size={14} strokeWidth={1.75} aria-hidden="true" />
+                    <span className="sidebar-convo-title">{displayTitle}</span>
+                    {!!runningConvos?.[item.id] && <span className="sidebar-running-dot" title="任务运行中" />}
+                  </button>
+
+                  {isProjectPluginEnabled && (
+                    <div className="sidebar-convo-tools">
+                      <button
+                        type="button"
+                        className="sidebar-convo-action-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPopoverConvoId(isMenuOpen ? null : item.id);
+                        }}
+                        title="设置项目"
+                        aria-label="设置项目"
+                      >
+                        <MoreHorizontal size={13} />
+                      </button>
+                    </div>
+                  )}
+
+                  {isMenuOpen && (
+                    <div className="sidebar-popover-menu" onClick={(e) => e.stopPropagation()}>
+                      {projects.length > 0 ? (
+                        projects.map((proj) => (
+                          <button
+                            key={proj.id}
+                            type="button"
+                            className="sidebar-popover-item"
+                            onClick={() => {
+                              onMoveConversation(item.id, proj.id);
+                              setPopoverConvoId(null);
+                            }}
+                          >
+                            <Folder size={13} />
+                            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{proj.name}</span>
+                          </button>
+                        ))
+                      ) : (
+                        <div className="sidebar-popover-empty">暂无可用项目</div>
+                      )}
+                      <div className="sidebar-popover-divider" />
+                      <button
+                        type="button"
+                        className="sidebar-popover-item"
+                        onClick={() => {
+                          onCreateProject();
+                          setPopoverConvoId(null);
+                        }}
+                      >
+                        <FolderPlus size={13} />
+                        <span>新建项目</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </nav>
+      </div>
+
+      <div className="sidebar-foot">
+        <button type="button" onClick={onPlugins} aria-label="打开插件与能力">
+          <Layers size={16} strokeWidth={1.75} aria-hidden="true" />
+          <span>插件与能力</span>
+        </button>
+        <button type="button" onClick={onSettings} aria-label="打开模型设置">
+          <SettingsIcon size={16} strokeWidth={1.75} aria-hidden="true" />
+          <span>模型设置</span>
+        </button>
+      </div>
+    </aside>
+  );
+}
+
+function compressImageFile(file: File, maxDim = 1600, quality = 0.82): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new window.Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return resolve(e.target?.result as string);
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = () => resolve(e.target?.result as string);
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+const DRAFTS_STORAGE_KEY = 'axiom_conversation_drafts_v1';
+
+export type DraftAttachment = {
+  id: string;
+  name: string;
+  dataUrl: string;
+};
+
+export type ConversationDraft = {
+  text: string;
+  attachments: DraftAttachment[];
+};
+
+function loadStoredDrafts(): Record<string, ConversationDraft> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(DRAFTS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      return parsed;
+    }
+  } catch {}
+  return {};
+}
+
+function persistDrafts(drafts: Record<string, ConversationDraft>) {
+  if (typeof window === 'undefined') return;
+  try {
+    const cleaned: Record<string, ConversationDraft> = {};
+    for (const [k, v] of Object.entries(drafts)) {
+      if ((v?.text && v.text.trim()) || (v?.attachments && v.attachments.length > 0)) {
+        cleaned[k] = {
+          text: v.text || '',
+          attachments: Array.isArray(v.attachments) ? v.attachments : [],
+        };
+      }
+    }
+    if (Object.keys(cleaned).length === 0) {
+      localStorage.removeItem(DRAFTS_STORAGE_KEY);
+    } else {
+      localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(cleaned));
+    }
+  } catch {
+    try {
+      const textOnly: Record<string, ConversationDraft> = {};
+      for (const [k, v] of Object.entries(drafts)) {
+        if (v?.text && v.text.trim()) {
+          textOnly[k] = { text: v.text, attachments: [] };
+        }
+      }
+      localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(textOnly));
+    } catch {}
+  }
+}
+
+function Chat({
+  active,
+  providers,
+  selectedProviderId,
+  onSelectProvider,
+  sending,
+  notice,
+  trace,
+  liveTrace,
+  turns,
+  onSend,
+  onCancel,
+  onConfigure,
+  onOpenPlugins,
+  unifiedPlugins,
+  onNotice,
+}: {
+  unifiedPlugins: UnifiedPlugin[];
+  onNotice?: (msg: string) => void;
+  active: ConversationDetail | null;
+  providers: Provider[];
+  selectedProviderId: string;
+  onSelectProvider: (id: string) => void;
+  sending: boolean;
+  notice: string;
+  trace: TraceEvent[];
+  liveTrace: TraceEvent[];
+  turns: AgentTurn[];
+  onSend: (content: string) => void;
+  onCancel: () => void;
+  onConfigure: () => void;
+  onOpenPlugins: (type?: 'all' | 'mcp' | 'skill' | 'core' | 'release') => void;
+}) {
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const modelMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (modelMenuRef.current && !modelMenuRef.current.contains(event.target as Node)) {
+        setModelMenuOpen(false);
+      }
+    }
+    if (modelMenuOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [modelMenuOpen]);
+
+  const currentProvider = useMemo(() => {
+    if (active?.providerId) {
+      const p = providers.find((item) => item.id === active.providerId);
+      if (p) return p;
+    }
+    if (selectedProviderId) {
+      const p = providers.find((item) => item.id === selectedProviderId);
+      if (p) return p;
+    }
+    return providers[0] || null;
+  }, [active, selectedProviderId, providers]);
+  const sessionId = active?.id || '__new__';
+
+  const [draftsMap, setDraftsMap] = useState<Record<string, ConversationDraft>>(() => loadStoredDrafts());
+  const draftsMapRef = useRef(draftsMap);
+
+  useEffect(() => {
+    draftsMapRef.current = draftsMap;
+    const timer = setTimeout(() => {
+      persistDrafts(draftsMap);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [draftsMap]);
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      persistDrafts(draftsMapRef.current);
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, []);
+
+  const currentDraftObj = draftsMap[sessionId];
+  const draft = currentDraftObj?.text ?? '';
+  const attachments = currentDraftObj?.attachments ?? [];
+
+  const setDraft = useCallback((textOrUpdater: string | ((prev: string) => string)) => {
+    setDraftsMap((prev) => {
+      const currentText = prev[sessionId]?.text ?? '';
+      const nextText = typeof textOrUpdater === 'function' ? textOrUpdater(currentText) : textOrUpdater;
+      if (nextText === currentText && prev[sessionId]) return prev;
+      return {
+        ...prev,
+        [sessionId]: {
+          text: nextText,
+          attachments: prev[sessionId]?.attachments ?? [],
+        },
+      };
+    });
+  }, [sessionId]);
+
+  const setAttachments = useCallback((
+    attachmentsOrUpdater: DraftAttachment[] | ((prev: DraftAttachment[]) => DraftAttachment[])
+  ) => {
+    setDraftsMap((prev) => {
+      const currentAtts = prev[sessionId]?.attachments ?? [];
+      const nextAtts = typeof attachmentsOrUpdater === 'function'
+        ? attachmentsOrUpdater(currentAtts)
+        : attachmentsOrUpdater;
+      return {
+        ...prev,
+        [sessionId]: {
+          text: prev[sessionId]?.text ?? '',
+          attachments: nextAtts,
+        },
+      };
+    });
+  }, [sessionId]);
+
+  const addAttachmentForSession = useCallback((
+    targetId: string,
+    att: DraftAttachment
+  ) => {
+    setDraftsMap((prev) => ({
+      ...prev,
+      [targetId]: {
+        text: prev[targetId]?.text ?? '',
+        attachments: [...(prev[targetId]?.attachments ?? []), att],
+      },
+    }));
+  }, []);
+
+  const clearCurrentDraft = useCallback(() => {
+    setDraftsMap((prev) => {
+      if (!prev[sessionId]) return prev;
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+  }, [sessionId]);
   const suggestions = ['检查这个项目的架构', '设计一份可靠的执行计划', '根据证据定位一个问题'];
-  const submit = () => { const value = draft; if (!sending && value.trim()) { setDraft(''); onSend(value); } };
-  return <div className="chat-column"><div className="messages">{!active?.messages.length ? <div className="empty-chat"><div className="pulse-orbit"><span>O</span></div><span className="eyebrow">AGENT 已就绪</span><h2>今天想做什么？</h2><p>告诉 O 你想达成的结果和约束。运行时会保留任务状态，并交给你配置的模型处理。</p>{!providers.length ? <button className="setup-card" onClick={onConfigure}><span>01</span><div><b>连接模型服务</b><small>配置模型供应商及其 API 协议</small></div><i>→</i></button> : <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setDraft(text)}>{text}<span>↗</span></button>)}</div>}</div> : active.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><div className="message-role">{message.role === 'user' ? '你' : 'O'}</div><div className="message-body">{message.content}</div></article>)}{sending && <article className="message assistant running-message"><div className="message-role">O</div><div className="thinking-stack"><div className="thinking-row"><div className="thinking"><i/><i/><i/> 正在处理</div><div className="thinking-actions"><button type="button" onClick={() => setActivityOpen((open) => !open)}>{activityOpen ? '收起过程' : '查看过程'}</button><button type="button" className="inline-stop" onClick={onCancel}>停止</button></div></div>{activityOpen && <ActivityTrace trace={trace} />}</div></article>}</div>{notice && <div className="notice">{notice}</div>}<div className="composer"><textarea value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !sending) { e.preventDefault(); submit(); } }} placeholder={!providers.length ? '请先配置模型服务…' : sending ? '可以先输入下一条消息，当前任务完成后发送…' : '描述目标、约束，或者下一步行动…'} disabled={!providers.length}/><div className="composer-row"><span>{sending ? '可以继续输入草稿 · 当前任务可安全停止' : 'Enter 发送 · Shift Enter 换行'}</span>{sending ? <button className="stop-button" onClick={onCancel}>停止 <i>■</i></button> : <button onClick={submit} disabled={!draft.trim()}>发送 <i>↑</i></button>}</div></div></div>;
+
+  const checkVisionSupport = (): boolean => {
+    const modelId = currentProvider?.model || currentProvider?.name || '';
+    if (!modelId) return true;
+    try {
+      const cfg = JSON.parse(localStorage.getItem('axiom_model_vision') || '{}') as Record<string, boolean>;
+      if (cfg[modelId] === false) {
+        onNotice?.('当前选择的模型 [' + modelId + '] 已在模型设置中关闭了视觉支持。若该模型支持图片输入，请在左下角「模型设置」中将其切换为「视觉开启」；或在底栏切换为支持多模态的模型。');
+        return false;
+      }
+    } catch {}
+    return true;
+  };
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const targetSessionId = sessionId;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type.startsWith('image/')) {
+        if (!checkVisionSupport()) {
+          e.preventDefault();
+          return;
+        }
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault();
+          compressImageFile(file).then((compressedDataUrl) => {
+            addAttachmentForSession(targetSessionId, {
+              id: 'img-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+              name: file.name || '粘贴图片',
+              dataUrl: compressedDataUrl,
+            });
+          }).catch(() => {});
+        }
+      }
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const files = e.dataTransfer?.files;
+    if (!files) return;
+    const targetSessionId = sessionId;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (file.type.startsWith('image/')) {
+        if (!checkVisionSupport()) {
+          return;
+        }
+        compressImageFile(file).then((compressedDataUrl) => {
+          addAttachmentForSession(targetSessionId, {
+            id: 'img-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+            name: file.name || '拖拽图片',
+            dataUrl: compressedDataUrl,
+          });
+        }).catch(() => {});
+      }
+    }
+  };
+
+
+  const isModelSelectorEnabled = useMemo(() => {
+    const p = unifiedPlugins.find((item) => item.id === 'core:model_selector');
+    return p ? p.status === 'enabled' : true;
+  }, [unifiedPlugins]);
+  const isRunInspectorEnabled = useMemo(() => {
+    const p = unifiedPlugins.find((item) => item.id === 'core:run_inspector');
+    return p ? p.status === 'enabled' : true;
+  }, [unifiedPlugins]);
+  const activeMcpCount = useMemo(() => unifiedPlugins.filter((p) => p.type === 'mcp' && p.status === 'enabled').length, [unifiedPlugins]);
+  const activeSkillCount = useMemo(() => unifiedPlugins.filter((p) => p.type === 'skill' && p.status === 'enabled').length, [unifiedPlugins]);
+  const activePluginCount = useMemo(
+    () => unifiedPlugins.filter((p) => (p.type === 'core' || p.type === 'release') && p.status === 'enabled').length,
+    [unifiedPlugins]
+  );
+
+  const submit = () => {
+    const textValue = draft.trim();
+    if (!sending && (textValue || attachments.length > 0)) {
+      let fullContent = textValue;
+      if (attachments.length > 0) {
+        const imgPart = attachments.map((a) => '![' + a.name + '](' + a.dataUrl + ')').join('\n\n');
+        fullContent = fullContent ? fullContent + '\n\n' + imgPart : imgPart;
+      }
+      clearCurrentDraft();
+      onSend(fullContent);
+    }
+  };
+
+  return (
+    <div className="chat-column">
+      <div className="messages">
+        {!active?.messages.length ? (
+          <div className="empty-chat">
+            <div className="empty-hero">
+              <div className="pulse-orbit">
+                <Sparkles size={20} strokeWidth={2} />
+              </div>
+              <h2 className="empty-title">今天想探讨什么任务？</h2>
+              <p className="empty-subtitle">输入目标与约束条件，本地 Agent 将自主调用工具与模型协同推进。</p>
+            </div>
+            {!providers.length ? (
+              <button type="button" className="setup-card" onClick={onConfigure}>
+                <div className="setup-card-icon">
+                  <KeyRound size={16} strokeWidth={2} />
+                </div>
+                <div className="setup-card-body">
+                  <b>连接模型服务</b>
+                  <small>配置 One-API、Claude 或 OpenAI 兼容接口，即可开启完整能力</small>
+                </div>
+                <span className="setup-card-arrow">前往配置 →</span>
+              </button>
+            ) : (
+              <div className="suggestions">
+                {suggestions.map((text) => (
+                  <button type="button" key={text} onClick={() => setDraft(text)}>
+                    <span>{text}</span>
+                    <span className="suggestion-arrow">↗</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          active.messages.map((message) => {
+            const messageTurn = message.role === 'assistant' ? turns.find((turn) => turn.resultMessageId === message.id) : undefined;
+            return (
+              <article key={message.id} className={`message ${message.role}`}>
+                <div className="message-role">{message.role === 'user' ? '你' : 'O'}</div>
+                <div className="message-body">
+                  {isRunInspectorEnabled && messageTurn && (
+                    <ActivityTrace turn={messageTurn} trace={trace.filter((event) => event.turnId === messageTurn.id)} />
+                  )}
+                  <MarkdownView content={message.content} />
+                </div>
+              </article>
+            );
+          })
+        )}
+        {sending && (
+          <article className="message assistant running-message">
+            <div className="message-role">O</div>
+            <div className="thinking-stack">
+              {isRunInspectorEnabled ? (
+                <ActivityTrace
+                  trace={liveTrace}
+                  turn={turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling')}
+                  running
+                />
+              ) : (
+                <div className="thinking-row">
+                  <div className="thinking"><i /><i /><i /> 正在处理</div>
+                </div>
+              )}
+            </div>
+          </article>
+        )}
+      </div>
+      {notice && (
+        <div className="notice-wrap">
+          <div className="notice" role="status">
+            <AlertCircle size={14} strokeWidth={2} className="notice-icon" />
+            <span className="notice-text">{notice}</span>
+            <button type="button" onClick={() => onNotice?.('')} className="notice-close" aria-label="关闭提示">✕</button>
+          </div>
+        </div>
+      )}
+      <div className="composer-wrap" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
+        <div className="composer">
+        {attachments.length > 0 && (
+          <div className="composer-attachments">
+            {attachments.map((att, idx) => (
+              <div key={att.id} className="composer-attachment-item">
+                {/* Local data URLs cannot use the Next image optimization pipeline. */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={att.dataUrl} alt={att.name} className="composer-attachment-thumb" />
+                <button
+                  type="button"
+                  className="composer-attachment-remove"
+                  onClick={() => setAttachments((prev) => prev.filter((_, i) => i !== idx))}
+                  title="移除图片"
+                  aria-label="移除图片"
+                >
+                  <X size={11} strokeWidth={2.5} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <textarea
+          key={sessionId}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onPaste={handlePaste}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey && !sending) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          placeholder={
+            !providers.length
+              ? '请先配置模型服务…'
+              : sending
+              ? '可以先输入下一条消息，当前任务完成后发送…'
+              : '描述目标、约束，或者下一步行动…'
+          }
+          disabled={!providers.length}
+          aria-label="输入消息内容"
+        />
+        <div className="composer-row">
+          <div className="composer-capability-bar" role="toolbar" aria-label="扩展能力入口">
+            <button
+              type="button"
+              className="capability-btn"
+              onClick={() => onOpenPlugins('mcp')}
+              title="管理 MCP 服务"
+              aria-label={`MCP 服务，已启用 ${activeMcpCount} 个`}
+            >
+              <span>MCP</span>
+              <span className="cap-badge">{activeMcpCount}</span>
+            </button>
+            <button
+              type="button"
+              className="capability-btn"
+              onClick={() => onOpenPlugins('skill')}
+              title="管理 Markdown 技能"
+              aria-label={`技能，已启用 ${activeSkillCount} 个`}
+            >
+              <span>Skill</span>
+              <span className="cap-badge">{activeSkillCount}</span>
+            </button>
+            <button
+              type="button"
+              className="capability-btn"
+              onClick={() => onOpenPlugins('core')}
+              title="管理核心插件"
+              aria-label={`插件，已启用 ${activePluginCount} 个`}
+            >
+              <span>Plugin</span>
+              <span className="cap-badge">{activePluginCount}</span>
+            </button>
+          </div>
+          <div className="composer-actions-right">
+            {isModelSelectorEnabled && (
+              <div className="model-selector-anchor" ref={modelMenuRef}>
+              <button
+                type="button"
+                className={`model-select-pill ${modelMenuOpen ? 'active' : ''}`}
+                onClick={() => setModelMenuOpen((v) => !v)}
+                title={currentProvider ? `当前模型: ${currentProvider.model || currentProvider.name}` : '未配置模型服务'}
+                aria-label="选择模型"
+              >
+                <span className="model-name-label">
+                  {currentProvider ? (currentProvider.model || currentProvider.name) : '选择模型'}
+                </span>
+                <ChevronDown size={12} strokeWidth={2} className={`chevron-icon ${modelMenuOpen ? 'open' : ''}`} />
+              </button>
+
+              {modelMenuOpen && (
+                <div className="model-dropdown-menu">
+                  <div className="model-dropdown-header">
+                    <span>切换模型</span>
+                    <button
+                      type="button"
+                      className="model-dropdown-cfg-btn"
+                      onClick={() => {
+                        setModelMenuOpen(false);
+                        onConfigure();
+                      }}
+                    >
+                      管理模型 ⚙
+                    </button>
+                  </div>
+                  <div className="model-dropdown-list">
+                    {providers.length === 0 ? (
+                      <div className="model-dropdown-empty">
+                        <p>尚未启用任何模型服务</p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setModelMenuOpen(false);
+                            onConfigure();
+                          }}
+                        >
+                          前往配置模型 →
+                        </button>
+                      </div>
+                    ) : (
+                      providers.map((p) => {
+                        const isSelected = p.id === currentProvider?.id;
+                        return (
+                          <button
+                            type="button"
+                            key={p.id}
+                            className={`model-option-item ${isSelected ? 'selected' : ''}`}
+                            onClick={() => {
+                              onSelectProvider(p.id);
+                              setModelMenuOpen(false);
+                            }}
+                          >
+                            <div className="model-option-info">
+                              <span className="model-option-name">{p.model || p.name}</span>
+                              <span className="model-option-sub">{p.name}</span>
+                            </div>
+                            {isSelected && <Check size={13} strokeWidth={2.5} className="model-check-icon" />}
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+            )}
+
+            {sending ? (
+              <button type="button" className="composer-icon-button stop-btn" onClick={onCancel} title="停止任务" aria-label="停止">
+                <Square size={12} fill="currentColor" strokeWidth={0} />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="composer-icon-button send-btn"
+                onClick={submit}
+                disabled={(!draft.trim() && attachments.length === 0) || !providers.length}
+                title="发送"
+                aria-label="发送"
+              >
+                <ArrowUp size={15} strokeWidth={2.4} />
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      </div>
+    </div>
+  );
 }
 
-function ActivityTrace({ trace }: { trace: TraceEvent[] }) {
-  const events = trace.slice(-12).reverse();
-  return <section className="activity-trace" aria-label="Agent 运行过程"><header><b>运行过程</b><small>来自运行时事件，不额外调用模型</small></header>{events.length ? <div className="activity-events">{events.map((event) => <article key={event.id} className={eventTone(event.kind)}><i/><div><b>{eventLabel(event.kind)}</b><span>{eventSummary(event)}</span></div><small>#{event.sequence}</small></article>)}</div> : <p>正在等待第一条运行事件…</p>}</section>;
+function ActivityTrace({
+  trace,
+  turn,
+  running = false,
+}: {
+  trace: TraceEvent[];
+  turn?: AgentTurn;
+  running?: boolean;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [running]);
+
+  const events = trace;
+  const startedAt = turn?.startedAt || events[0]?.createdAt;
+  const completedAt = turn?.completedAt || (!running ? events[events.length - 1]?.createdAt : undefined);
+  const elapsed = startedAt ? Math.max(0, (completedAt ? Date.parse(completedAt) : now) - Date.parse(startedAt)) : 0;
+  const steps = events.reduce((max, event) => {
+    const step = typeof event.details?.step === 'number' ? event.details.step : 0;
+    return Math.max(max, step);
+  }, 0);
+  const terminal = [...events].reverse().find((event) => event.kind.startsWith('turn.') && event.kind !== 'turn.started' && event.kind !== 'turn.cancel_requested');
+  const metrics = asRecord(terminal?.details?.metrics);
+  const liveTokenCount = events.reduce((sum, event) => {
+    if (event.kind !== 'model.completed') return sum;
+    const usage = asRecord(event.details?.usage);
+    return sum + (typeof usage.totalTokens === 'number' ? usage.totalTokens : 0);
+  }, 0);
+  const tokenCount = typeof metrics.totalTokens === 'number' ? metrics.totalTokens : liveTokenCount;
+  const status = running ? (turn?.status === 'cancelling' ? '正在停止' : '运行中') : turnStatusLabel(turn?.status || terminal?.kind || 'completed');
+  const toolRuns = buildToolRuns(events);
+
+  return (
+    <details className={`activity-trace ${running ? 'is-running' : ''}`}>
+      <summary>
+        <span className="run-summary-text">
+          {running && <span className="run-live-label">{status} · </span>}
+          用时 {formatDuration(elapsed)} · 消耗 {tokenCount > 0 ? formatCompactNumber(tokenCount) : '0'} tokens · {steps || 0} 步
+        </span>
+        <ChevronDown size={14} strokeWidth={1.8} className="run-chevron" aria-hidden="true" />
+      </summary>
+      <div className="activity-trace-body">
+        <div className="activity-trace-meta">
+          <span>{startedAt ? `${formatClock(startedAt)} 开始` : '等待运行时事件'}</span>
+          <span>{status} · 运行详情保存在本地会话中</span>
+        </div>
+        {toolRuns.length ? (
+          <div className="tool-runs">
+            {toolRuns.map((run) => <ToolRunDetail key={run.id} run={run} />)}
+          </div>
+        ) : events.length ? (
+          <div className="activity-events compact-events">
+            {events.filter((event) => event.kind === 'model.requested' || event.kind === 'model.completed' || event.kind.includes('failed')).map((event) => (
+              <article key={event.id} className={eventTone(event.kind)}>
+                <div className="activity-event-content">
+                  <div className="activity-event-title"><b>{eventLabel(event.kind)}</b><span>{eventSummary(event)}</span></div>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="activity-empty">正在等待第一条运行事件…</p>
+        )}
+      </div>
+    </details>
+  );
 }
 
-function RuntimePanel({ plugins, provider, messageCount, trace }: { plugins: Plugin[]; provider?: Provider; messageCount: number; trace: TraceEvent[] }) {
-  const running = plugins.filter((item) => item.state === 'running').length;
-  return <aside className="runtime-panel"><div className="panel-title"><div><span className="eyebrow">实时检查</span><h3>运行状态</h3></div><span className="live-dot">实时</span></div><div className="runtime-metric"><span>插件图</span><b>{running}<small> / {plugins.length} 个运行中</small></b><div className="meter"><i style={{width: plugins.length ? `${running/plugins.length*100}%` : '0%'}}/></div></div><div className="runtime-section"><p>当前模型</p>{provider ? <div className="model-card"><div className="model-icon">M</div><div><b>{provider.model}</b><small>{provider.name} · API</small></div><i>●</i></div> : <div className="muted-card">尚未配置模型服务</div>}</div><div className="runtime-section"><p>任务状态</p><dl><div><dt>阶段</dt><dd>{eventLabel(trace.at(-1)?.kind ?? (messageCount ? 'checkpointed' : 'idle'))}</dd></div><div><dt>消息</dt><dd>{messageCount}</dd></div><div><dt>策略</dt><dd>按需加载 / 版本固定</dd></div></dl></div>{!!trace.length && <div className="runtime-section trace-list"><p>最近轨迹</p>{trace.slice(-6).map((event) => <div className={eventTone(event.kind)} key={event.id}><i/><span>{eventLabel(event.kind)}</span><small>#{event.sequence}</small></div>)}</div>}<div className="runtime-section plugin-list"><p>插件图</p>{plugins.slice(0,6).map((item) => <div key={item.id}><i className={item.state}/><span>{item.id.replace('core.','').replace('.v1','')}</span><small>{item.version}</small></div>)}</div><div className="runtime-foot"><span>状态</span><b>本地 / 已加密</b></div></aside>;
+type ToolRun = {
+  id: string;
+  name: string;
+  step: number;
+  argumentsValue: unknown;
+  resultValue?: unknown;
+  durationMillis?: number;
+  ok?: boolean;
+};
+
+function buildToolRuns(events: TraceEvent[]): ToolRun[] {
+  const runs = new Map<string, ToolRun>();
+  for (const event of events) {
+    if (event.kind !== 'tool.started' && event.kind !== 'tool.completed') continue;
+    const id = textDetail(event.details, 'toolCallId') || event.id;
+    const current = runs.get(id) || {
+      id,
+      name: textDetail(event.details, 'name') || 'tool',
+      step: typeof event.details.step === 'number' ? event.details.step : 0,
+      argumentsValue: undefined,
+    };
+    if (event.kind === 'tool.started') current.argumentsValue = event.details.arguments;
+    if (event.kind === 'tool.completed') {
+      current.resultValue = event.details.result;
+      current.durationMillis = typeof event.details.durationMillis === 'number' ? event.details.durationMillis : undefined;
+      current.ok = event.details.ok !== false;
+    }
+    runs.set(id, current);
+  }
+  return [...runs.values()];
+}
+
+function ToolRunDetail({ run }: { run: ToolRun }) {
+  const args = asRecord(run.argumentsValue);
+  const rawResult = asRecord(run.resultValue);
+  const result = Object.prototype.hasOwnProperty.call(rawResult, 'result') ? rawResult.result : run.resultValue;
+  const resultRecord = asRecord(result);
+  const isShell = run.name === 'exec_command';
+  const command = typeof args.cmd === 'string' ? args.cmd : '';
+  const workdir = typeof args.workdir === 'string' ? args.workdir : '';
+  const stdout = typeof resultRecord.stdout === 'string' ? resultRecord.stdout : '';
+  const stderr = typeof resultRecord.stderr === 'string' ? resultRecord.stderr : '';
+  const exitCode = typeof resultRecord.exitCode === 'number' ? resultRecord.exitCode : undefined;
+
+  return (
+    <section className="tool-run">
+      <div className="tool-run-heading">
+        <span>{isShell ? 'Shell' : run.name}</span>
+        <small>第 {run.step || '—'} 步 · {run.ok === false ? '失败' : run.resultValue === undefined ? '运行中' : '完成'}{run.durationMillis !== undefined ? ` · ${formatDuration(run.durationMillis)}` : ''}</small>
+      </div>
+      {isShell ? (
+        <>
+          {workdir && <div className="tool-workdir">工作目录 {workdir}</div>}
+          {command && <pre className="tool-command"><span aria-hidden="true">$ </span>{command}</pre>}
+          {stdout && <OutputBlock label="输出" value={stdout} />}
+          {stderr && <OutputBlock label="错误输出" value={stderr} tone="error" />}
+          {exitCode !== undefined && <div className={`tool-exit ${exitCode === 0 ? '' : 'error'}`}>退出码 {exitCode}{resultRecord.outTruncated === true ? ' · 输出已截断' : ''}</div>}
+          {!command && run.argumentsValue !== undefined && <OutputBlock label="参数" value={formatTraceValue(run.argumentsValue)} />}
+          {!stdout && !stderr && run.resultValue !== undefined && exitCode === undefined && <OutputBlock label="反馈" value={formatTraceValue(result)} />}
+        </>
+      ) : (
+        <>
+          {run.argumentsValue !== undefined && <OutputBlock label="参数" value={formatTraceValue(run.argumentsValue)} />}
+          {run.resultValue !== undefined && <OutputBlock label="反馈" value={formatTraceValue(result)} tone={run.ok === false ? 'error' : undefined} />}
+        </>
+      )}
+    </section>
+  );
+}
+
+function OutputBlock({ label, value, tone }: { label: string; value: string; tone?: 'error' }) {
+  return (
+    <div className={`tool-output ${tone === 'error' ? 'error' : ''}`}>
+      <span>{label}</span>
+      <pre>{value}</pre>
+    </div>
+  );
+}
+
+function formatTraceValue(value: unknown) {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function textDetail(details: Record<string, unknown>, key: string) {
+  return typeof details?.[key] === 'string' ? (details[key] as string) : '';
+}
+
+function turnStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+	completed: '已完成',
+	incomplete: '未完成',
+    failed: '运行失败',
+    cancelled: '已停止',
+    needs_reconciliation: '等待确认',
+	'turn.completed': '已完成',
+	'turn.incomplete': '未完成',
+    'turn.failed': '运行失败',
+    'turn.cancelled': '已停止',
+    'turn.needs_reconciliation': '等待确认',
+  };
+  return labels[status] || '已结束';
+}
+
+function formatDuration(milliseconds: number) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 1000) return `${Math.max(0, Math.round(milliseconds))} ms`;
+  const seconds = Math.floor(milliseconds / 1000);
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${minutes} 分 ${rest} 秒`;
+}
+
+function formatCompactNumber(value: number) {
+  return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
+
+function formatClock(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(date);
 }
 
 function eventLabel(value: string) {
   const labels: Record<string, string> = {
-    idle: '空闲', checkpointed: '已保存', 'turn.started': '任务开始', 'turn.completed': '任务完成',
-    'turn.failed': '任务失败', 'turn.cancelled': '任务已取消', 'turn.needs_reconciliation': '等待确认',
-    'model.requested': '正在请求模型', 'model.started': '模型调用', 'model.completed': '模型完成', 'model.failed': '模型调用失败',
-    'planner.requested': '正在请求规划', 'planner.completed': '规划完成', 'planner.failed': '规划失败',
-    'tools.dispatched': '准备调用工具', 'tools.completed': '工具批次完成', 'tool.started': '工具调用', 'tool.completed': '工具完成',
-    'context.compacted': '上下文已压缩', 'provider.compatibility_warning': '模型兼容性提示',
+    idle: '空闲',
+    checkpointed: '已保存',
+    'turn.started': '任务开始',
+	'turn.completed': '任务完成',
+	'turn.incomplete': '达到步数上限',
+    'turn.failed': '任务失败',
+    'turn.cancelled': '任务已取消',
+    'turn.cancel_requested': '正在停止任务',
+    'turn.needs_reconciliation': '等待确认',
+    'model.requested': '正在请求模型',
+    'model.started': '模型调用',
+    'model.completed': '模型完成',
+    'model.failed': '模型调用失败',
+    'planner.requested': '正在请求规划',
+    'planner.completed': '规划完成',
+    'planner.failed': '规划失败',
+    'tools.dispatched': '准备调用工具',
+    'tools.completed': '工具批次完成',
+    'tool.started': '工具调用',
+    'tool.completed': '工具完成',
+    'context.compacted': '上下文已压缩',
+    'provider.compatibility_warning': '模型兼容性提示',
+    'loop.step_limit_reached': '达到步骤上限',
   };
   return labels[value] ?? value;
 }
@@ -212,219 +1993,46 @@ function eventTone(kind: string) {
 
 function eventSummary(event: TraceEvent) {
   const details = event.details ?? {};
-  const number = (key: string) => typeof details[key] === 'number' ? details[key] as number : undefined;
-  const text = (key: string) => typeof details[key] === 'string' ? details[key] as string : '';
+  const number = (key: string) => (typeof details[key] === 'number' ? (details[key] as number) : undefined);
+  const text = (key: string) => (typeof details[key] === 'string' ? (details[key] as string) : '');
   const step = number('step');
-  if (event.kind === 'model.requested') return `第 ${step ?? 1} 步 · ${number('messageCount') ?? 0} 条上下文 · ${number('toolDefinitionCount') ?? 0} 个可用工具`;
-  if (event.kind === 'model.completed') return `第 ${step ?? 1} 步 · ${number('toolCallCount') ?? 0} 个工具调用 · 输出 ${number('contentBytes') ?? 0} 字节`;
-  if (event.kind === 'model.failed' || event.kind === 'planner.failed' || event.kind === 'turn.failed') return text('error') || '运行时未返回详细错误';
-  if (event.kind === 'tool.started') return `${text('name') || '未命名工具'} · 第 ${step ?? 1} 步`;
-  if (event.kind === 'tool.completed') return `${text('name') || '未命名工具'} · ${details.ok === false ? '执行失败' : '执行成功'} · ${number('durationMillis') ?? 0} ms`;
-  if (event.kind === 'tools.dispatched' || event.kind === 'tools.completed') return `第 ${step ?? 1} 步 · ${number('toolCallCount') ?? 0} 个工具`;
-  if (event.kind === 'context.compacted') return `省略 ${number('omittedMessages') ?? 0} 条较早消息`;
+  if (event.kind === 'model.requested')
+    return `第 ${step ?? 1} 步 · ${number('messageCount') ?? 0} 条上下文 · ${number('toolDefinitionCount') ?? 0} 个可用工具`;
+  if (event.kind === 'model.completed')
+    return typeof details.durationMillis === 'number'
+      ? `第 ${step ?? 1} 步 · ${number('toolCallCount') ?? 0} 个工具调用 · ${formatDuration(number('durationMillis') ?? 0)}`
+      : `第 ${step ?? 1} 步 · ${number('toolCallCount') ?? 0} 个工具调用 · 输出 ${number('contentBytes') ?? 0} 字节`;
+  if (event.kind === 'model.failed' || event.kind === 'planner.failed' || event.kind === 'turn.failed')
+    return text('error') || '运行时未返回详细错误';
+  if (event.kind === 'tool.started') {
+    const argumentsRecord = asRecord(details.arguments);
+    const command = typeof argumentsRecord.cmd === 'string' ? argumentsRecord.cmd : '';
+    return command ? shortenLine(command, 180) : `${text('name') || '未命名工具'} · 第 ${step ?? 1} 步`;
+  }
+  if (event.kind === 'tool.completed')
+    return `${text('name') || '未命名工具'} · ${details.ok === false ? '执行失败' : '执行成功'} · ${number('durationMillis') ?? 0} ms`;
+  if (event.kind === 'tools.dispatched' || event.kind === 'tools.completed')
+    return `第 ${step ?? 1} 步 · ${number('toolCallCount') ?? 0} 个工具`;
+	if (event.kind === 'context.compacted') {
+	  if (details.scope === 'turn') {
+		return `本轮工具轨迹由 ${formatCompactNumber(number('originalChars') ?? 0)} 字符压缩到 ${formatCompactNumber(number('compactedChars') ?? 0)} 字符`;
+	  }
+	  return `已压缩提炼 ${number('compactedMessages') || number('omittedMessages') || 0} 条早期对话记忆，保留最新 ${number('retainedMessages') ?? 0} 条`;
+	}
   if (event.kind === 'provider.compatibility_warning') return text('message') || text('code') || '供应商兼容性提示';
   if (event.kind === 'turn.started') return `${number('messageCount') ?? 0} 条消息 · ${number('pinnedTools') ?? 0} 个固定工具`;
-  if (event.kind === 'turn.completed') return '结果已经保存到当前对话';
+	if (event.kind === 'turn.completed') {
+    const metrics = asRecord(details.metrics);
+    const duration = typeof metrics.durationMillis === 'number' ? metrics.durationMillis : 0;
+    return duration > 0 ? `结果已保存 · 总耗时 ${formatDuration(duration)}` : '结果已经保存到当前对话';
+	}
+	if (event.kind === 'turn.incomplete') return '已保存当前总结，但任务尚未完成';
+  if (event.kind === 'turn.cancel_requested') return '正在等待当前操作安全结束';
   if (event.kind === 'turn.cancelled') return '用户停止了当前任务';
   return step ? `第 ${step} 步` : '运行状态已更新';
 }
 
-function stateLabel(value: string) {
-  const labels: Record<string, string> = {
-    proposed: '待生成', generating: '生成中', generation_failed: '生成失败', generated: '已生成',
-    building: '构建中', build_failed: '构建失败', tested: '验证通过', awaiting_approval: '等待批准',
-    approved: '已批准', installed: '已安装', active: '运行中', inactive: '已停用', activation_failed: '启用失败',
-    queued: '排队中', running: '运行中', completed: '已完成', failed: '失败', candidate: '候选', stable: '稳定', superseded: '已替代',
-  };
-  return labels[value] ?? value.replaceAll('_', ' ');
-}
-
-function PluginCenter({ onClose }: { onClose: () => void }) {
-  const [projects, setProjects] = useState<ForgeProject[]>([]);
-  const [installations, setInstallations] = useState<Installation[]>([]);
-  const [surfaces, setSurfaces] = useState<SurfaceState[]>([]);
-  const [selectedId, setSelectedId] = useState<string>('');
-  const [busy, setBusy] = useState<string>('');
-  const [error, setError] = useState('');
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-
-  const refresh = useCallback(async () => {
-    const [nextProjects, nextInstallations, nextSurfaces] = await Promise.all([
-      request<ForgeProject[]>('/plugin-forge/projects'),
-      request<Installation[]>('/plugin-runtime/installations'),
-      request<SurfaceState[]>('/plugin-runtime/surfaces'),
-    ]);
-    setProjects(nextProjects); setInstallations(nextInstallations); setSurfaces(nextSurfaces);
-    setSelectedId((current) => current || nextProjects[0]?.id || '');
-  }, []);
-
-  useEffect(() => {
-    void Promise.all([
-      request<ForgeProject[]>('/plugin-forge/projects'),
-      request<Installation[]>('/plugin-runtime/installations'),
-      request<SurfaceState[]>('/plugin-runtime/surfaces'),
-    ]).then(([nextProjects, nextInstallations, nextSurfaces]) => {
-      setProjects(nextProjects); setInstallations(nextInstallations); setSurfaces(nextSurfaces);
-      setSelectedId(nextProjects[0]?.id || '');
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : '无法加载插件'));
-  }, []);
-  const selected = projects.find((project) => project.id === selectedId) ?? projects[0];
-  const installation = installations.find((item) => item.projectId === selected?.id && item.status === 'active');
-
-  useEffect(() => {
-    async function bridge(event: MessageEvent) {
-      if (event.source !== iframeRef.current?.contentWindow || (event.origin !== 'null' && event.origin !== ASSET_ORIGIN) || !selected?.latestRelease) return;
-      const data = event.data as { type?: string; id?: string; operation?: string; serviceId?: string; capabilitySuffix?: string; input?: unknown };
-      const legacy = data.type === 'axiom.plugin.invoke';
-      if (!data.id || (legacy ? !data.capabilitySuffix : data.type !== 'axiom.ui.call' || (!data.operation && !data.serviceId))) return;
-      try {
-        const endpoint = legacy
-          ? `/plugin-runtime/ui/${encodeURIComponent(selected.latestRelease.pluginId)}/legacy-invoke`
-          : data.serviceId
-            ? `/plugin-runtime/ui/${encodeURIComponent(selected.latestRelease.pluginId)}/services/${encodeURIComponent(data.serviceId)}/call`
-            : `/plugin-runtime/ui/${encodeURIComponent(selected.latestRelease.pluginId)}/call`;
-        const body = legacy ? { capabilitySuffix: data.capabilitySuffix, input: data.input ?? {} } : data.serviceId ? { input: data.input ?? {} } : { operation: data.operation, input: data.input ?? {} };
-        const result = await request<{ output: unknown }>(endpoint, { method: 'POST', body: JSON.stringify(body) });
-        iframeRef.current?.contentWindow?.postMessage({ type: legacy ? 'axiom.plugin.result' : 'axiom.ui.result', id: data.id, output: result.output }, '*');
-      } catch (reason) {
-        iframeRef.current?.contentWindow?.postMessage({ type: legacy ? 'axiom.plugin.result' : 'axiom.ui.result', id: data.id, error: reason instanceof Error ? reason.message : '界面调用失败' }, '*');
-      }
-    }
-    window.addEventListener('message', bridge);
-    return () => window.removeEventListener('message', bridge);
-  }, [selected]);
-
-  async function create(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy('create'); setError('');
-    const form = new FormData(event.currentTarget);
-    try {
-      const project = await request<ForgeProject>('/plugin-forge/projects', { method: 'POST', body: JSON.stringify(Object.fromEntries(form)) });
-      setProjects((items) => [project, ...items]); setSelectedId(project.id); event.currentTarget.reset();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法创建插件'); }
-    finally { setBusy(''); }
-  }
-
-  async function act(project: ForgeProject, action: string) {
-    setBusy(`${project.id}:${action}`); setError('');
-    try {
-      await request(`/plugin-forge/projects/${project.id}/${action}`, { method: 'POST' });
-      await refresh();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '插件操作失败'); await refresh().catch(() => undefined); }
-    finally { setBusy(''); }
-  }
-
-  async function rollback(project: ForgeProject, releaseId: string) {
-    setBusy(`${project.id}:rollback`); setError('');
-    try {
-      await request(`/plugin-forge/projects/${project.id}/rollback`, { method: 'POST', body: JSON.stringify({ releaseId }) });
-      await refresh();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '回退失败'); }
-    finally { setBusy(''); }
-  }
-
-  const nextAction = selected ? forgeAction(selected.state) : null;
-  const permissions = selected?.latestRelease?.manifest.permissions;
-  const selectedSurfaces = surfaces.filter((surface) => surface.pluginId === selected?.latestRelease?.pluginId && surface.releaseId === installation?.activeReleaseId);
-  const permissionChanged = !!selected?.releases?.[1] && selected.releases[0].permissionHash !== selected.releases[1].permissionHash;
-  return <div className="modal-backdrop forge-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="forge-modal">
-    <header className="forge-header"><div><span className="eyebrow">系统 / 插件工坊</span><h2>安全地构建新能力</h2><p>每个插件都拥有独立 Git 项目，经过验证和你的批准后，才会作为隔离版本加载。</p></div><button onClick={onClose}>×</button></header>
-    <div className="forge-layout"><aside className="forge-rail"><form onSubmit={create} className="forge-create"><label>插件名称<input name="name" placeholder="工作区检查器" required /></label><label>插件形态<select name="shape" defaultValue="hybrid"><option value="hybrid">全栈界面 + Agent 工具</option><option value="agent-tool">Agent 工具</option><option value="ui">界面扩展</option><option value="service">后端服务</option><option value="skill">按需加载的 Skill</option></select></label><label>它需要做什么？<textarea name="description" placeholder="描述一个具体能力…" required /></label><button disabled={busy === 'create'}>{busy === 'create' ? '正在创建…' : '创建提案'} <span>＋</span></button></form><div className="forge-projects"><p className="eyebrow">项目</p>{projects.length === 0 ? <div className="forge-empty">还没有插件项目。</div> : projects.map((project) => <button key={project.id} className={project.id === selected?.id ? 'active' : ''} onClick={() => setSelectedId(project.id)}><i className={`state-${project.state}`}/><span><b>{project.name}</b><small>{stateLabel(project.state)}</small></span><em>›</em></button>)}</div></aside>
-      <div className="forge-stage">{selected ? <><div className="forge-title"><div><span className="eyebrow">{selected.latestRelease?.pluginId ?? `草稿 / ${selected.slug}`}</span><h3>{selected.name}</h3><p>{selected.description}</p></div><span className={`forge-state state-${selected.state}`}>{stateLabel(selected.state)}</span></div>
-        <div className="forge-pipeline">{['proposed','generated','tested','approved','active'].map((state, index) => <div key={state} className={pipelineReached(selected.state, state) ? 'reached' : ''}><span>{index + 1}</span><b>{stateLabel(state)}</b></div>)}</div>
-        {!!selectedSurfaces.length && <section className="surface-strip"><span><b className="eyebrow">已加载能力面</b><small>版本 {installation?.activeReleaseId.slice(0, 12)} · 注册表 {Math.max(...selectedSurfaces.map((item) => item.registryEpoch))}</small></span><div>{selectedSurfaces.map((surface) => <em className={`surface-${surface.status}`} title={`${surface.surfaceId} · ${surfacePrincipal(surface.kind)}`} key={`${surface.kind}:${surface.surfaceId}`}>{surfaceKindLabel(surface.kind)} · {stateLabel(surface.status)}</em>)}</div></section>}
-        {selected.lastError && <div className="forge-error"><b>上次运行失败</b><span>{selected.lastError}</span></div>}
-        {permissions && <section className="permission-card"><div><span><b className="eyebrow">权限契约</b><small>{selected.latestRelease?.permissionHash.slice(0, 16)} · {permissionChanged ? '相较上一版本有变化' : '与当前版本绑定'}</small></span><h4>需要用户批准</h4></div><div className="permission-grid"><Permission label="读取工作区" enabled={permissions.filesystem?.read?.includes('${workspace}') ?? false}/><Permission label="写入插件数据" enabled={permissions.filesystem?.write?.includes('${pluginData}') ?? false}/><Permission label="后台任务" enabled={permissions.background ?? false}/><Permission label={`网络：${permissions.network?.length ? permissions.network.join(', ') : '禁止'}`} enabled={(permissions.network?.length ?? 0) > 0}/><Permission label={`密钥：${permissions.secrets?.length ? permissions.secrets.join(', ') : '无'}`} enabled={(permissions.secrets?.length ?? 0) > 0}/></div></section>}
-        {selected.state === 'active' && selected.releases?.length > 1 && <section className="release-history"><span className="eyebrow">不可变版本</span>{selected.releases.map((release) => <div key={release.id}><span><b>{release.version} · {release.sourceVersion}</b><small>{release.digest.slice(0, 12)}</small></span>{installation?.activeReleaseId === release.id ? <em>当前版本</em> : <button onClick={() => rollback(selected, release.id)} disabled={busy !== ''}>回退</button>}</div>)}</section>}
-        {installation && selected.latestRelease?.manifest.ui ? <section className="plugin-preview"><div className="preview-bar"><span><i/> 实时 · {selected.latestRelease.version}</span><small>沙箱界面 · 版本固定</small></div><iframe ref={iframeRef} title={`${selected.name} 插件`} sandbox="allow-scripts" src={`${API}/plugin-assets/${installation.activeReleaseId}/${selected.latestRelease.manifest.ui.entry.split('/').pop()}`} /></section> : <section className="forge-wait"><span>{selected.state === 'proposed' ? '◇' : '◌'}</span><h4>{forgeGuidance(selected.state).title}</h4><p>{selected.state === 'active' && !selected.latestRelease?.manifest.ui ? `插件已加载但没有界面。当前能力面：${selectedSurfaces.map((item) => surfaceKindLabel(item.kind)).join('、') || '无'}。` : forgeGuidance(selected.state).body}</p></section>}
-        <div className="forge-actions"><div><span className="eyebrow">下一步</span><small>未经批准，不会安装插件或扩大权限。</small></div><div className="forge-action-buttons">{selected.state === 'active' && <button className="secondary" onClick={() => act(selected, 'revise')} disabled={busy !== ''}>创建更新</button>}{nextAction && <button onClick={() => act(selected, nextAction.action)} disabled={busy !== ''}>{busy.startsWith(selected.id) ? '处理中…' : nextAction.label}<span>→</span></button>}</div></div>
-      </> : <div className="forge-wait"><span>◇</span><h4>定义第一个能力</h4><p>先创建提案；只有在你明确操作后，系统才会开始生成。</p></div>}</div>
-    </div>{error && <div className="forge-toast">{error}</div>}
-  </section></div>;
-}
-
-function Permission({ label, enabled }: { label: string; enabled: boolean }) { return <div className={enabled ? 'enabled' : ''}><i>{enabled ? '✓' : '—'}</i><span>{label}</span></div>; }
-function surfacePrincipal(kind: string) { return kind === 'ui' ? '界面权限域' : kind === 'tool' || kind === 'skill' ? 'Agent 权限域' : '宿主权限域'; }
-function surfaceKindLabel(kind: string) {
-  return ({ ui: '界面', tool: '工具', skill: 'Skill', service: '服务', hook: '钩子', job: '任务' } as Record<string, string>)[kind] ?? kind;
-}
-function forgeAction(state: string): { action: string; label: string } | null {
-  if (state === 'proposed' || state === 'generation_failed') return { action: 'generate', label: '生成源码' };
-  if (state === 'generated' || state === 'build_failed') return { action: 'build', label: '构建并测试' };
-  if (state === 'tested') return { action: 'request-approval', label: '检查权限' };
-  if (state === 'awaiting_approval') return { action: 'approve', label: '批准此版本' };
-  if (state === 'approved' || state === 'installed' || state === 'inactive' || state === 'activation_failed') return { action: 'install', label: state === 'inactive' ? '启用插件' : '安装并启用' };
-  if (state === 'active') return { action: 'deactivate', label: '停用插件' };
-  return null;
-}
-function pipelineReached(current: string, target: string) {
-  const order = ['proposed','generating','generated','building','tested','awaiting_approval','approved','installed','active'];
-  const normalized = current.includes('failed') ? current.replace('_failed', '') : current;
-  return order.indexOf(normalized) >= order.indexOf(target);
-}
-function forgeGuidance(state: string) {
-  const copy: Record<string, { title: string; body: string }> = {
-    proposed: { title: '提案已准备', body: '生成拥有独立 Git 历史的完整插件源码。' },
-    generated: { title: '源码已生成', body: '源码独立于 O 核心；构建和测试将产出不可变版本。' },
-    tested: { title: '验证已通过', body: '开放批准操作前，请检查插件申请的权限契约。' },
-    awaiting_approval: { title: '等待你的批准', body: '批准结果只对当前版本摘要和权限摘要有效。' },
-    approved: { title: '版本已批准', body: '安装时会启动候选 Sidecar、完成健康检查，再原子加载全部能力。' },
-    inactive: { title: '插件已停用', body: '版本仍保留在本地，无需重新构建即可再次启用。' },
-  };
-  return copy[state] ?? { title: '正在处理', body: 'O 正在保留当前状态和完整审计记录。' };
-}
-
-function Settings({ providers, onClose, onSaved }: { providers: Provider[]; onClose: () => void; onSaved: (provider: Provider) => void }) {
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState('');
-  const [editing, setEditing] = useState<Provider | null>(providers[0] ?? null);
-  const [kinds, setKinds] = useState<ProviderKind[]>([]);
-  const defaultName = useMemo(() => providers.length ? `模型服务 ${providers.length + 1}` : '主模型', [providers.length]);
-
-  useEffect(() => {
-    request<ProviderKind[]>('/provider-kinds').then(setKinds).catch((error) => setStatus(error instanceof Error ? error.message : '无法加载模型协议'));
-  }, []);
-
-  async function save(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true); setStatus('');
-    const form = new FormData(event.currentTarget);
-    try {
-      const saved = await request<Provider>(editing ? `/providers/${editing.id}` : '/providers', { method: editing ? 'PUT' : 'POST', body: JSON.stringify(Object.fromEntries(form)) });
-      onSaved(saved); setEditing(saved); setStatus('模型服务已保存，请运行连接测试确认 API Key 和模型 ID。');
-    } catch (error) { setStatus(error instanceof Error ? error.message : '无法保存模型服务'); }
-    finally { setBusy(false); }
-  }
-
-  async function test(id: string) {
-    setStatus('正在测试连接…');
-    try { await request(`/providers/${id}/test`, { method: 'POST' }); setStatus('连接正常。'); }
-    catch (error) { setStatus(error instanceof Error ? error.message : '连接失败'); }
-  }
-
-  function selectKind(event: ChangeEvent<HTMLSelectElement>) {
-    if (editing) return;
-    const selected = kinds.find((item) => item.kind === event.target.value);
-    const base = event.currentTarget.form?.elements.namedItem('baseUrl');
-    if (selected && base instanceof HTMLInputElement) base.value = selected.defaultBaseUrl;
-  }
-
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="settings-modal">
-      <header><div><span className="eyebrow">系统 / 模型服务</span><h2>模型连接</h2></div><button onClick={onClose}>×</button></header>
-      <p className="modal-lead">请选择供应商实际支持的 API 协议。凭证由本地 Go Host 加密保存，不会返回浏览器。</p>
-      {!!providers.length && <div className="provider-list">{providers.map((item) => <div key={item.id}><span className="model-icon">M</span><div><b>{item.name}</b><small>{item.model} · {item.kind}</small></div><div className="provider-actions"><button onClick={() => { setEditing(item); setStatus(''); }}>编辑</button><button onClick={() => test(item.id)}>测试</button></div></div>)}</div>}
-      <form key={editing?.id ?? 'new'} onSubmit={save} className="provider-form">
-        <p>{editing ? '编辑模型连接' : '添加模型连接'}</p>
-        <div className="form-grid">
-          <label>API 协议<select name="kind" defaultValue={editing?.kind ?? 'openai-responses'} onChange={selectKind} required>{kinds.length ? kinds.map((item) => <option key={item.kind} value={item.kind}>{item.label}</option>) : <option value={editing?.kind ?? 'openai-responses'}>{editing?.kind ?? '正在加载协议…'}</option>}</select></label>
-          <label>连接名称<input name="name" defaultValue={editing?.name ?? defaultName} required /></label>
-          <label className="wide">模型 ID<input name="model" defaultValue={editing?.model ?? ''} placeholder="gpt-5 / claude-sonnet / deepseek-chat" required /></label>
-          <label className="wide">基础 URL<input name="baseUrl" defaultValue={editing?.baseUrl ?? 'https://api.openai.com/v1'} required /></label>
-          <label className="wide">API KEY<input name="apiKey" type="password" placeholder={editing ? '留空以继续使用现有密钥' : '输入 API Key'} required={!editing} /></label>
-        </div>
-        {status && <div className="form-status">{status}</div>}
-        <button className="primary-button" disabled={busy}>{busy ? '正在加密保存…' : editing ? '更新连接' : '保存连接'}<span>→</span></button>
-        {editing && <button type="button" className="text-button" onClick={() => { setEditing(null); setStatus(''); }}>添加另一个模型服务</button>}
-      </form>
-    </section>
-  </div>;
+function shortenLine(value: string, maxLength: number) {
+  const oneLine = value.replace(/\s+/g, ' ').trim();
+  return oneLine.length > maxLength ? `${oneLine.slice(0, maxLength)}…` : oneLine;
 }

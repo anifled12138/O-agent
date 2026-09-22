@@ -3,12 +3,19 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "dev": "npm --prefix desktop run dev",
+    "start": "npm --prefix desktop run dev",
     "dev:web": "npm --prefix frontend run dev",
     "dev:desktop": "npm --prefix desktop run dev",
     "build:web": "npm --prefix frontend run build",
     "build:desktop": "npm --prefix desktop run package",
     "lint:web": "npm --prefix frontend run lint",
     "audit:web": "npm --prefix frontend audit --audit-level=high",
-    "audit:desktop": "npm --prefix desktop audit --audit-level=high"
+    "audit:desktop": "npm --prefix desktop audit --audit-level=high",
+    "package": "node scripts/package.mjs",
+    "package:fast": "node scripts/package.mjs --fast",
+    "package:ui": "node scripts/package.mjs --ui",
+    "package:backend": "node scripts/package.mjs --backend",
+    "package:clean": "node scripts/package.mjs --clean"
   }
 }

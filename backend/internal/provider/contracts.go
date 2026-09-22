@@ -8,10 +8,14 @@ import (
 )
 
 const (
+	KindNewAPI            = "new-api"
+	KindOneAPI            = "one-api"
 	KindOpenAICompatible  = "openai-compatible"
 	KindOpenAIResponses   = "openai-responses"
 	KindAnthropicMessages = "anthropic-messages"
 	KindDeepSeekChat      = "deepseek-chat"
+	KindOllama            = "ollama"
+	KindVLLM              = "vllm"
 )
 
 type SupportLevel string
@@ -42,9 +46,12 @@ type KindDescriptor struct {
 
 func Kinds() []KindDescriptor {
 	return []KindDescriptor{
+		{Kind: KindNewAPI, Label: "New-API / One-API", Description: "Universal open-source LLM router / gateway with unified OpenAI completions format.", DefaultBaseURL: "http://127.0.0.1:3000/v1", Capabilities: ModelCapabilities{Tools: SupportYes, ParallelToolCalls: SupportYes, Streaming: SupportYes, Vision: SupportYes, StrictJSONSchema: SupportYes, ReasoningControl: SupportYes, PromptCaching: SupportYes}},
 		{Kind: KindOpenAIResponses, Label: "OpenAI Responses", Description: "OpenAI's Responses API with native function calls.", DefaultBaseURL: "https://api.openai.com/v1", Capabilities: ModelCapabilities{Tools: SupportYes, ParallelToolCalls: SupportYes, Streaming: SupportYes, Vision: SupportYes, StrictJSONSchema: SupportYes, ReasoningControl: SupportYes, PromptCaching: SupportYes}},
 		{Kind: KindAnthropicMessages, Label: "Anthropic Messages", Description: "Anthropic Messages API with tool_use and tool_result blocks.", DefaultBaseURL: "https://api.anthropic.com/v1", Capabilities: ModelCapabilities{Tools: SupportYes, ParallelToolCalls: SupportYes, Streaming: SupportYes, Vision: SupportYes, StrictJSONSchema: SupportUnknown, ReasoningControl: SupportYes, PromptCaching: SupportYes}},
 		{Kind: KindDeepSeekChat, Label: "DeepSeek Chat", Description: "DeepSeek's OpenAI-compatible chat API with conservative defaults.", DefaultBaseURL: "https://api.deepseek.com/v1", Capabilities: ModelCapabilities{Tools: SupportYes, ParallelToolCalls: SupportUnknown, Streaming: SupportYes, Vision: SupportNo, StrictJSONSchema: SupportUnknown, ReasoningControl: SupportUnknown, PromptCaching: SupportYes}},
+		{Kind: KindOllama, Label: "Ollama", Description: "Local open-source models via Ollama (Llama, Qwen, DeepSeek).", DefaultBaseURL: "http://127.0.0.1:11434/v1", Capabilities: ModelCapabilities{Tools: SupportYes, ParallelToolCalls: SupportUnknown, Streaming: SupportYes, Vision: SupportYes, StrictJSONSchema: SupportUnknown, ReasoningControl: SupportUnknown, PromptCaching: SupportUnknown}},
+		{Kind: KindVLLM, Label: "vLLM / LocalAI", Description: "High-throughput open-source LLM inference serving OpenAI-compatible endpoints.", DefaultBaseURL: "http://127.0.0.1:8000/v1", Capabilities: ModelCapabilities{Tools: SupportYes, ParallelToolCalls: SupportYes, Streaming: SupportYes, Vision: SupportUnknown, StrictJSONSchema: SupportUnknown, ReasoningControl: SupportUnknown, PromptCaching: SupportUnknown}},
 		{Kind: KindOpenAICompatible, Label: "OpenAI-compatible", Description: "A custom endpoint implementing the Chat Completions wire format.", DefaultBaseURL: "http://127.0.0.1:8000/v1", Capabilities: ModelCapabilities{Tools: SupportUnknown, ParallelToolCalls: SupportUnknown, Streaming: SupportUnknown, Vision: SupportUnknown, StrictJSONSchema: SupportUnknown, ReasoningControl: SupportUnknown, PromptCaching: SupportUnknown}},
 	}
 }
@@ -53,12 +60,18 @@ func normalizeKind(value string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", KindOpenAICompatible, "openai-chat", "openai-chat-completions":
 		return KindOpenAICompatible, true
+	case KindNewAPI, "newapi", KindOneAPI, "oneapi":
+		return KindNewAPI, true
 	case KindOpenAIResponses, "responses":
 		return KindOpenAIResponses, true
 	case KindAnthropicMessages, "anthropic":
 		return KindAnthropicMessages, true
 	case KindDeepSeekChat, "deepseek":
 		return KindDeepSeekChat, true
+	case KindOllama:
+		return KindOllama, true
+	case KindVLLM, "localai":
+		return KindVLLM, true
 	default:
 		return "", false
 	}

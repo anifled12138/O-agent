@@ -1,4 +1,4 @@
-const { contextBridge } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
 
 const prefix = '--o-api-origin=';
 const rawOrigin = process.argv.find((value) => value.startsWith(prefix))?.slice(prefix.length) ?? '';
@@ -8,4 +8,6 @@ contextBridge.exposeInMainWorld('oDesktop', Object.freeze({
   apiOrigin,
   platform: process.platform,
   version: process.versions.electron,
+  copyText: (text) => ipcRenderer.invoke('o-clipboard-write', text),
+  selectDirectory: (options) => ipcRenderer.invoke('o-select-directory', options),
 }));

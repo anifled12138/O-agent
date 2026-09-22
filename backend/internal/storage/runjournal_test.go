@@ -63,6 +63,30 @@ func TestRunJournalCommitsInputEventsAndOutputAtomically(t *testing.T) {
 	}
 }
 
+func TestRunJournalPersistsStepLimitAsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	store, userID, conversation, generation := runJournalFixture(t, "incomplete")
+	defer store.Close()
+	now := time.Now().UTC()
+	input := domain.Message{ID: "msg_incomplete_input", ConversationID: conversation.ID, Role: "user", Content: "long task", CreatedAt: now}
+	turn := domain.AgentTurn{ID: "turn_incomplete", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
+	if err := store.StartAgentTurn(ctx, userID, turn, input, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	output := domain.Message{ID: "msg_incomplete_output", ConversationID: conversation.ID, Role: "assistant", Content: "partial summary", CreatedAt: now.Add(time.Second)}
+	if err := store.FinishAgentTurn(ctx, userID, turn.ID, "incomplete", "step_limit", &output, json.RawMessage(`{"metrics":{"reachedStepLimit":true}}`)); err != nil {
+		t.Fatal(err)
+	}
+	turns, err := store.AgentTurns(ctx, userID, conversation.ID)
+	if err != nil || len(turns) != 1 || turns[0].Status != "incomplete" || turns[0].StopReason != "step_limit" {
+		t.Fatalf("incomplete turn projection = %#v, %v", turns, err)
+	}
+	events, err := store.TurnEvents(ctx, userID, turn.ID, 0)
+	if err != nil || events[len(events)-1].Kind != "turn.incomplete" {
+		t.Fatalf("incomplete terminal event = %#v, %v", events, err)
+	}
+}
+
 func TestRunJournalRecoveryDoesNotReplayUnknownToolEffects(t *testing.T) {
 	ctx := context.Background()
 	store, userID, conversation, generation := runJournalFixture(t, "recovery")

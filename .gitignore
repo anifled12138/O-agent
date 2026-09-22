@@ -1,17 +1,85 @@
+# Dependencies
+node_modules/
+*/node_modules/
 .npm-cache/
-frontend/node_modules/
+.pnpm-store/
+pnpm-lock.yaml
+
+# Next.js & Frontend Build Outputs
 frontend/.next/
+frontend/.vinext/
+frontend/.wrangler/
 frontend/dist/
 frontend/dist-desktop/
-desktop/node_modules/
-desktop/.runtime/
+frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
+dist/
+out/
+build/
 release/
-frontend/.wrangler/
-backend/data/
+
+# Desktop / Electron Runtime
+desktop/.runtime/
+desktop/dist/
+
+# Go Toolchains, Modules & Build Artifacts
+.gocache/
+.gomodcache/
+.gopath/
+.cache/
 backend/axiom.exe
+backend/o-host.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Local Runtime Data & Storage
 data/
 work/
-*.log
+backend/data/
+backend/work/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Environment & Secrets
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+
+# Agent Runtime & Scratchpad
+.axiom/
+.tmp/
+tmp/
+temp/
+*.b64
+.run.py
+.check_prompt.py
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.user
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json

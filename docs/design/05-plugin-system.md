@@ -89,16 +89,17 @@ Host 提供按 user/plugin 隔离的 storage namespace。进程和 UI 都不是�
 ```text
 Capability gap -> PluginSpec -> threat model -> isolated Git repo
  -> generate -> tests/conformance -> build immutable Release
- -> behavior/permission diff -> user grant -> canary -> activate
+ -> behavior/permission diff -> install grant -> canary -> activate
 ```
 
-Agent 可以自动完成 grant 之前的全部步骤，也可以在既有 standing policy 范围内更新
-不增加权限的普通能力；它不能批准新增权限或直接写活动路由。
+本地单用户产品不再暴露独立 approve 步骤。“安装并启用”是唯一显式授权边界：
+用户执行安装即确认当前 Release 摘要绑定的权限契约。Agent 不能绕过安装边界或直接写活动路由。
 
 ## PluginSpec
 
 生成代码前必须包含：目标、非目标、输入输出、Surface、Effect、权限理由、依赖、数据、
-失败语义、测试、UI Slot 和升级策略。实现新增 Surface/权限/依赖时，Spec 和批准失效。
+失败语义、测试、UI Slot 和升级策略。实现新增 Surface/权限/依赖时，既有安装授权失效，
+必须针对新的 Release 再次执行“安装并启用”。
 
 ## Conformance
 
