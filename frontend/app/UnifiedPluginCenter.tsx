@@ -34,6 +34,11 @@ export default function UnifiedPluginCenter({
   const [busy, setBusy] = useState<string>('');
   const [error, setError] = useState<string>('');
   const [showAddMcp, setShowAddMcp] = useState<boolean>(false);
+  const [removeConfirmationMcp, setRemoveConfirmationMcp] = useState('');
+  const [removeMcpConsent, setRemoveMcpConsent] = useState(false);
+  const [enableConfirmationMcp, setEnableConfirmationMcp] = useState('');
+  const [enableMcpConsent, setEnableMcpConsent] = useState(false);
+  const [mcpLaunchConsent, setMcpLaunchConsent] = useState(false);
 
   // Form states for adding MCP
   const [mcpId, setMcpId] = useState('');
@@ -42,12 +47,19 @@ export default function UnifiedPluginCenter({
   const [mcpArgs, setMcpArgs] = useState('');
   const [mcpEnv, setMcpEnv] = useState('');
 
+  const closeAddMcp = useCallback(() => {
+    setShowAddMcp(false);
+    setMcpLaunchConsent(false);
+  }, []);
+
   const loadPlugins = useCallback(async () => {
     try {
       const data = await getUnifiedPlugins();
       setPlugins(data);
+      return data;
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载插件列表失败');
+      throw err;
     }
   }, []);
 
@@ -71,21 +83,33 @@ export default function UnifiedPluginCenter({
     function handleSubModalKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape' && showAddMcp) {
         e.stopPropagation();
-        setShowAddMcp(false);
+        closeAddMcp();
       }
     }
     if (showAddMcp) {
       window.addEventListener('keydown', handleSubModalKeyDown, true);
       return () => window.removeEventListener('keydown', handleSubModalKeyDown, true);
     }
-  }, [showAddMcp]);
+  }, [showAddMcp, closeAddMcp]);
 
   async function handleToggle(p: UnifiedPlugin) {
     const nextState = p.status !== 'enabled';
+    const isMcpStart = p.type === 'mcp' && nextState;
+    if (isMcpStart && (enableConfirmationMcp !== p.id || !enableMcpConsent)) {
+      setEnableConfirmationMcp(p.id);
+      setEnableMcpConsent(false);
+      return;
+    }
     setBusy(`toggle:${p.id}`);
     try {
-      await toggleUnifiedPlugin(p.id, nextState);
-      await loadPlugins();
+      const updated = await toggleUnifiedPlugin(p.id, nextState, isMcpStart && enableMcpConsent);
+      const data = await loadPlugins();
+      const observed = data.find((item) => item.id === p.id);
+      const expectedStatus = nextState ? 'enabled' : 'disabled';
+      if (updated.status !== expectedStatus || observed?.status !== expectedStatus) {
+        throw new Error('插件状态读回与请求不一致，请重试或检查运行状态');
+      }
+      if (isMcpStart) { setEnableConfirmationMcp(''); setEnableMcpConsent(false); }
       onPluginsChanged?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : '切换插件状态失败');
@@ -133,10 +157,12 @@ export default function UnifiedPluginCenter({
         command: mcpCommand.trim(),
         args,
         env: Object.keys(envObj).length > 0 ? envObj : undefined,
+        enabled: true,
       };
 
       await addMcpServerConfig(cfg);
-      setShowAddMcp(false);
+      closeAddMcp();
+      setMcpLaunchConsent(false);
       setMcpId('');
       setMcpName('');
       setMcpCommand('');
@@ -151,10 +177,17 @@ export default function UnifiedPluginCenter({
   }
 
   async function handleRemoveMcp(id: string) {
-    if (!confirm(`确定要移除 MCP 服务 "${id}" 吗？`)) return;
+    if (removeConfirmationMcp !== id) {
+      setRemoveConfirmationMcp(id);
+      setRemoveMcpConsent(false);
+      return;
+    }
+    if (!removeMcpConsent) return;
     setBusy(`remove:${id}`);
     try {
       await removeMcpServerConfig(id);
+      setRemoveConfirmationMcp('');
+      setRemoveMcpConsent(false);
       await loadPlugins();
     } catch (err) {
       setError(err instanceof Error ? err.message : '删除 MCP 服务失败');
@@ -238,10 +271,10 @@ export default function UnifiedPluginCenter({
               onClick={handleReload}
               disabled={busy !== ''}
               className="upc-btn-secondary"
-              aria-label="热重载所有插件"
+              aria-label="重载 Skills 并刷新插件状态"
             >
               <RotateCw size={12} className={busy === 'reload' ? 'spin' : ''} aria-hidden="true" />
-              <span>{busy === 'reload' ? '正在重载…' : '热重载'}</span>
+              <span>{busy === 'reload' ? '正在重载…' : '重载 Skills'}</span>
             </button>
             {filterType === 'mcp' && (
               <button
@@ -307,6 +340,7 @@ export default function UnifiedPluginCenter({
             <div className="upc-grid">
               {filteredPlugins.map((p) => {
                 const isEnabled = p.status === 'enabled';
+                const statusLabel = p.status === 'error' ? '运行异常' : isEnabled ? '已启用' : '已停用';
                 const typeLabel =
                   p.type === 'core'
                     ? 'Core 工具'
@@ -324,13 +358,13 @@ export default function UnifiedPluginCenter({
                         type="button"
                         role="switch"
                         aria-checked={isEnabled}
-                        aria-label={`${p.name}，当前状态：${isEnabled ? '已启用' : '已停用'}`}
+                        aria-label={`${p.name}，当前状态：${statusLabel}`}
                         aria-busy={busy === ('toggle:' + p.id)}
                         onClick={() => handleToggle(p)}
                         disabled={busy === ('toggle:' + p.id)}
                         className={'upc-toggle ' + (isEnabled ? 'enabled' : '')}
                       >
-                        {busy === ('toggle:' + p.id) ? '…' : isEnabled ? '已启用' : '已停用'}
+                        {busy === ('toggle:' + p.id) ? '…' : statusLabel}
                       </button>
                     </div>
 
@@ -342,6 +376,12 @@ export default function UnifiedPluginCenter({
                     </div>
 
                     <p className="upc-card-desc">{p.description || '暂无详细描述'}</p>
+
+                    {p.status === 'error' && (
+                      <div className="upc-notice error" role="status">
+                        {p.error || '配置已保存，但运行时未确认启动。'}
+                      </div>
+                    )}
 
                     {p.capabilities && p.capabilities.length > 0 && (
                       <div style={{ borderTop: '1px solid #f3f4f6', paddingTop: 8 }}>
@@ -363,22 +403,30 @@ export default function UnifiedPluginCenter({
                     {p.type === 'mcp' && (
                       <div className="upc-card-footer">
                         <span style={{ fontSize: 11, color: '#9ca3af' }}>MCP 外部连接</span>
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveMcp(p.id)}
-                          disabled={busy !== ''}
-                          style={{
-                            fontSize: 11,
-                            color: '#ef4444',
-                            background: 'transparent',
-                            border: 'none',
-                            cursor: 'pointer',
-                            padding: '4px 8px',
-                            minHeight: '28px',
-                          }}
-                        >
-                          移除服务
-                        </button>
+                        {enableConfirmationMcp === p.id && p.status !== 'enabled' && (
+                          <form onSubmit={(event) => { event.preventDefault(); void handleToggle(p); }}>
+                            <label className="permission-consent">
+                              <input type="checkbox" checked={enableMcpConsent} onChange={(event) => setEnableMcpConsent(event.target.checked)} required />
+                              我授权启动此 MCP 外部进程。
+                            </label>
+                            <button type="submit" disabled={!enableMcpConsent || busy !== ''}>授权并启动</button>
+                            <button type="button" onClick={() => setEnableConfirmationMcp('')}>取消</button>
+                          </form>
+                        )}
+                        {removeConfirmationMcp === p.id ? (
+                          <form onSubmit={(event) => { event.preventDefault(); void handleRemoveMcp(p.id); }}>
+                            <label className="permission-consent">
+                              <input type="checkbox" checked={removeMcpConsent} onChange={(event) => setRemoveMcpConsent(event.target.checked)} required />
+                              删除此 MCP 配置并停止连接。
+                            </label>
+                            <button type="submit" disabled={busy !== '' || !removeMcpConsent} style={{ color: '#ef4444' }}>确认移除</button>
+                            <button type="button" onClick={() => setRemoveConfirmationMcp('')}>取消</button>
+                          </form>
+                        ) : (
+                          <button type="button" onClick={() => handleRemoveMcp(p.id)} disabled={busy !== ''} style={{ fontSize: 11, color: '#ef4444', background: 'transparent', border: 'none', cursor: 'pointer', padding: '4px 8px', minHeight: '28px' }}>
+                            移除服务
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -394,7 +442,7 @@ export default function UnifiedPluginCenter({
             className="upc-backdrop"
             style={{ zIndex: 110 }}
             onMouseDown={(e) => {
-              if (e.target === e.currentTarget) setShowAddMcp(false);
+              if (e.target === e.currentTarget) closeAddMcp();
             }}
           >
             <div
@@ -411,7 +459,7 @@ export default function UnifiedPluginCenter({
                 </h3>
                 <button
                   type="button"
-                  onClick={() => setShowAddMcp(false)}
+                  onClick={closeAddMcp}
                   className="upc-btn-close"
                   aria-label="关闭添加 MCP 弹窗"
                 >
@@ -472,11 +520,16 @@ export default function UnifiedPluginCenter({
                   />
                 </label>
 
+                <label className="permission-consent">
+                  <input type="checkbox" checked={mcpLaunchConsent} onChange={(e) => setMcpLaunchConsent(e.target.checked)} required />
+                  我确认启动上面配置的本机进程并建立 MCP 连接。
+                </label>
+
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
-                  <button type="button" onClick={() => setShowAddMcp(false)} className="upc-btn-secondary">
+                  <button type="button" onClick={closeAddMcp} className="upc-btn-secondary">
                     取消
                   </button>
-                  <button type="submit" disabled={busy === 'add-mcp'} className="upc-btn-primary">
+                  <button type="submit" disabled={busy === 'add-mcp' || !mcpLaunchConsent} className="upc-btn-primary">
                     {busy === 'add-mcp' ? '正在连接…' : '添加并连接'}
                   </button>
                 </div>

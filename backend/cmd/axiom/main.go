@@ -41,6 +41,9 @@ func main() {
 
 func run() error {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
@@ -124,7 +127,7 @@ func run() error {
 		if recovered > 0 {
 			slog.Warn("recovered interrupted agent turns", "count", recovered)
 		}
-		agentService, err = agent.New(ctx, st, providers, forge, evolutionService, cfg.WorkspaceRoot, cfg.DataDir)
+		agentService, err = agent.New(ctx, st, providers, forge, evolutionService, cfg.WorkspaceRoot, cfg.DataDir, cfg.AgentTempDir, agent.RunLimits{MaxConcurrentRuns: cfg.AgentMaxConcurrentRuns, MaxTokensPerRun: cfg.AgentMaxTokensPerRun, MaxModelCalls: cfg.AgentMaxModelCalls, MaxRunDuration: cfg.AgentMaxRunDuration})
 		if err != nil {
 			return err
 		}
@@ -205,6 +208,11 @@ func run() error {
 		})
 	}
 	agentService.SetPlugins(unifiedPlugins)
+	agentService.ResumeInterruptedTurns(workspaceID)
+	agentService.ResumeQueuedInputs(workspaceID)
+	if err := evalHarnessService.Recover(ctx, workspaceID); err != nil {
+		return err
+	}
 	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(workspaceID, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErrors := make(chan error, 1)
 	go func() {

@@ -60,6 +60,9 @@ CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, updated_at DES
 CREATE TABLE IF NOT EXISTS conversations (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), title TEXT NOT NULL,
  provider_id TEXT NOT NULL REFERENCES providers(id), project_id TEXT NOT NULL DEFAULT '',
+ permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous',
+ parent_conversation_id TEXT NOT NULL DEFAULT '', branch_from_message_id TEXT NOT NULL DEFAULT '',
+ execution_paused INTEGER NOT NULL DEFAULT 0,
  created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
@@ -79,13 +82,49 @@ CREATE TABLE IF NOT EXISTS agent_turns (
  user_id TEXT NOT NULL REFERENCES users(id), input_message_id TEXT NOT NULL REFERENCES messages(id),
  result_message_id TEXT REFERENCES messages(id), provider_id TEXT NOT NULL REFERENCES providers(id),
  generation_id TEXT NOT NULL, definition_digest TEXT NOT NULL,
+ permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous',
+ retry_of_turn_id TEXT NOT NULL DEFAULT '', input_content_snapshot TEXT NOT NULL DEFAULT '', inbox_id TEXT NOT NULL DEFAULT '',
  status TEXT NOT NULL, stop_reason TEXT NOT NULL DEFAULT '', recovery_class TEXT NOT NULL DEFAULT '',
  cancel_requested INTEGER NOT NULL DEFAULT 0, last_sequence INTEGER NOT NULL DEFAULT 0,
  started_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, completed_at DATETIME
 );
 CREATE INDEX IF NOT EXISTS idx_agent_turns_conversation ON agent_turns(conversation_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_turns_user_started ON agent_turns(user_id, started_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_turns_one_active ON agent_turns(conversation_id)
- WHERE status IN ('running','cancelling');
+ WHERE status IN ('running','cancelling','awaiting_approval');
+CREATE TABLE IF NOT EXISTS agent_approvals (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), turn_id TEXT NOT NULL REFERENCES agent_turns(id),
+ user_id TEXT NOT NULL REFERENCES users(id), tool_call_id TEXT NOT NULL, tool_name TEXT NOT NULL, source TEXT NOT NULL,
+ effect TEXT NOT NULL, permission_profile TEXT NOT NULL, plugin_id TEXT NOT NULL DEFAULT '', release_id TEXT NOT NULL DEFAULT '', resource TEXT NOT NULL DEFAULT '', impact TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, arguments_preview TEXT NOT NULL,
+ arguments_sha256 TEXT NOT NULL, status TEXT NOT NULL, decision TEXT NOT NULL DEFAULT '',
+ created_at DATETIME NOT NULL, expires_at DATETIME NOT NULL, resolved_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_agent_approvals_pending ON agent_approvals(user_id,conversation_id,status,created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_approvals_user_created ON agent_approvals(user_id,created_at,tool_name);
+CREATE TABLE IF NOT EXISTS message_revisions (
+ id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id),
+ prior_content TEXT NOT NULL, revised_content TEXT NOT NULL,
+ revised_by_turn_id TEXT NOT NULL REFERENCES agent_turns(id), revised_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_revisions_message ON message_revisions(message_id,revised_at);
+CREATE TABLE IF NOT EXISTS agent_inbox (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
+ user_id TEXT NOT NULL REFERENCES users(id), content TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'queued', turn_id TEXT NOT NULL DEFAULT '',
+ created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_inbox_queue ON agent_inbox(user_id,conversation_id,status,created_at);
+CREATE TABLE IF NOT EXISTS agent_turn_reconciliations (
+ id TEXT PRIMARY KEY, turn_id TEXT NOT NULL UNIQUE REFERENCES agent_turns(id),
+ user_id TEXT NOT NULL REFERENCES users(id), conversation_id TEXT NOT NULL REFERENCES conversations(id),
+ decision TEXT NOT NULL, note TEXT NOT NULL, created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_turn_reconciliations_user ON agent_turn_reconciliations(user_id,conversation_id,created_at);
+CREATE TABLE IF NOT EXISTS conversation_lifecycle_events (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
+ kind TEXT NOT NULL, details_json BLOB NOT NULL DEFAULT '{}', created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_lifecycle_events ON conversation_lifecycle_events(conversation_id,created_at);
 CREATE TABLE IF NOT EXISTS agent_steps (
  id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id), ordinal INTEGER NOT NULL,
  status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +137,15 @@ CREATE TABLE IF NOT EXISTS agent_model_attempts (
  status TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', usage_json BLOB NOT NULL DEFAULT '{}',
  error_class TEXT NOT NULL DEFAULT '', started_at DATETIME NOT NULL, completed_at DATETIME,
  UNIQUE(step_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS agent_turn_checkpoints (
+ turn_id TEXT PRIMARY KEY REFERENCES agent_turns(id) ON DELETE CASCADE,
+ checkpoint_version INTEGER NOT NULL,
+ state_cipher BLOB NOT NULL,
+ state_nonce BLOB NOT NULL,
+ resume_allowed INTEGER NOT NULL DEFAULT 0,
+ event_sequence INTEGER NOT NULL,
+ updated_at DATETIME NOT NULL
 );
 CREATE TABLE IF NOT EXISTS agent_definitions (
  user_id TEXT NOT NULL REFERENCES users(id), digest TEXT NOT NULL,
@@ -137,6 +185,7 @@ CREATE INDEX IF NOT EXISTS idx_eval_experiments_user ON eval_experiments(user_id
 CREATE TABLE IF NOT EXISTS eval_trials (
  id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES eval_experiments(id), case_id TEXT NOT NULL,
  side TEXT NOT NULL, repetition INTEGER NOT NULL, success INTEGER NOT NULL,
+ status TEXT NOT NULL DEFAULT 'completed', failure_class TEXT NOT NULL DEFAULT '',
  response TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', metrics_json BLOB NOT NULL,
  created_at DATETIME NOT NULL, UNIQUE(experiment_id, case_id, side, repetition)
 );
@@ -148,14 +197,39 @@ CREATE INDEX IF NOT EXISTS idx_eval_trials_experiment ON eval_trials(experiment_
 	}
 	for _, migration := range []string{
 		`ALTER TABLE conversations ADD COLUMN project_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE conversations ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous'`,
+		`ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE conversations ADD COLUMN branch_from_message_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE conversations ADD COLUMN execution_paused INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE agent_turns ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous'`,
+		`ALTER TABLE agent_turns ADD COLUMN retry_of_turn_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agent_turns ADD COLUMN input_content_snapshot TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agent_turns ADD COLUMN inbox_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE projects ADD COLUMN instructions_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE projects ADD COLUMN remote_repo_url TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE projects ADD COLUMN remote_branch TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE providers ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE agent_approvals ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous'`,
+		`ALTER TABLE agent_approvals ADD COLUMN impact TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agent_approvals ADD COLUMN plugin_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agent_approvals ADD COLUMN release_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE eval_trials ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'`,
+		`ALTER TABLE eval_trials ADD COLUMN failure_class TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, migrationErr := s.db.ExecContext(ctx, migration); migrationErr != nil && !strings.Contains(strings.ToLower(migrationErr.Error()), "duplicate column name") {
 			return migrationErr
 		}
+	}
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_agent_turns_one_active;
+CREATE UNIQUE INDEX idx_agent_turns_one_active ON agent_turns(conversation_id) WHERE status IN ('running','cancelling','awaiting_approval');`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE agent_turns SET recovery_class=CASE
+ WHEN EXISTS (SELECT 1 FROM agent_trace_events e WHERE e.turn_id=agent_turns.id AND e.kind='tool.started') THEN
+  CASE WHEN status='completed' THEN 'not_replayable' ELSE 'unknown_external_effect' END
+ ELSE 'safe_to_retry' END
+WHERE recovery_class='' AND status IN ('completed','failed','cancelled','interrupted','incomplete','needs_reconciliation')`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -257,7 +331,13 @@ func (s *Store) ProviderSecret(ctx context.Context, userID, id string) (domain.P
 }
 
 func (s *Store) CreateConversation(ctx context.Context, c domain.Conversation) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,project_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.ProjectID, c.CreatedAt, c.UpdatedAt)
+	profile := c.PermissionProfile
+	if profile == "" {
+		profile = domain.DefaultPermissionProfile()
+	} else if !profile.Valid() {
+		return domain.ErrInvalid
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,project_id,permission_profile,parent_conversation_id,branch_from_message_id,execution_paused,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.ProjectID, profile, c.ParentConversationID, c.BranchFromMessageID, c.ExecutionPaused, c.CreatedAt, c.UpdatedAt)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "foreign key") {
 		return domain.ErrInvalid
 	}
@@ -270,7 +350,13 @@ func (s *Store) CreateConversationWithGeneration(ctx context.Context, c domain.C
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,project_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.ProjectID, c.CreatedAt, c.UpdatedAt)
+	profile := c.PermissionProfile
+	if profile == "" {
+		profile = domain.DefaultPermissionProfile()
+	} else if !profile.Valid() {
+		return domain.ErrInvalid
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,project_id,permission_profile,parent_conversation_id,branch_from_message_id,execution_paused,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, c.ID, c.UserID, c.Title, c.ProviderID, c.ProjectID, profile, c.ParentConversationID, c.BranchFromMessageID, c.ExecutionPaused, c.CreatedAt, c.UpdatedAt)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "foreign key") {
 			return domain.ErrInvalid
@@ -290,7 +376,7 @@ SELECT ?,?,?,?,? FROM agent_generations WHERE id=? AND user_id=? AND definition_
 }
 
 func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.Conversation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.user_id=? ORDER BY c.updated_at DESC`, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.permission_profile,COALESCE(c.parent_conversation_id,''),COALESCE(c.branch_from_message_id,''),c.execution_paused,c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.user_id=? ORDER BY c.updated_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -298,12 +384,30 @@ func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.
 	result := []domain.Conversation{}
 	for rows.Next() {
 		var c domain.Conversation
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Title, &c.ProviderID, &c.AgentGenerationID, &c.AgentDefinitionDigest, &c.ProjectID, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Title, &c.ProviderID, &c.AgentGenerationID, &c.AgentDefinitionDigest, &c.ProjectID, &c.PermissionProfile, &c.ParentConversationID, &c.BranchFromMessageID, &c.ExecutionPaused, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, c)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) UpdateConversationPermissionProfile(ctx context.Context, userID, id string, profile domain.PermissionProfile) error {
+	if !profile.Valid() {
+		return domain.ErrInvalid
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET permission_profile=?,updated_at=? WHERE id=? AND user_id=?`, profile, time.Now().UTC(), id, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) UpdateConversationTitle(ctx context.Context, userID, id, title string) error {
@@ -430,6 +534,13 @@ func (s *Store) DeleteProject(ctx context.Context, userID, id string) error {
 	if err != nil {
 		return err
 	}
+	var remainingConversations int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM conversations WHERE project_id=? AND (user_id=? OR ?='')`, id, userID, userID).Scan(&remainingConversations); err != nil {
+		return err
+	}
+	if remainingConversations != 0 {
+		return fmt.Errorf("project removal left %d associated conversations", remainingConversations)
+	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id=? AND (user_id=? OR ?='')`, id, userID, userID)
 	if err != nil {
 		return err
@@ -446,7 +557,7 @@ func (s *Store) DeleteProject(ctx context.Context, userID, id string) error {
 
 func (s *Store) Conversation(ctx context.Context, userID, id string) (domain.ConversationDetail, error) {
 	var d domain.ConversationDetail
-	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.id=? AND c.user_id=?`, id, userID).Scan(&d.ID, &d.UserID, &d.Title, &d.ProviderID, &d.AgentGenerationID, &d.AgentDefinitionDigest, &d.ProjectID, &d.CreatedAt, &d.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.permission_profile,COALESCE(c.parent_conversation_id,''),COALESCE(c.branch_from_message_id,''),c.execution_paused,c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.id=? AND c.user_id=?`, id, userID).Scan(&d.ID, &d.UserID, &d.Title, &d.ProviderID, &d.AgentGenerationID, &d.AgentDefinitionDigest, &d.ProjectID, &d.PermissionProfile, &d.ParentConversationID, &d.BranchFromMessageID, &d.ExecutionPaused, &d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, domain.ErrNotFound
 	}
@@ -466,7 +577,28 @@ func (s *Store) Conversation(ctx context.Context, userID, id string) (domain.Con
 		}
 		d.Messages = append(d.Messages, m)
 	}
-	return d, rows.Err()
+	if err := rows.Err(); err != nil {
+		return d, err
+	}
+	if err := rows.Close(); err != nil {
+		return d, err
+	}
+	events, err := s.db.QueryContext(ctx, `SELECT id,conversation_id,kind,details_json,created_at FROM conversation_lifecycle_events WHERE conversation_id=? ORDER BY created_at,rowid`, id)
+	if err != nil {
+		return d, err
+	}
+	defer events.Close()
+	d.LifecycleEvents = []domain.ConversationLifecycleEvent{}
+	for events.Next() {
+		var event domain.ConversationLifecycleEvent
+		var details []byte
+		if err := events.Scan(&event.ID, &event.ConversationID, &event.Kind, &details, &event.CreatedAt); err != nil {
+			return d, err
+		}
+		event.Details = details
+		d.LifecycleEvents = append(d.LifecycleEvents, event)
+	}
+	return d, events.Err()
 }
 
 func (s *Store) AddMessage(ctx context.Context, userID string, m domain.Message) error {

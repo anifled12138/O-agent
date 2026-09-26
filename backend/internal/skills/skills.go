@@ -132,8 +132,12 @@ func (r *Registry) SetEnabled(id string, enabled bool) error {
 	if !ok {
 		return fmt.Errorf("skill %q not found", id)
 	}
+	previous := s.Enabled
 	s.Enabled = enabled
-	_ = r.savePersistedStatesLocked()
+	if err := r.savePersistedStatesLocked(); err != nil {
+		s.Enabled = previous
+		return fmt.Errorf("persist skill %q state: %w", id, err)
+	}
 	return nil
 }
 

@@ -41,6 +41,7 @@ type UnifiedPlugin struct {
 	Type         PluginType        `json:"type"`
 	Description  string            `json:"description"`
 	Status       PluginStatus      `json:"status"`
+	Error        string            `json:"error,omitempty"`
 	Capabilities []string          `json:"capabilities,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
 }
@@ -74,7 +75,7 @@ func NewManager(workspaceRoot string) *Manager {
 	for _, t := range tools {
 		name := t.Definition.Function.Name
 		coreMap[name] = t
-		coreEnabled[name] = name != "exec_command" || os.Getenv("O_ENABLE_SHELL_TOOL") == "1"
+		coreEnabled[name] = (name != "exec_command" && name != "exec_script") || os.Getenv("O_ENABLE_SHELL_TOOL") == "1"
 	}
 	coreEnabled["model_selector"] = true
 	coreEnabled["context_compactor"] = true
@@ -189,12 +190,17 @@ func (m *Manager) Catalog() []UnifiedPlugin {
 		if !cfg.Enabled {
 			status = StatusDisabled
 		}
+		runtimeError := m.mcpManager.RuntimeError(cfg.ID)
+		if runtimeError != "" {
+			status = StatusError
+		}
 		list = append(list, UnifiedPlugin{
 			ID:          "mcp:" + cfg.ID,
 			Name:        cfg.Name,
 			Type:        TypeMCP,
 			Description: cfg.Description,
 			Status:      status,
+			Error:       runtimeError,
 			Metadata:    map[string]string{"command": cfg.Command},
 		})
 	}

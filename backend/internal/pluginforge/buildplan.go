@@ -1,10 +1,12 @@
 package pluginforge
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,7 +39,7 @@ func (s *Service) executeBuildPlan(ctx context.Context, project Project, documen
 	return s.executeV2Build(ctx, project, document.Manifest)
 }
 
-func (s *Service) executeLegacyBuild(ctx context.Context, project Project, document pluginmanifest.Document, manifestRaw []byte) (buildResult, error) {
+func (s *Service) executeLegacyBuild(ctx context.Context, project Project, document pluginmanifest.Document, manifestRaw []byte) (result buildResult, retErr error) {
 	var manifest Manifest
 	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
 		return buildResult{}, err
@@ -58,10 +60,15 @@ func (s *Service) executeLegacyBuild(ctx context.Context, project Project, docum
 	if err != nil {
 		return buildResult{}, fmt.Errorf("plugin tests failed: %s", testOutput)
 	}
-	buildDir := filepath.Join(project.SourceDir, "build", time.Now().UTC().Format("20060102T150405.000000000"))
-	if err = os.MkdirAll(buildDir, 0o700); err != nil {
+	buildDir, err := os.MkdirTemp(s.dataDir, "plugin-build-"+project.ID+"-")
+	if err != nil {
 		return buildResult{}, err
 	}
+	defer func() {
+		if cleanupErr := os.RemoveAll(buildDir); cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("clean plugin build temporary directory: %w", cleanupErr))
+		}
+	}()
 	exeName := "plugin"
 	if runtime.GOOS == "windows" {
 		exeName += ".exe"
@@ -80,6 +87,9 @@ func (s *Service) executeLegacyBuild(ctx context.Context, project Project, docum
 	if err = packageRelease(bundleDir, builtExe, frontendSource, manifestRaw); err != nil {
 		return buildResult{}, err
 	}
+	if err = verifyLegacyBundle(bundleDir, digest, manifestRaw); err != nil {
+		return buildResult{}, err
+	}
 	report, _ := json.Marshal(map[string]any{
 		"passed": true, "sourceVersion": document.SourceVersion,
 		"steps":          []buildStep{{Surface: "backend", Action: "go test", Passed: true, Output: strings.TrimSpace(testOutput)}, {Surface: "backend", Action: "go build", Passed: true, Output: strings.TrimSpace(buildOutput)}, {Surface: "ui", Action: "verify entry", Passed: true}},
@@ -88,7 +98,7 @@ func (s *Service) executeLegacyBuild(ctx context.Context, project Project, docum
 	return buildResult{digest: digest, bundleDir: bundleDir, report: report}, nil
 }
 
-func (s *Service) executeV2Build(ctx context.Context, project Project, manifest pluginmanifest.Manifest) (buildResult, error) {
+func (s *Service) executeV2Build(ctx context.Context, project Project, manifest pluginmanifest.Manifest) (result buildResult, retErr error) {
 	started := time.Now()
 	steps := []buildStep{}
 	artifacts := map[string]string{}
@@ -107,10 +117,15 @@ func (s *Service) executeV2Build(ctx context.Context, project Project, manifest 
 			return buildResult{}, fmt.Errorf("plugin tests failed: %s", testOutput)
 		}
 		steps = append(steps, buildStep{Surface: "backend", Action: "go test", Passed: true, Output: strings.TrimSpace(testOutput)})
-		buildDir := filepath.Join(project.SourceDir, "build", time.Now().UTC().Format("20060102T150405.000000000"))
-		if err = os.MkdirAll(buildDir, 0o700); err != nil {
+		buildDir, err := os.MkdirTemp(s.dataDir, "plugin-build-"+project.ID+"-")
+		if err != nil {
 			return buildResult{}, err
 		}
+		defer func() {
+			if cleanupErr := os.RemoveAll(buildDir); cleanupErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("clean plugin build temporary directory: %w", cleanupErr))
+			}
+		}()
 		executable := filepath.Join(buildDir, "plugin")
 		if runtime.GOOS == "windows" {
 			executable += ".exe"
@@ -159,11 +174,107 @@ func (s *Service) executeV2Build(ctx context.Context, project Project, manifest 
 	if err = packageArtifactSet(bundleDir, canonicalManifest, artifacts, manifest); err != nil {
 		return buildResult{}, err
 	}
+	bundledArtifacts := make(map[string]string, len(artifacts))
+	for logical := range artifacts {
+		bundledArtifacts[logical] = filepath.Join(bundleDir, filepath.FromSlash(logical))
+	}
+	observedDigest, err := digestArtifactSet(canonicalManifest, bundledArtifacts)
+	if err != nil {
+		return buildResult{}, fmt.Errorf("verify packaged plugin release: %w", err)
+	}
+	if observedDigest != digest {
+		return buildResult{}, fmt.Errorf("packaged plugin release digest mismatch: expected %s, got %s", digest, observedDigest)
+	}
 	report, _ := json.Marshal(map[string]any{
 		"passed": true, "sourceVersion": pluginmanifest.SourceV2, "steps": steps,
 		"artifactCount": len(artifacts), "durationMillis": time.Since(started).Milliseconds(), "checkedAt": time.Now().UTC(),
 	})
 	return buildResult{digest: digest, bundleDir: bundleDir, report: report}, nil
+}
+
+func verifyLegacyBundle(bundleDir, expectedDigest string, manifest []byte) error {
+	if err := verifyBundleManifest(bundleDir, manifest); err != nil {
+		return err
+	}
+	executable := filepath.Join(bundleDir, "backend", "plugin")
+	if runtime.GOOS == "windows" {
+		executable += ".exe"
+	}
+	observed, err := artifactDigest(manifest, executable, filepath.Join(bundleDir, "frontend", "index.html"))
+	if err != nil {
+		return fmt.Errorf("verify packaged plugin release: %w", err)
+	}
+	if observed != expectedDigest {
+		return fmt.Errorf("packaged plugin release digest mismatch: expected %s, got %s", expectedDigest, observed)
+	}
+	return nil
+}
+
+func verifyBundleManifest(bundleDir string, expected []byte) error {
+	manifest, err := os.ReadFile(filepath.Join(bundleDir, "manifest.json"))
+	if err != nil {
+		return fmt.Errorf("read packaged plugin manifest: %w", err)
+	}
+	if !bytes.Equal(manifest, expected) {
+		return errors.New("packaged plugin manifest does not match the release manifest")
+	}
+	return nil
+}
+
+func packageLegacyArtifactSet(bundleDir string, manifest []byte, builtExe, frontendSource string) (retErr error) {
+	expectedDigest, err := artifactDigest(manifest, builtExe, frontendSource)
+	if err != nil {
+		return err
+	}
+	parentDir := filepath.Dir(bundleDir)
+	if err := os.MkdirAll(parentDir, 0o700); err != nil {
+		return err
+	}
+	stageDir, err := os.MkdirTemp(parentDir, "."+filepath.Base(bundleDir)+".stage-")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cleanupErr := os.RemoveAll(stageDir); cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("clean staged plugin bundle: %w", cleanupErr))
+		}
+	}()
+	backendDir := filepath.Join(stageDir, "backend")
+	frontendDir := filepath.Join(stageDir, "frontend")
+	if err := os.MkdirAll(backendDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(frontendDir, 0o700); err != nil {
+		return err
+	}
+	exeName := "plugin"
+	if runtime.GOOS == "windows" {
+		exeName += ".exe"
+	}
+	if err := copyIfMissing(builtExe, filepath.Join(backendDir, exeName), 0o700); err != nil {
+		return err
+	}
+	if err := copyIfMissing(frontendSource, filepath.Join(frontendDir, "index.html"), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, "manifest.json"), manifest, 0o600); err != nil {
+		return err
+	}
+	if err := verifyLegacyBundle(stageDir, expectedDigest, manifest); err != nil {
+		return err
+	}
+	renameErr := os.Rename(stageDir, bundleDir)
+	if renameErr == nil {
+		return nil
+	}
+	if _, statErr := os.Stat(bundleDir); statErr == nil {
+		if verifyErr := verifyLegacyBundle(bundleDir, expectedDigest, manifest); verifyErr == nil {
+			return nil
+		} else {
+			return errors.Join(renameErr, verifyErr, fmt.Errorf("content-addressed release directory already exists: %s", bundleDir))
+		}
+	}
+	return renameErr
 }
 
 func collectUIArtifacts(sourceRoot string, ui pluginmanifest.UI) (map[string]string, error) {
@@ -336,10 +447,24 @@ func digestArtifactSet(manifest []byte, artifacts map[string]string) (string, er
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func packageArtifactSet(bundleDir string, manifest []byte, artifacts map[string]string, definition pluginmanifest.Manifest) error {
-	if err := os.MkdirAll(bundleDir, 0o700); err != nil {
+func packageArtifactSet(bundleDir string, manifest []byte, artifacts map[string]string, definition pluginmanifest.Manifest) (retErr error) {
+	expectedDigest, err := digestArtifactSet(manifest, artifacts)
+	if err != nil {
 		return err
 	}
+	parentDir := filepath.Dir(bundleDir)
+	if err := os.MkdirAll(parentDir, 0o700); err != nil {
+		return err
+	}
+	stageDir, err := os.MkdirTemp(parentDir, "."+filepath.Base(bundleDir)+".stage-")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cleanupErr := os.RemoveAll(stageDir); cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("clean staged plugin bundle: %w", cleanupErr))
+		}
+	}()
 	for logical, source := range artifacts {
 		mode := os.FileMode(0o600)
 		if definition.Runtime != nil && definition.Runtime.Backend != nil {
@@ -351,7 +476,7 @@ func packageArtifactSet(bundleDir string, manifest []byte, artifacts map[string]
 				mode = 0o700
 			}
 		}
-		target := filepath.Join(bundleDir, filepath.FromSlash(logical))
+		target := filepath.Join(stageDir, filepath.FromSlash(logical))
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return err
 		}
@@ -359,9 +484,43 @@ func packageArtifactSet(bundleDir string, manifest []byte, artifacts map[string]
 			return err
 		}
 	}
-	manifestPath := filepath.Join(bundleDir, "manifest.json")
-	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
-		return os.WriteFile(manifestPath, manifest, 0o600)
+	manifestPath := filepath.Join(stageDir, "manifest.json")
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		return err
 	}
-	return nil
+	stagedArtifacts := make(map[string]string, len(artifacts))
+	for logical := range artifacts {
+		stagedArtifacts[logical] = filepath.Join(stageDir, filepath.FromSlash(logical))
+	}
+	observedDigest, err := digestArtifactSet(manifest, stagedArtifacts)
+	if err != nil {
+		return fmt.Errorf("verify staged plugin bundle: %w", err)
+	}
+	if observedDigest != expectedDigest {
+		return fmt.Errorf("staged plugin bundle digest mismatch: expected %s, got %s", expectedDigest, observedDigest)
+	}
+	if err = os.Rename(stageDir, bundleDir); err == nil {
+		return nil
+	}
+	// A concurrent build may have installed the same content-addressed bundle.
+	// Accept it only after hashing the persisted files, never just because the
+	// target directory exists.
+	if _, statErr := os.Stat(bundleDir); statErr == nil {
+		if verifyErr := verifyBundleManifest(bundleDir, manifest); verifyErr != nil {
+			return errors.Join(err, verifyErr)
+		}
+		existingArtifacts := make(map[string]string, len(artifacts))
+		for logical := range artifacts {
+			existingArtifacts[logical] = filepath.Join(bundleDir, filepath.FromSlash(logical))
+		}
+		existingDigest, verifyErr := digestArtifactSet(manifest, existingArtifacts)
+		if verifyErr != nil {
+			return errors.Join(err, fmt.Errorf("verify existing plugin bundle: %w", verifyErr))
+		}
+		if existingDigest == expectedDigest {
+			return nil
+		}
+		return errors.Join(err, fmt.Errorf("existing content-addressed bundle is corrupt: expected %s, got %s", expectedDigest, existingDigest))
+	}
+	return err
 }

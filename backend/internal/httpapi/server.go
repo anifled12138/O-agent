@@ -26,6 +26,7 @@ import (
 	"axiom.local/agent/internal/evolution"
 	"axiom.local/agent/internal/mcp"
 	"axiom.local/agent/internal/pluginforge"
+	"axiom.local/agent/internal/plugins"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/storage"
 )
@@ -76,11 +77,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/conversations/{id}", s.conversationGet)
 	mux.HandleFunc("PATCH /api/v1/conversations/{id}", s.conversationUpdate)
 	mux.HandleFunc("PUT /api/v1/conversations/{id}", s.conversationUpdate)
+	mux.HandleFunc("PUT /api/v1/conversations/{id}/permissions", s.conversationPermissionUpdate)
+	mux.HandleFunc("GET /api/v1/conversations/{id}/approvals", s.conversationApprovals)
+	mux.HandleFunc("GET /api/v1/observability/tools", s.toolUsageMetrics)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/generate-title", s.conversationGenerateTitle)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/trace", s.conversationTrace)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/turns", s.conversationTurns)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/messages", s.messageCreate)
 	mux.HandleFunc("POST /api/v1/agent/turns/{id}/cancel", s.turnCancel)
+	mux.HandleFunc("POST /api/v1/agent/approvals/{id}/decision", s.approvalDecision)
 	mux.HandleFunc("GET /api/v1/capabilities/fragments", s.fragmentList)
 	mux.HandleFunc("GET /api/v1/capabilities/capsules", s.capsuleList)
 	mux.HandleFunc("POST /api/v1/capabilities/capsules/{id}/verify", s.capsuleVerify)
@@ -97,6 +102,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/evolution/experiments", s.experimentStart)
 	mux.HandleFunc("GET /api/v1/evolution/experiments/{id}", s.experimentGet)
 	mux.HandleFunc("GET /api/v1/plugin-forge/projects", s.forgeProjectList)
+	mux.HandleFunc("GET /api/v1/plugin-forge/storage", s.forgeStorageUsage)
+	mux.HandleFunc("POST /api/v1/plugin-forge/projects/{id}/releases/{release}/unusable", s.forgeReleaseUnusable)
 	mux.HandleFunc("POST /api/v1/plugin-forge/projects", s.forgeProjectCreate)
 	mux.HandleFunc("GET /api/v1/plugin-forge/projects/{id}/source-tree", s.forgeSourceTree)
 	mux.HandleFunc("GET /api/v1/plugin-forge/projects/{id}/source", s.forgeSourceRead)
@@ -119,6 +126,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v2/plugin-assets/{release}/{path...}", s.pluginAsset)
 	mux.HandleFunc("GET /api/v2/agent/runs/{id}/trace", s.conversationTrace)
 	mux.HandleFunc("POST /api/v2/agent/conversations/{id}/turns", s.turnSubmit)
+	mux.HandleFunc("POST /api/v2/agent/conversations/{id}/cancel", s.conversationCancel)
+	mux.HandleFunc("POST /api/v2/agent/turns/{id}/cancel", s.turnCancel)
+	mux.HandleFunc("GET /api/v2/agent/conversations/{id}/inbox", s.inboxList)
+	mux.HandleFunc("POST /api/v2/agent/conversations/{id}/inbox", s.inboxQueue)
+	mux.HandleFunc("POST /api/v2/agent/turns/{id}/retry", s.turnRetry)
+	mux.HandleFunc("POST /api/v2/agent/turns/{id}/reconcile", s.turnReconcile)
+	mux.HandleFunc("POST /api/v2/agent/turns/{id}/branch", s.turnBranch)
 	mux.HandleFunc("GET /api/v2/agent/turns/{id}/events", s.turnEvents)
 	return s.recoverer(s.cors(s.logging(mux)))
 }
@@ -126,11 +140,28 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	status := "ok"
 	code := http.StatusOK
+	var agentHealth any
 	if err := s.store.Ping(r.Context()); err != nil {
 		status = "degraded"
 		code = http.StatusServiceUnavailable
+	} else if s.agent != nil {
+		runtimeStatus, err := s.agent.RuntimeHealth(r.Context(), s.workspaceID)
+		if err != nil {
+			status = "degraded"
+			code = http.StatusServiceUnavailable
+		} else {
+			agentHealth = map[string]any{
+				"activeRuns":             runtimeStatus.ActiveRuns,
+				"queuedInputs":           runtimeStatus.QueuedInputs,
+				"outstandingEvaluations": runtimeStatus.OutstandingEvaluations,
+				"maxConcurrentRuns":      runtimeStatus.MaxConcurrent,
+				"maxTokensPerRun":        runtimeStatus.MaxTokensPerRun,
+				"maxModelCalls":          runtimeStatus.MaxModelCalls,
+				"maxRunDurationSeconds":  runtimeStatus.MaxRunDuration.Seconds(),
+			}
+		}
 	}
-	write(w, code, map[string]any{"status": status, "plugins": s.plugins.Snapshots()})
+	write(w, code, map[string]any{"status": status, "plugins": s.plugins.Snapshots(), "agent": agentHealth})
 }
 
 func (s *Server) pluginList(w http.ResponseWriter, r *http.Request) {
@@ -471,8 +502,25 @@ func (s *Server) projectGitClone(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) projectDelete(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ConfirmDelete bool `json:"confirmDelete"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if !in.ConfirmDelete {
+		write(w, http.StatusBadRequest, map[string]string{"error": "explicitly confirm project removal"})
+		return
+	}
 	id := r.PathValue("id")
 	if err := s.store.DeleteProject(r.Context(), s.workspaceID, id); err != nil {
+		fail(w, err)
+		return
+	}
+	if _, err := s.store.Project(r.Context(), s.workspaceID, id); !errors.Is(err, domain.ErrNotFound) {
+		if err == nil {
+			err = errors.New("project removal was not observed")
+		}
 		fail(w, err)
 		return
 	}
@@ -573,6 +621,25 @@ func (s *Server) conversationUpdate(w http.ResponseWriter, r *http.Request) {
 	fail(w, errors.New("agent service not initialized"))
 }
 
+func (s *Server) conversationPermissionUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil {
+		fail(w, errors.New("agent service not initialized"))
+		return
+	}
+	var in struct {
+		Profile domain.PermissionProfile `json:"profile"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	detail, err := s.agent.UpdatePermissionProfile(r.Context(), s.workspaceID, r.PathValue("id"), in.Profile)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, detail)
+}
+
 func (s *Server) conversationGenerateTitle(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var in struct {
@@ -605,6 +672,45 @@ func (s *Server) conversationTurns(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusOK, turns)
 }
+func (s *Server) conversationApprovals(w http.ResponseWriter, r *http.Request) {
+	items, err := s.agent.PendingApprovals(r.Context(), s.workspaceID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, items)
+}
+func (s *Server) toolUsageMetrics(w http.ResponseWriter, r *http.Request) {
+	days := 30
+	if raw := r.URL.Query().Get("days"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 365 {
+			fail(w, domain.ErrInvalid)
+			return
+		}
+		days = parsed
+	}
+	items, err := s.agent.ToolUsageMetrics(r.Context(), s.workspaceID, days)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, items)
+}
+func (s *Server) approvalDecision(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Choice string `json:"choice"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	request, err := s.agent.ResolveApproval(r.Context(), s.workspaceID, r.PathValue("id"), in.Choice)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, request)
+}
 func (s *Server) turnCancel(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Reason string `json:"reason"`
@@ -612,11 +718,27 @@ func (s *Server) turnCancel(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	if err := s.agent.Cancel(r.Context(), s.workspaceID, r.PathValue("id"), in.Reason); err != nil {
+	turn, err := s.agent.Cancel(r.Context(), s.workspaceID, r.PathValue("id"), in.Reason)
+	if err != nil {
 		fail(w, err)
 		return
 	}
-	write(w, http.StatusAccepted, map[string]any{"ok": true})
+	write(w, http.StatusAccepted, turn)
+}
+
+func (s *Server) conversationCancel(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Reason string `json:"reason"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	receipt, err := s.agent.CancelConversation(r.Context(), s.workspaceID, r.PathValue("id"), in.Reason)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, receipt)
 }
 func (s *Server) turnSubmit(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -631,6 +753,75 @@ func (s *Server) turnSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusAccepted, receipt)
+}
+
+func (s *Server) turnRetry(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Content *string `json:"content"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	receipt, err := s.agent.Retry(r.Context(), s.workspaceID, r.PathValue("id"), in.Content)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, receipt)
+}
+
+func (s *Server) turnReconcile(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Note string `json:"note"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	reconciliation, err := s.agent.Reconcile(r.Context(), s.workspaceID, r.PathValue("id"), in.Note)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, reconciliation)
+}
+
+func (s *Server) turnBranch(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Content *string `json:"content"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	receipt, err := s.agent.BranchRetry(r.Context(), s.workspaceID, r.PathValue("id"), in.Content)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, receipt)
+}
+
+func (s *Server) inboxQueue(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Content string `json:"content"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	item, err := s.agent.QueueInput(r.Context(), s.workspaceID, r.PathValue("id"), in.Content)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, item)
+}
+
+func (s *Server) inboxList(w http.ResponseWriter, r *http.Request) {
+	items, err := s.agent.Inbox(r.Context(), s.workspaceID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, items)
 }
 func (s *Server) turnEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
@@ -669,7 +860,7 @@ func (s *Server) turnEvents(w http.ResponseWriter, r *http.Request) {
 				return writeErr
 			}
 			after = event.Sequence
-			terminal = event.Kind == "turn.completed" || event.Kind == "turn.incomplete" || event.Kind == "turn.failed" || event.Kind == "turn.cancelled" || event.Kind == "turn.needs_reconciliation"
+			terminal = event.Kind == "turn.completed" || event.Kind == "turn.incomplete" || event.Kind == "turn.failed" || event.Kind == "turn.cancelled" || event.Kind == "turn.needs_reconciliation" || event.Kind == "turn.interrupted"
 		}
 		flusher.Flush()
 		return nil
@@ -722,6 +913,35 @@ func (s *Server) forgeProjectList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusOK, items)
+}
+
+func (s *Server) forgeStorageUsage(w http.ResponseWriter, r *http.Request) {
+	usage, err := s.forge.StorageUsage(r.Context(), s.workspaceID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, usage)
+}
+
+func (s *Server) forgeReleaseUnusable(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Confirm bool   `json:"confirm"`
+		Reason  string `json:"reason"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if !in.Confirm {
+		write(w, http.StatusBadRequest, map[string]string{"error": "explicitly confirm marking this release unusable"})
+		return
+	}
+	release, err := s.forge.MarkReleaseUnusable(r.Context(), s.workspaceID, r.PathValue("id"), r.PathValue("release"), in.Reason)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, release)
 }
 
 func (s *Server) forgeProjectCreate(w http.ResponseWriter, r *http.Request) {
@@ -788,14 +1008,22 @@ func (s *Server) forgeProjectAction(w http.ResponseWriter, r *http.Request) {
 		project, release, err := s.forge.BuildAndTest(r.Context(), userID, projectID)
 		s.writeForgeResult(w, project, &release, nil, err)
 	case "install":
-		// Installation is the single explicit authorization boundary in the
-		// simplified local workflow. Grants remain digest-bound internally.
-		if _, approveErr := s.forge.Approve(r.Context(), userID, projectID); approveErr != nil {
-			if _, _, requestErr := s.forge.RequestApproval(r.Context(), userID, projectID); requestErr == nil {
-				_, _ = s.forge.Approve(r.Context(), userID, projectID)
-			}
+		var in struct {
+			ReleaseID          string `json:"releaseId"`
+			ConfirmPermissions bool   `json:"confirmPermissions"`
 		}
-		project, installation, err := s.forge.Install(r.Context(), userID, projectID)
+		if !decode(w, r, &in) {
+			return
+		}
+		if strings.TrimSpace(in.ReleaseID) == "" || !in.ConfirmPermissions {
+			write(w, http.StatusBadRequest, map[string]string{"error": "select an exact release and confirm its declared permissions"})
+			return
+		}
+		if _, err := s.forge.ApproveRelease(r.Context(), userID, projectID, in.ReleaseID); err != nil {
+			fail(w, err)
+			return
+		}
+		project, installation, err := s.forge.InstallRelease(r.Context(), userID, projectID, in.ReleaseID)
 		s.writeForgeResult(w, project, nil, &installation, err)
 	case "deactivate":
 		project, err := s.forge.Deactivate(r.Context(), userID, projectID)
@@ -812,9 +1040,18 @@ func (s *Server) forgeProjectAction(w http.ResponseWriter, r *http.Request) {
 		s.writeForgeResult(w, project, nil, nil, err)
 	case "rollback":
 		var in struct {
-			ReleaseID string `json:"releaseId"`
+			ReleaseID          string `json:"releaseId"`
+			ConfirmPermissions bool   `json:"confirmPermissions"`
 		}
 		if !decode(w, r, &in) {
+			return
+		}
+		if strings.TrimSpace(in.ReleaseID) == "" || !in.ConfirmPermissions {
+			write(w, http.StatusBadRequest, map[string]string{"error": "select an exact release and confirm its declared permissions"})
+			return
+		}
+		if _, err := s.forge.ApproveRelease(r.Context(), userID, projectID, in.ReleaseID); err != nil {
+			fail(w, err)
 			return
 		}
 		project, installation, err := s.forge.Rollback(r.Context(), userID, projectID, in.ReleaseID)
@@ -1023,6 +1260,8 @@ func fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalid):
 		write(w, http.StatusBadRequest, map[string]string{"error": "输入无效"})
+	case errors.Is(err, domain.ErrBusy):
+		write(w, http.StatusTooManyRequests, map[string]string{"error": "运行容量已满，请稍后重试；已排队的输入会在容量空闲时继续"})
 	case errors.Is(err, domain.ErrConflict):
 		write(w, http.StatusConflict, map[string]string{"error": "资源已存在"})
 	case errors.Is(err, domain.ErrUnauthorized):
@@ -1050,16 +1289,36 @@ func (s *Server) unifiedPluginToggle(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	var req struct {
-		Enabled bool `json:"enabled"`
+		Enabled         bool `json:"enabled"`
+		ConfirmExternal bool `json:"confirmExternal"`
 	}
 	if !decode(w, r, &req) {
+		return
+	}
+	if strings.HasPrefix(id, "mcp:") && req.Enabled && !req.ConfirmExternal {
+		write(w, http.StatusBadRequest, map[string]string{"error": "explicitly confirm starting this MCP server"})
 		return
 	}
 	if err := s.agent.Plugins().Toggle(id, req.Enabled); err != nil {
 		fail(w, err)
 		return
 	}
-	write(w, http.StatusOK, map[string]any{"id": id, "enabled": req.Enabled})
+	for _, plugin := range s.agent.Plugins().List() {
+		if plugin.ID != id {
+			continue
+		}
+		expected := plugins.StatusDisabled
+		if req.Enabled {
+			expected = plugins.StatusEnabled
+		}
+		if plugin.Status != expected {
+			write(w, http.StatusConflict, map[string]string{"error": "插件状态与请求不一致"})
+			return
+		}
+		write(w, http.StatusOK, plugin)
+		return
+	}
+	write(w, http.StatusConflict, map[string]string{"error": "插件状态读回失败"})
 }
 
 func (s *Server) unifiedPluginReload(w http.ResponseWriter, r *http.Request) {
@@ -1079,16 +1338,34 @@ func (s *Server) unifiedPluginAddMCP(w http.ResponseWriter, r *http.Request) {
 		fail(w, errors.New("plugins manager not initialized"))
 		return
 	}
-	var cfg mcp.ServerConfig
-	if !decode(w, r, &cfg) {
+	var in struct {
+		Config        mcp.ServerConfig `json:"config"`
+		ConfirmLaunch bool             `json:"confirmLaunch"`
+	}
+	if !decode(w, r, &in) {
 		return
 	}
+	if !in.ConfirmLaunch {
+		write(w, http.StatusBadRequest, map[string]string{"error": "explicitly confirm launching this MCP process"})
+		return
+	}
+	cfg := in.Config
 	if err := s.agent.Plugins().MCPManager().AddOrUpdateConfig(cfg); err != nil {
 		fail(w, err)
 		return
 	}
-	_ = s.agent.Plugins().Reload()
-	write(w, http.StatusOK, s.agent.Plugins().List())
+	for _, plugin := range s.agent.Plugins().List() {
+		if plugin.ID != "mcp:"+cfg.ID {
+			continue
+		}
+		if cfg.Enabled && plugin.Status != plugins.StatusEnabled {
+			write(w, http.StatusConflict, map[string]string{"error": "MCP 服务已保存但运行时未确认连接"})
+			return
+		}
+		write(w, http.StatusOK, s.agent.Plugins().List())
+		return
+	}
+	write(w, http.StatusConflict, map[string]string{"error": "MCP 配置读回失败"})
 }
 
 func (s *Server) unifiedPluginRemoveMCP(w http.ResponseWriter, r *http.Request) {
@@ -1096,11 +1373,42 @@ func (s *Server) unifiedPluginRemoveMCP(w http.ResponseWriter, r *http.Request) 
 		fail(w, errors.New("plugins manager not initialized"))
 		return
 	}
-	id := r.PathValue("id")
+	var in struct {
+		ConfirmRemove bool `json:"confirmRemove"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if !in.ConfirmRemove {
+		write(w, http.StatusBadRequest, map[string]string{"error": "explicitly confirm MCP server removal"})
+		return
+	}
+	qualifiedID := r.PathValue("id")
+	id := strings.TrimPrefix(qualifiedID, "mcp:")
+	if strings.TrimSpace(id) == "" {
+		write(w, http.StatusBadRequest, map[string]string{"error": "invalid MCP server id"})
+		return
+	}
+	found := false
+	for _, cfg := range s.agent.Plugins().MCPManager().ListConfigs() {
+		if cfg.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		fail(w, domain.ErrNotFound)
+		return
+	}
 	if err := s.agent.Plugins().MCPManager().Remove(id); err != nil {
 		fail(w, err)
 		return
 	}
-	_ = s.agent.Plugins().Reload()
+	for _, cfg := range s.agent.Plugins().MCPManager().ListConfigs() {
+		if cfg.ID == id {
+			write(w, http.StatusConflict, map[string]string{"error": "MCP 配置仍然存在，移除未完成"})
+			return
+		}
+	}
 	write(w, http.StatusOK, map[string]any{"removed": id})
 }

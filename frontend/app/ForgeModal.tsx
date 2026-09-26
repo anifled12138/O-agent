@@ -7,7 +7,7 @@ import { useDialogA11y } from './useDialogA11y';
 
 type Capability = { id: string; summary: string; risk: string; pluginId?: string; releaseId?: string; version?: string };
 type PermissionSet = { filesystem?: { read?: string[]; write?: string[] }; network?: string[]; secrets?: string[]; process?: boolean; background?: boolean };
-type Release = { id: string; projectId: string; pluginId: string; version: string; digest: string; permissionHash: string; sourceVersion: 'v1' | 'v2'; manifest: { name: string; description: string; permissions: PermissionSet; ui?: { entry: string; slots?: string[] }; exports?: { tools?: Capability[]; services?: unknown[]; skills?: unknown[] } } };
+type Release = { id: string; projectId: string; pluginId: string; version: string; digest: string; permissionHash: string; sourceVersion: 'v1' | 'v2'; availability: 'available' | 'unusable_pending_cleanup' | 'unusable'; manifest: { name: string; description: string; permissions: PermissionSet; ui?: { entry: string; slots?: string[] }; exports?: { tools?: Capability[]; services?: unknown[]; skills?: unknown[] } } };
 export type ForgeProject = { id: string; name: string; slug: string; description: string; state: string; lastError?: string; updatedAt: string; latestRelease?: Release; releases: Release[] };
 export type Installation = { id: string; pluginId: string; projectId: string; activeReleaseId: string; status: string };
 export type SurfaceState = { pluginId: string; releaseId: string; kind: string; surfaceId: string; status: string; registryEpoch: number };
@@ -17,20 +17,30 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
   const [projects, setProjects] = useState<ForgeProject[]>([]);
   const [installations, setInstallations] = useState<Installation[]>([]);
   const [surfaces, setSurfaces] = useState<SurfaceState[]>([]);
+  const [storageUsage, setStorageUsage] = useState<{ releaseCount: number; uniqueBundleCount: number; bundleBytes: number; missingBundleCount: number } | null>(null);
   const [selectedId, setSelectedId] = useState<string>('');
   const [busy, setBusy] = useState<string>('');
   const [error, setError] = useState('');
+  const [installConfirmationRelease, setInstallConfirmationRelease] = useState('');
+  const [permissionConsent, setPermissionConsent] = useState(false);
+  const [rollbackConfirmationRelease, setRollbackConfirmationRelease] = useState('');
+  const [rollbackConsent, setRollbackConsent] = useState(false);
+  const [unusableConfirmationRelease, setUnusableConfirmationRelease] = useState('');
+  const [unusableReason, setUnusableReason] = useState('');
+  const [unusableConsent, setUnusableConsent] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const refresh = useCallback(async () => {
-    const [nextProjects, nextInstallations, nextSurfaces] = await Promise.all([
+    const [nextProjects, nextInstallations, nextSurfaces, nextStorageUsage] = await Promise.all([
       request<ForgeProject[]>('/plugin-forge/projects'),
       request<Installation[]>('/plugin-runtime/installations'),
       request<SurfaceState[]>('/plugin-runtime/surfaces'),
+      request<{ releaseCount: number; uniqueBundleCount: number; bundleBytes: number; missingBundleCount: number }>('/plugin-forge/storage'),
     ]);
     setProjects(nextProjects);
     setInstallations(nextInstallations);
     setSurfaces(nextSurfaces);
+    setStorageUsage(nextStorageUsage);
     setSelectedId((current) => current || nextProjects[0]?.id || '');
   }, []);
 
@@ -39,11 +49,13 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
       request<ForgeProject[]>('/plugin-forge/projects'),
       request<Installation[]>('/plugin-runtime/installations'),
       request<SurfaceState[]>('/plugin-runtime/surfaces'),
+      request<{ releaseCount: number; uniqueBundleCount: number; bundleBytes: number; missingBundleCount: number }>('/plugin-forge/storage'),
     ])
-      .then(([nextProjects, nextInstallations, nextSurfaces]) => {
+      .then(([nextProjects, nextInstallations, nextSurfaces, nextStorageUsage]) => {
         setProjects(nextProjects);
         setInstallations(nextInstallations);
         setSurfaces(nextSurfaces);
+        setStorageUsage(nextStorageUsage);
         setSelectedId(nextProjects[0]?.id || '');
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : '无法加载插件'));
@@ -51,6 +63,7 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
 
   const selected = projects.find((project) => project.id === selectedId) ?? projects[0];
   const installation = installations.find((item) => item.projectId === selected?.id && item.status === 'active');
+  const activeRelease = selected?.releases.find((release) => release.id === installation?.activeReleaseId) ?? selected?.latestRelease;
 
   useEffect(() => {
     async function bridge(event: MessageEvent) {
@@ -119,6 +132,15 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
   }
 
   async function act(project: ForgeProject, action: string) {
+    if (action === 'install') {
+      if (!project.latestRelease) {
+        setError('没有可安装的不可变版本。');
+        return;
+      }
+      setInstallConfirmationRelease(project.latestRelease.id);
+      setPermissionConsent(false);
+      return;
+    }
     setBusy(`${project.id}:${action}`);
     setError('');
     try {
@@ -133,16 +155,66 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
   }
 
   async function rollback(project: ForgeProject, releaseId: string) {
+    if (rollbackConfirmationRelease !== releaseId) {
+      setRollbackConfirmationRelease(releaseId);
+      setRollbackConsent(false);
+      return;
+    }
+    if (!rollbackConsent) return;
     setBusy(`${project.id}:rollback`);
     setError('');
     try {
       await request(`/plugin-forge/projects/${project.id}/rollback`, {
         method: 'POST',
-        body: JSON.stringify({ releaseId }),
+        body: JSON.stringify({ releaseId, confirmPermissions: true }),
       });
+      setRollbackConfirmationRelease('');
+      setRollbackConsent(false);
       await refresh();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '回退失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function confirmInstall(project: ForgeProject) {
+    const releaseId = installConfirmationRelease;
+    if (!releaseId || !permissionConsent) return;
+    setBusy(`${project.id}:install`);
+    setError('');
+    try {
+      await request(`/plugin-forge/projects/${project.id}/install`, {
+        method: 'POST',
+        body: JSON.stringify({ releaseId, confirmPermissions: true }),
+      });
+      setInstallConfirmationRelease('');
+      setPermissionConsent(false);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '插件安装失败');
+      await refresh().catch(() => undefined);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function markReleaseUnusable(project: ForgeProject) {
+    const releaseId = unusableConfirmationRelease;
+    if (!releaseId || !unusableConsent || unusableReason.trim().length < 3) return;
+    setBusy(`${project.id}:mark-unusable`);
+    setError('');
+    try {
+      await request(`/plugin-forge/projects/${project.id}/releases/${releaseId}/unusable`, {
+        method: 'POST',
+        body: JSON.stringify({ confirm: true, reason: unusableReason.trim() }),
+      });
+      setUnusableConfirmationRelease('');
+      setUnusableReason('');
+      setUnusableConsent(false);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '无法标记版本');
     } finally {
       setBusy('');
     }
@@ -227,6 +299,13 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
                 <Plus size={14} aria-hidden="true" />
               </button>
             </form>
+            {storageUsage && (
+              <div className="forge-storage-summary" aria-live="polite">
+                版本 {storageUsage.releaseCount} 个 · 去重包 {storageUsage.uniqueBundleCount} 个 · release 包占用{' '}
+                {new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(storageUsage.bundleBytes / 1024 / 1024)} MiB
+                {storageUsage.missingBundleCount > 0 && ` · 缺失 ${storageUsage.missingBundleCount} 个包`}
+              </div>
+            )}
             <div className="forge-projects">
               <p className="eyebrow">项目 ({projects.length})</p>
               {projects.length === 0 ? (
@@ -325,7 +404,43 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
                     </div>
                   </section>
                 )}
-                {selected.state === 'active' && selected.releases?.length > 1 && (
+                {installConfirmationRelease === selected.latestRelease?.id && selected.latestRelease && (
+                  <form
+                    className="permission-card"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void confirmInstall(selected);
+                    }}
+                  >
+                    <div>
+                      <span>
+                        <b className="eyebrow">安装授权表单</b>
+                        <small>{selected.latestRelease.version} · {selected.latestRelease.id}</small>
+                      </span>
+                      <h4>确认安装这个固定版本</h4>
+                      <small>摘要：{selected.latestRelease.digest}</small>
+                      <small>权限摘要：{selected.latestRelease.permissionHash}</small>
+                    </div>
+                    <label className="permission-consent">
+                      <input
+                        type="checkbox"
+                        checked={permissionConsent}
+                        onChange={(event) => setPermissionConsent(event.target.checked)}
+                        required
+                      />
+                      我已查看上方权限契约，并授权此 release 按所列权限安装和启用。
+                    </label>
+                    <div className="forge-action-buttons">
+                      <button type="button" className="secondary" onClick={() => setInstallConfirmationRelease('')}>
+                        取消
+                      </button>
+                      <button type="submit" disabled={!permissionConsent || busy !== ''}>
+                        {busy.endsWith(':install') ? '正在安装…' : '授权并安装此版本'}
+                      </button>
+                    </div>
+                  </form>
+                )}
+                {selected.releases?.length > 0 && (
                   <section className="release-history">
                     <span className="eyebrow">不可变版本</span>
                     {selected.releases.map((release) => (
@@ -335,23 +450,55 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
                             {release.version} · {release.sourceVersion}
                           </b>
                           <small>{release.digest.slice(0, 12)}</small>
+                          <small>{release.availability === 'available' ? '可用' : release.availability === 'unusable_pending_cleanup' ? '已标记不可用，待下次启动清理 bundle' : '不可用，bundle 已清理'}</small>
                         </span>
                         {installation?.activeReleaseId === release.id ? (
                           <em>当前版本</em>
+                        ) : release.availability !== 'available' ? (
+                          <em>不可回退</em>
                         ) : (
-                          <button type="button" onClick={() => rollback(selected, release.id)} disabled={busy !== ''}>
-                            回退
-                          </button>
+                          <div className="forge-action-buttons">
+                          {selected.state === 'active' && (rollbackConfirmationRelease === release.id ? (
+                            <form onSubmit={(event) => { event.preventDefault(); void rollback(selected, release.id); }}>
+                              <small>将启用摘要 {release.digest.slice(0, 16)} 的不可变版本。</small>
+                              <label className="permission-consent">
+                                <input type="checkbox" checked={rollbackConsent} onChange={(event) => setRollbackConsent(event.target.checked)} required />
+                                我授权此版本恢复运行。
+                              </label>
+                              <button type="submit" disabled={busy !== '' || !rollbackConsent}>授权并回退</button>
+                              <button type="button" className="secondary" onClick={() => setRollbackConfirmationRelease('')}>取消</button>
+                            </form>
+                          ) : (
+                            <button type="button" onClick={() => rollback(selected, release.id)} disabled={busy !== ''}>回退</button>
+                          ))}
+                          {unusableConfirmationRelease === release.id ? (
+                            <form onSubmit={(event) => { event.preventDefault(); void markReleaseUnusable(selected); }}>
+                              <small>版本记录和审计会保留；下次启动时删除 bundle，之后不能再回退到此版本。</small>
+                              <label>
+                                标记原因
+                                <textarea value={unusableReason} onChange={(event) => setUnusableReason(event.target.value)} minLength={3} maxLength={500} required />
+                              </label>
+                              <label className="permission-consent">
+                                <input type="checkbox" checked={unusableConsent} onChange={(event) => setUnusableConsent(event.target.checked)} required />
+                                我确认这个版本有问题且不可用，同意下次启动删除它的 bundle。
+                              </label>
+                              <button type="submit" disabled={busy !== '' || !unusableConsent || unusableReason.trim().length < 3}>标记并安排清理</button>
+                              <button type="button" className="secondary" onClick={() => setUnusableConfirmationRelease('')}>取消</button>
+                            </form>
+                          ) : (
+                            <button type="button" className="secondary" onClick={() => { setUnusableConfirmationRelease(release.id); setUnusableReason(''); setUnusableConsent(false); }} disabled={busy !== ''}>标记不可用</button>
+                          )}
+                          </div>
                         )}
                       </div>
                     ))}
                   </section>
                 )}
-                {installation && selected.latestRelease?.manifest.ui ? (
+                {installation && activeRelease?.manifest.ui ? (
                   <section className="plugin-preview">
                     <div className="preview-bar">
                       <span>
-                        <i /> 实时 · {selected.latestRelease.version}
+                        <i /> 实时 · {activeRelease.version}
                       </span>
                       <small>沙箱界面 · 版本固定</small>
                     </div>
@@ -359,7 +506,7 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
                       ref={iframeRef}
                       title={`${selected.name} 插件`}
                       sandbox="allow-scripts"
-                      src={`${API}/plugin-assets/${installation.activeReleaseId}/${selected.latestRelease.manifest.ui.entry.split('/').pop()}`}
+                      src={`${API}/plugin-assets/${installation.activeReleaseId}/${activeRelease.manifest.ui.entry.split('/').pop()}`}
                     />
                   </section>
                 ) : (
@@ -367,7 +514,7 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
                     <span>{selected.state === 'proposed' ? '◇' : '◌'}</span>
                     <h4>{forgeGuidance(selected.state).title}</h4>
                     <p>
-                      {selected.state === 'active' && !selected.latestRelease?.manifest.ui
+                      {selected.state === 'active' && !activeRelease?.manifest.ui
                         ? `插件已加载但没有界面。当前能力面：${selectedSurfaces.map((item) => surfaceKindLabel(item.kind)).join('、') || '无'}。`
                         : forgeGuidance(selected.state).body}
                     </p>
@@ -376,7 +523,7 @@ export default function ForgeModal({ onClose, onOpenUnified }: { onClose: () => 
                 <div className="forge-actions">
                   <div>
                     <span className="eyebrow">下一步</span>
-                    <small>点击安装即确认当前版本声明的权限并启用插件。</small>
+                    <small>安装会先显示固定版本和权限摘要，再由你提交明确授权。</small>
                   </div>
                   <div className="forge-action-buttons">
                     {selected.state === 'active' && (

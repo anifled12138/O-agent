@@ -12,6 +12,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,9 +76,14 @@ func (s *Service) lockSourceProject(projectID string) func() {
 }
 
 func (s *Service) handleRuntimeEvent(event RuntimeEvent) {
-	_ = s.repo.MarkRuntimeFailure(context.Background(), event.UserID, event.PluginID, event.ReleaseID, event.Error)
-	raw, _ := json.Marshal(map[string]any{"releaseId": event.ReleaseID, "kind": event.Kind, "error": event.Error})
-	_ = s.repo.Audit(context.Background(), AuditEvent{ID: newID("evt"), UserID: event.UserID, PluginID: event.PluginID, Action: "runtime.crashed", Details: raw, CreatedAt: event.At})
+	if err := s.repo.MarkRuntimeFailure(context.Background(), event.UserID, event.PluginID, event.ReleaseID, event.Error); err != nil {
+		log.Printf("plugin runtime failure state could not be persisted: plugin=%s release=%s kind=%s error=%v", event.PluginID, event.ReleaseID, event.Kind, err)
+	}
+	errorDigest := sha256.Sum256([]byte(event.Error))
+	raw, _ := json.Marshal(map[string]any{"releaseId": event.ReleaseID, "kind": event.Kind, "errorDigest": hex.EncodeToString(errorDigest[:])})
+	if err := s.repo.Audit(context.Background(), AuditEvent{ID: newID("evt"), UserID: event.UserID, PluginID: event.PluginID, Action: "runtime.crashed", Details: raw, CreatedAt: event.At}); err != nil {
+		log.Printf("plugin runtime crash audit could not be persisted: plugin=%s release=%s kind=%s error=%v", event.PluginID, event.ReleaseID, event.Kind, err)
+	}
 }
 
 func (s *Service) ListProjects(ctx context.Context, userID string) ([]ProjectView, error) {
@@ -87,19 +93,95 @@ func (s *Service) ListProjects(ctx context.Context, userID string) ([]ProjectVie
 	}
 	result := make([]ProjectView, 0, len(projects))
 	for _, project := range projects {
-		releases, releaseErr := s.repo.Releases(ctx, project.ID)
-		if releaseErr != nil {
-			return nil, releaseErr
+		releases, err := s.repo.Releases(ctx, project.ID)
+		if err != nil {
+			return nil, err
 		}
 		view := ProjectView{Project: project, Releases: releases}
-		if len(releases) > 0 {
-			view.LatestRelease = &releases[0]
+		for i := range releases {
+			if releases[i].Availability == ReleaseAvailabilityAvailable {
+				view.LatestRelease = &releases[i]
+				break
+			}
 		}
 		result = append(result, view)
 	}
 	return result, nil
 }
-
+func (s *Service) StorageUsage(ctx context.Context, userID string) (StorageUsage, error) {
+	projects, err := s.repo.ListProjects(ctx, userID)
+	if err != nil {
+		return StorageUsage{}, err
+	}
+	root, err := filepath.Abs(filepath.Join(s.dataDir, "plugin-store", "sha256"))
+	if err != nil {
+		return StorageUsage{}, err
+	}
+	usage := StorageUsage{}
+	seen := map[string]struct{}{}
+	for _, project := range projects {
+		releases, err := s.repo.Releases(ctx, project.ID)
+		if err != nil {
+			return StorageUsage{}, err
+		}
+		for _, release := range releases {
+			usage.ReleaseCount++
+			if release.Availability == ReleaseAvailabilityUnusable {
+				continue
+			}
+			if _, exists := seen[release.Digest]; exists {
+				continue
+			}
+			seen[release.Digest] = struct{}{}
+			if len(release.Digest) != 64 {
+				return StorageUsage{}, fmt.Errorf("release %s has an invalid content digest", release.ID)
+			}
+			if _, err := hex.DecodeString(release.Digest); err != nil {
+				return StorageUsage{}, fmt.Errorf("release %s has an invalid content digest: %w", release.ID, err)
+			}
+			expected, err := filepath.Abs(filepath.Join(root, release.Digest))
+			if err != nil {
+				return StorageUsage{}, err
+			}
+			if filepath.Clean(release.BundleDir) != filepath.Clean(expected) {
+				return StorageUsage{}, fmt.Errorf("release %s bundle path is outside the content-addressed store", release.ID)
+			}
+			info, err := os.Lstat(expected)
+			if errors.Is(err, os.ErrNotExist) {
+				usage.MissingBundleCount++
+				continue
+			}
+			if err != nil {
+				return StorageUsage{}, fmt.Errorf("inspect release bundle %s: %w", release.ID, err)
+			}
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return StorageUsage{}, fmt.Errorf("release bundle %s is not a regular directory", release.ID)
+			}
+			usage.UniqueBundleCount++
+			err = filepath.WalkDir(expected, func(path string, entry os.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if entry.Type()&os.ModeSymlink != 0 {
+					return fmt.Errorf("release bundle %s contains a symbolic link", release.ID)
+				}
+				if entry.IsDir() {
+					return nil
+				}
+				fileInfo, err := entry.Info()
+				if err != nil {
+					return err
+				}
+				usage.BundleBytes += fileInfo.Size()
+				return nil
+			})
+			if err != nil {
+				return StorageUsage{}, fmt.Errorf("measure release bundle %s: %w", release.ID, err)
+			}
+		}
+	}
+	return usage, nil
+}
 func (s *Service) BeginRevision(ctx context.Context, userID, projectID string) (Project, error) {
 	project, err := s.repo.Project(ctx, userID, projectID)
 	if err != nil {
@@ -110,7 +192,7 @@ func (s *Service) BeginRevision(ctx context.Context, userID, projectID string) (
 	}
 	project, err = s.repo.Transition(ctx, userID, projectID, StateGenerated, "")
 	if err == nil {
-		s.audit(ctx, project, "revision.started", map[string]any{"activeReleasePreserved": true})
+		err = s.audit(ctx, project, "revision.started", map[string]any{"activeReleasePreserved": true})
 	}
 	return project, err
 }
@@ -165,7 +247,9 @@ func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Pr
 	if err := s.repo.CreateProject(ctx, p); err != nil {
 		return Project{}, err
 	}
-	s.audit(ctx, p, "project.proposed", nil)
+	if err := s.audit(ctx, p, "project.proposed", nil); err != nil {
+		return Project{}, fmt.Errorf("project was created but audit recording failed: %w", err)
+	}
 	return p, nil
 }
 
@@ -188,7 +272,7 @@ func (s *Service) Generate(ctx context.Context, userID, projectID string) (Proje
 	}
 	p, err = s.repo.Transition(ctx, userID, projectID, StateGenerated, "")
 	if err == nil {
-		s.audit(ctx, p, "project.generated", map[string]any{"sourceDir": p.SourceDir, "specVersion": pluginmanifest.SpecV2, "shape": shape})
+		err = s.audit(ctx, p, "project.generated", map[string]any{"sourceDir": p.SourceDir, "specVersion": pluginmanifest.SpecV2, "shape": shape})
 	}
 	return p, err
 }
@@ -235,7 +319,9 @@ func (s *Service) WriteSourceFile(ctx context.Context, userID, projectID string,
 	if err = commitSourceChange(ctx, project.SourceDir, filepath.ToSlash(relative)); err != nil {
 		return Project{}, err
 	}
-	s.audit(ctx, project, "source.updated", map[string]any{"path": filepath.ToSlash(relative), "bytes": len(in.Content)})
+	if err = s.audit(ctx, project, "source.updated", map[string]any{"path": filepath.ToSlash(relative), "bytes": len(in.Content)}); err != nil {
+		return Project{}, fmt.Errorf("source was updated but audit recording failed: %w", err)
+	}
 	return project, nil
 }
 
@@ -254,8 +340,21 @@ func (s *Service) BuildAndTest(ctx context.Context, userID, projectID string) (P
 		return Project{}, Release{}, err
 	}
 	fail := func(buildErr error) (Project, Release, error) {
-		failed, _ := s.repo.Transition(ctx, userID, projectID, StateBuildFailed, buildErr.Error())
-		return failed, Release{}, buildErr
+		_, transitionErr := s.repo.Transition(ctx, userID, projectID, StateBuildFailed, buildErr.Error())
+		if transitionErr != nil {
+			return Project{}, Release{}, errors.Join(buildErr, fmt.Errorf("record plugin build failure: %w", transitionErr))
+		}
+		persisted, readErr := s.repo.Project(ctx, userID, projectID)
+		if readErr != nil {
+			return Project{}, Release{}, errors.Join(buildErr, fmt.Errorf("read plugin build failure state: %w", readErr))
+		}
+		if persisted.State != StateBuildFailed {
+			return Project{}, Release{}, errors.Join(buildErr, fmt.Errorf("plugin build failure state read-back mismatch: got %s", persisted.State))
+		}
+		if auditErr := s.audit(ctx, persisted, "release.build_failed", map[string]any{"failureKind": "build"}); auditErr != nil {
+			return persisted, Release{}, errors.Join(buildErr, fmt.Errorf("record plugin build audit: %w", auditErr))
+		}
+		return persisted, Release{}, buildErr
 	}
 	manifestRaw, err := os.ReadFile(filepath.Join(p.SourceDir, "plugin.json"))
 	if err != nil {
@@ -281,55 +380,174 @@ func (s *Service) BuildAndTest(ctx context.Context, userID, projectID string) (P
 		PermissionHash: pluginmanifest.GrantDigest(document.Manifest),
 		CreatedAt:      time.Now().UTC(),
 		SourceVersion:  document.SourceVersion,
+		Availability:   ReleaseAvailabilityAvailable,
 	}
-	if err = s.repo.CreateRelease(ctx, release); err != nil && !strings.Contains(strings.ToLower(err.Error()), "unique") {
-		return fail(err)
+	if err = s.repo.CreateRelease(ctx, release); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return fail(err)
+		}
+		existing, readErr := s.repo.Release(ctx, release.ID)
+		if readErr != nil {
+			return fail(errors.Join(err, fmt.Errorf("read existing content-addressed release: %w", readErr)))
+		}
+		if existing.ProjectID != projectID || existing.Digest != release.Digest || existing.PermissionHash != release.PermissionHash || existing.BundleDir != release.BundleDir {
+			return fail(fmt.Errorf("content-addressed release ID conflicts with existing immutable release %s", existing.ID))
+		}
+		if existing.Availability != ReleaseAvailabilityAvailable {
+			if existing.Availability == ReleaseAvailabilityUnusable {
+				event := AuditEvent{ID: newID("evt"), Action: "release.cleanup_requeued", CreatedAt: time.Now().UTC()}
+				if requeueErr := s.repo.RequeueUnusableRelease(ctx, userID, projectID, existing.ID, event); requeueErr != nil {
+					return fail(fmt.Errorf("release content is unusable and cleanup could not be requeued: %w", requeueErr))
+				}
+			}
+			return fail(errors.New("this content matches a release already marked unusable; change the source before building a new release"))
+		}
+		release = existing
+	}
+	release, err = s.repo.Release(ctx, release.ID)
+	if err != nil {
+		return fail(fmt.Errorf("read built release back from storage: %w", err))
+	}
+	if release.Availability != ReleaseAvailabilityAvailable || release.Digest != result.digest {
+		return fail(fmt.Errorf("built release read-back mismatch: availability=%s digest=%s", release.Availability, release.Digest))
 	}
 	p, err = s.repo.Transition(ctx, userID, projectID, StateTested, "")
 	if err != nil {
-		return p, release, err
+		return fail(err)
 	}
-	s.audit(ctx, p, "release.tested", map[string]any{"releaseId": release.ID, "digest": result.digest, "sourceVersion": document.SourceVersion})
+	p, err = s.repo.Project(ctx, userID, projectID)
+	if err != nil {
+		return Project{}, Release{}, err
+	}
+	if p.State != StateTested {
+		return fail(fmt.Errorf("plugin build state read-back mismatch: expected tested, got %s", p.State))
+	}
+	if err = s.audit(ctx, p, "release.tested", map[string]any{"releaseId": release.ID, "digest": result.digest, "sourceVersion": document.SourceVersion}); err != nil {
+		return Project{}, Release{}, fmt.Errorf("release was built but audit recording failed: %w", err)
+	}
 	return p, release, nil
 }
 
-func (s *Service) RequestApproval(ctx context.Context, userID, projectID string) (Project, Release, error) {
+func (s *Service) RequestApproval(ctx context.Context, userID, projectID, releaseID string) (Project, Release, error) {
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
+	release, err := s.repo.Release(ctx, releaseID)
+	if err != nil {
+		return Project{}, Release{}, err
+	}
+	if release.ProjectID != projectID {
+		return Project{}, Release{}, domain.ErrNotFound
+	}
+	if release.Availability != ReleaseAvailabilityAvailable {
+		return Project{}, Release{}, errors.New("release is unusable")
+	}
+	if _, err := s.repo.Project(ctx, userID, projectID); err != nil {
+		return Project{}, Release{}, err
+	}
 	p, err := s.repo.Transition(ctx, userID, projectID, StateAwaitingApproval, "")
 	if err != nil {
 		return Project{}, Release{}, err
 	}
-	release, err := s.repo.LatestRelease(ctx, projectID)
-	if err == nil {
-		s.audit(ctx, p, "permission.requested", map[string]any{"permissionHash": release.PermissionHash, "permissions": release.Manifest.Permissions})
+	if err = s.audit(ctx, p, "permission.requested", map[string]any{"releaseId": release.ID, "permissionHash": release.PermissionHash, "permissions": release.Manifest.Permissions}); err != nil {
+		return Project{}, Release{}, fmt.Errorf("approval request state was saved but audit recording failed: %w", err)
 	}
-	return p, release, err
+	return p, release, nil
 }
 func (s *Service) Approve(ctx context.Context, userID, projectID string) (Project, error) {
+	return Project{}, errors.New("approval requires an exact immutable release ID; use ApproveRelease")
+}
+
+// ApproveRelease records a grant for the exact immutable release reviewed by the user.
+func (s *Service) ApproveRelease(ctx context.Context, userID, projectID, releaseID string) (Project, error) {
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
 	p, err := s.repo.Project(ctx, userID, projectID)
 	if err != nil {
 		return Project{}, err
 	}
-	if p.State != StateAwaitingApproval {
-		return Project{}, fmt.Errorf("project is not awaiting approval")
-	}
-	release, err := s.repo.LatestRelease(ctx, projectID)
+	release, err := s.repo.Release(ctx, releaseID)
 	if err != nil {
 		return Project{}, err
 	}
-	if err = s.repo.Grant(ctx, userID, release); err != nil {
+	if release.ProjectID != projectID {
+		return Project{}, domain.ErrNotFound
+	}
+	if release.Availability != ReleaseAvailabilityAvailable {
+		return Project{}, errors.New("release is unusable")
+	}
+	if p.State == StateTested {
+		p, err = s.repo.Transition(ctx, userID, projectID, StateAwaitingApproval, "")
+		if err != nil {
+			return Project{}, err
+		}
+	}
+	if p.State != StateAwaitingApproval && p.State != StateApproved && p.State != StateInstalled && p.State != StateActive && p.State != StateInactive && p.State != StateActivationFailed {
+		return Project{}, fmt.Errorf("project is not ready for release approval")
+	}
+	granted, err := s.repo.HasGrant(ctx, userID, release)
+	if err != nil {
 		return Project{}, err
 	}
-	p, err = s.repo.Transition(ctx, userID, projectID, StateApproved, "")
-	if err == nil {
-		s.audit(ctx, p, "permission.approved", map[string]any{"releaseId": release.ID, "permissionHash": release.PermissionHash})
+	if !granted {
+		if err := s.repo.Grant(ctx, userID, release); err != nil {
+			return Project{}, err
+		}
 	}
-	return p, err
+	if p.State == StateAwaitingApproval {
+		p, err = s.repo.Transition(ctx, userID, projectID, StateApproved, "")
+		if err != nil {
+			return Project{}, err
+		}
+	}
+	if auditErr := s.audit(ctx, p, "permission.approved", map[string]any{"releaseId": release.ID, "permissionHash": release.PermissionHash}); auditErr != nil {
+		return Project{}, fmt.Errorf("permission grant and approval state were saved, but audit recording failed: %w", auditErr)
+	}
+	persisted, err := s.repo.Project(ctx, userID, projectID)
+	if err != nil {
+		return Project{}, err
+	}
+	grantExists, err := s.repo.HasGrant(ctx, userID, release)
+	if err != nil {
+		return Project{}, err
+	}
+	if !grantExists {
+		return Project{}, errors.New("release permission grant was not persisted")
+	}
+	if persisted.State != p.State {
+		return Project{}, fmt.Errorf("release approval state read-back mismatch: expected %s, got %s", p.State, persisted.State)
+	}
+	return persisted, nil
+}
+func (s *Service) Install(ctx context.Context, userID, projectID string) (Project, Installation, error) {
+	return Project{}, Installation{}, errors.New("installation requires an exact immutable release ID; use InstallRelease")
 }
 
-func (s *Service) Install(ctx context.Context, userID, projectID string) (Project, Installation, error) {
+func (s *Service) InstallRelease(ctx context.Context, userID, projectID, releaseID string) (Project, Installation, error) {
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
 	p, err := s.repo.Project(ctx, userID, projectID)
 	if err != nil {
 		return Project{}, Installation{}, err
+	}
+	if p.State != StateApproved && p.State != StateInactive && p.State != StateActivationFailed {
+		return Project{}, Installation{}, fmt.Errorf("project must be approved before installation")
+	}
+	release, err := s.repo.Release(ctx, releaseID)
+	if err != nil {
+		return Project{}, Installation{}, err
+	}
+	if release.ProjectID != projectID {
+		return Project{}, Installation{}, domain.ErrNotFound
+	}
+	if release.Availability != ReleaseAvailabilityAvailable {
+		return Project{}, Installation{}, errors.New("release is unusable")
+	}
+	granted, err := s.repo.HasGrant(ctx, userID, release)
+	if err != nil {
+		return Project{}, Installation{}, err
+	}
+	if !granted {
+		return Project{}, Installation{}, errors.New("release permissions have not been approved")
 	}
 	if p.State == StateActivationFailed {
 		p, err = s.repo.Transition(ctx, userID, projectID, StateApproved, "")
@@ -337,61 +555,159 @@ func (s *Service) Install(ctx context.Context, userID, projectID string) (Projec
 			return Project{}, Installation{}, err
 		}
 	}
-	if p.State != StateApproved && p.State != StateInactive {
-		return Project{}, Installation{}, fmt.Errorf("project must be approved before installation")
-	}
-	release, err := s.repo.LatestRelease(ctx, projectID)
+	before, err := s.repo.ListInstallations(ctx, userID)
 	if err != nil {
 		return Project{}, Installation{}, err
 	}
-	granted, err := s.repo.HasGrant(ctx, userID, release)
-	if err != nil || !granted {
-		if err == nil {
-			err = errors.New("release permissions have not been approved")
+	var previous *Release
+	for _, item := range before {
+		if item.PluginID == release.PluginID && item.Status == "active" {
+			old, loadErr := s.repo.Release(ctx, item.ActiveReleaseID)
+			if loadErr != nil {
+				return Project{}, Installation{}, loadErr
+			}
+			previous = &old
+			break
 		}
-		return Project{}, Installation{}, err
 	}
 	installation, err := s.activateRelease(ctx, userID, release)
 	if err != nil {
-		failed, _ := s.repo.Transition(ctx, userID, projectID, StateActivationFailed, err.Error())
+		failed, transitionErr := s.repo.Transition(ctx, userID, projectID, StateActivationFailed, err.Error())
+		if transitionErr == nil {
+			if auditErr := s.audit(ctx, failed, "plugin.activation_failed", map[string]any{"releaseId": release.ID}); auditErr != nil {
+				transitionErr = fmt.Errorf("record activation failure audit: %w", auditErr)
+			}
+		}
+		if transitionErr != nil {
+			return Project{}, Installation{}, errors.Join(err, fmt.Errorf("record activation failure: %w", transitionErr))
+		}
 		return failed, Installation{}, err
 	}
 	if p.State == StateApproved {
 		p, err = s.repo.Transition(ctx, userID, projectID, StateInstalled, "")
 		if err != nil {
-			return p, Installation{}, err
+			return Project{}, Installation{}, errors.Join(err, s.restoreInstallation(ctx, userID, release, previous))
 		}
 	}
 	p, err = s.repo.Transition(ctx, userID, projectID, StateActive, "")
-	if err == nil {
-		s.audit(ctx, p, "plugin.activated", map[string]any{"releaseId": release.ID})
+	if err != nil {
+		return Project{}, Installation{}, errors.Join(err, s.restoreInstallation(ctx, userID, release, previous))
 	}
-	return p, installation, err
+	if err = s.audit(ctx, p, "plugin.activated", map[string]any{"releaseId": release.ID}); err != nil {
+		return Project{}, Installation{}, fmt.Errorf("plugin activated but audit recording failed: %w", err)
+	}
+	p, err = s.repo.Project(ctx, userID, projectID)
+	if err != nil {
+		return Project{}, Installation{}, err
+	}
+	if p.State != StateActive {
+		return Project{}, Installation{}, fmt.Errorf("plugin lifecycle read-back mismatch: expected active, got %s", p.State)
+	}
+	installations, err := s.repo.ListInstallations(ctx, userID)
+	if err != nil {
+		return Project{}, Installation{}, err
+	}
+	verified := false
+	for _, installed := range installations {
+		if installed.PluginID == release.PluginID && installed.Status == "active" && installed.ActiveReleaseID == release.ID {
+			verified = true
+			installation = installed
+			break
+		}
+	}
+	if !verified {
+		return Project{}, Installation{}, fmt.Errorf("plugin activation was not observed for release %s", release.ID)
+	}
+	return p, installation, nil
 }
 
+func (s *Service) restoreInstallation(ctx context.Context, userID string, candidate Release, previous *Release) error {
+	if previous != nil {
+		if _, err := s.activateRelease(ctx, userID, *previous); err != nil {
+			return fmt.Errorf("restore previous release %s: %w", previous.ID, err)
+		}
+		return nil
+	}
+	if err := s.runtime.Deactivate(ctx, userID, candidate.PluginID); err != nil {
+		return fmt.Errorf("deactivate candidate release %s: %w", candidate.ID, err)
+	}
+	if err := s.repo.SetInstallationStatus(ctx, userID, candidate.PluginID, "inactive"); err != nil {
+		return fmt.Errorf("persist inactive candidate release %s: %w", candidate.ID, err)
+	}
+	return nil
+}
 func (s *Service) Deactivate(ctx context.Context, userID, projectID string) (Project, error) {
-	p, err := s.repo.Project(ctx, userID, projectID)
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
+	project, err := s.repo.Project(ctx, userID, projectID)
 	if err != nil {
 		return Project{}, err
 	}
-	release, err := s.repo.LatestRelease(ctx, projectID)
+	if project.State != StateActive {
+		return Project{}, fmt.Errorf("only an active plugin can be deactivated")
+	}
+	installations, err := s.repo.ListInstallations(ctx, userID)
 	if err != nil {
 		return Project{}, err
+	}
+	var active *Installation
+	for _, item := range installations {
+		if item.ProjectID == projectID && item.Status == "active" {
+			copy := item
+			active = &copy
+			break
+		}
+	}
+	if active == nil {
+		return Project{}, fmt.Errorf("active installation was not found for project %s", projectID)
+	}
+	release, err := s.repo.Release(ctx, active.ActiveReleaseID)
+	if err != nil {
+		return Project{}, err
+	}
+	if release.ProjectID != projectID {
+		return Project{}, domain.ErrNotFound
 	}
 	if err = s.runtime.Deactivate(ctx, userID, release.PluginID); err != nil {
 		return Project{}, err
 	}
 	if err = s.repo.SetInstallationStatus(ctx, userID, release.PluginID, "inactive"); err != nil {
+		_, restoreErr := s.activateRelease(ctx, userID, release)
+		return Project{}, errors.Join(err, restoreErr)
+	}
+	if _, err = s.repo.Transition(ctx, userID, projectID, StateInactive, ""); err != nil {
+		_, restoreErr := s.activateRelease(ctx, userID, release)
+		return Project{}, errors.Join(err, restoreErr)
+	}
+	persisted, err := s.repo.Project(ctx, userID, projectID)
+	if err != nil {
 		return Project{}, err
 	}
-	p, err = s.repo.Transition(ctx, userID, projectID, StateInactive, "")
-	if err == nil {
-		s.audit(ctx, p, "plugin.deactivated", nil)
+	if persisted.State != StateInactive {
+		return Project{}, fmt.Errorf("plugin deactivation state read-back mismatch: expected inactive, got %s", persisted.State)
 	}
-	return p, err
+	installations, err = s.repo.ListInstallations(ctx, userID)
+	if err != nil {
+		return Project{}, err
+	}
+	verified := false
+	for _, item := range installations {
+		if item.ProjectID == projectID && item.ActiveReleaseID == release.ID && item.Status == "inactive" {
+			verified = true
+			break
+		}
+	}
+	if !verified {
+		return Project{}, fmt.Errorf("inactive installation was not observed for release %s", release.ID)
+	}
+	if err = s.audit(ctx, persisted, "plugin.deactivated", map[string]any{"releaseId": release.ID}); err != nil {
+		return Project{}, fmt.Errorf("plugin deactivated but audit recording failed: %w", err)
+	}
+	return persisted, nil
 }
-
 func (s *Service) Rollback(ctx context.Context, userID, projectID, releaseID string) (Project, Installation, error) {
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
 	project, err := s.repo.Project(ctx, userID, projectID)
 	if err != nil {
 		return Project{}, Installation{}, err
@@ -400,31 +716,61 @@ func (s *Service) Rollback(ctx context.Context, userID, projectID, releaseID str
 		return Project{}, Installation{}, errors.New("rollback requires an active plugin")
 	}
 	release, err := s.repo.Release(ctx, releaseID)
-	if err != nil || release.ProjectID != project.ID {
-		if err == nil {
-			err = domain.ErrNotFound
-		}
+	if err != nil {
 		return Project{}, Installation{}, err
 	}
+	if release.ProjectID != project.ID {
+		return Project{}, Installation{}, domain.ErrNotFound
+	}
+	if release.Availability != ReleaseAvailabilityAvailable {
+		return Project{}, Installation{}, errors.New("release is unusable")
+	}
 	granted, err := s.repo.HasGrant(ctx, userID, release)
-	if err != nil || !granted {
-		if err == nil {
-			err = errors.New("rollback release permissions are not approved")
-		}
+	if err != nil {
 		return Project{}, Installation{}, err
+	}
+	if !granted {
+		return Project{}, Installation{}, errors.New("rollback release permissions are not approved")
 	}
 	installation, err := s.activateRelease(ctx, userID, release)
 	if err != nil {
 		return Project{}, Installation{}, err
 	}
-	s.audit(ctx, project, "plugin.rolled_back", map[string]any{"releaseId": release.ID})
-	return project, installation, nil
+	persisted, err := s.repo.Project(ctx, userID, projectID)
+	if err != nil {
+		return Project{}, Installation{}, err
+	}
+	if persisted.State != StateActive {
+		return Project{}, Installation{}, fmt.Errorf("rollback lifecycle state read-back mismatch: expected active, got %s", persisted.State)
+	}
+	installations, err := s.repo.ListInstallations(ctx, userID)
+	if err != nil {
+		return Project{}, Installation{}, err
+	}
+	verified := false
+	for _, item := range installations {
+		if item.ProjectID == projectID && item.PluginID == release.PluginID && item.Status == "active" && item.ActiveReleaseID == release.ID {
+			installation = item
+			verified = true
+			break
+		}
+	}
+	if !verified {
+		return Project{}, Installation{}, fmt.Errorf("rollback release %s was not observed active", release.ID)
+	}
+	if err = s.audit(ctx, persisted, "plugin.rolled_back", map[string]any{"releaseId": release.ID}); err != nil {
+		return Project{}, Installation{}, fmt.Errorf("plugin rolled back but audit recording failed: %w", err)
+	}
+	return persisted, installation, nil
 }
 
 // activateRelease coordinates the in-memory registry swap with the durable
 // installation/surface transaction. If persistence fails, it restores the
 // previous mounted release (or detaches the candidate) before returning.
 func (s *Service) activateRelease(ctx context.Context, userID string, release Release) (Installation, error) {
+	if release.Availability != ReleaseAvailabilityAvailable {
+		return Installation{}, errors.New("cannot activate an unusable release")
+	}
 	var previous *Release
 	installations, listErr := s.repo.ListInstallations(ctx, userID)
 	if listErr != nil {
@@ -448,12 +794,16 @@ func (s *Service) activateRelease(ctx context.Context, userID string, release Re
 	if err == nil {
 		return installation, nil
 	}
+	persistErr := fmt.Errorf("persist plugin activation: %w", err)
+	var compensationErr error
 	if previous != nil {
-		_ = s.runtime.Activate(context.Background(), userID, *previous)
-	} else {
-		_ = s.runtime.Deactivate(context.Background(), userID, release.PluginID)
+		if restoreErr := s.runtime.Activate(context.Background(), userID, *previous); restoreErr != nil {
+			compensationErr = fmt.Errorf("restore runtime release %s: %w", previous.ID, restoreErr)
+		}
+	} else if deactivateErr := s.runtime.Deactivate(context.Background(), userID, release.PluginID); deactivateErr != nil {
+		compensationErr = fmt.Errorf("detach unpersisted release %s: %w", release.ID, deactivateErr)
 	}
-	return Installation{}, fmt.Errorf("persist plugin activation: %w", err)
+	return Installation{}, errors.Join(persistErr, compensationErr)
 }
 
 func (s *Service) Invoke(ctx context.Context, userID, capabilityID string, input json.RawMessage) (json.RawMessage, error) {
@@ -541,19 +891,128 @@ func (s *Service) LegacyUICall(ctx context.Context, userID, pluginID, suffix str
 	return s.runtime.InvokePinned(ctx, userID, selected, release.ID, input)
 }
 
-func (s *Service) Restore(ctx context.Context) error {
-	installations, err := s.repo.ActiveInstallations(ctx)
+func (s *Service) MarkReleaseUnusable(ctx context.Context, userID, projectID, releaseID, reason string) (Release, error) {
+	reason = strings.TrimSpace(reason)
+	runeCount := len([]rune(reason))
+	if runeCount < 3 || runeCount > 500 {
+		return Release{}, errors.New("provide a reason between 3 and 500 characters")
+	}
+	unlock := s.lockSourceProject(projectID)
+	defer unlock()
+	if _, err := s.repo.Project(ctx, userID, projectID); err != nil {
+		return Release{}, err
+	}
+	release, err := s.repo.Release(ctx, releaseID)
+	if err != nil {
+		return Release{}, err
+	}
+	if release.ProjectID != projectID {
+		return Release{}, domain.ErrNotFound
+	}
+	event := AuditEvent{ID: newID("evt"), Action: "release.marked_unusable", CreatedAt: time.Now().UTC()}
+	if err := s.repo.MarkReleaseUnusable(ctx, userID, projectID, releaseID, reason, event); err != nil {
+		return Release{}, err
+	}
+	persisted, err := s.repo.Release(ctx, releaseID)
+	if err != nil {
+		return Release{}, fmt.Errorf("release was marked unusable but read-back failed: %w", err)
+	}
+	if persisted.Availability != ReleaseAvailabilityPendingCleanup {
+		return Release{}, fmt.Errorf("release unusable state read-back mismatch: got %s", persisted.Availability)
+	}
+	return persisted, nil
+}
+
+func (s *Service) cleanupMarkedReleaseBundles(ctx context.Context) error {
+	pending, err := s.repo.PendingBundleCleanup(ctx)
+	if err != nil {
+		return err
+	}
+	root, err := filepath.Abs(filepath.Join(s.dataDir, "plugin-store", "sha256"))
 	if err != nil {
 		return err
 	}
 	var joined error
+	for _, release := range pending {
+		if len(release.Digest) != 64 {
+			joined = errors.Join(joined, fmt.Errorf("pending release %s has an invalid digest", release.ID))
+			continue
+		}
+		if _, err := hex.DecodeString(release.Digest); err != nil {
+			joined = errors.Join(joined, fmt.Errorf("pending release %s has an invalid digest: %w", release.ID, err))
+			continue
+		}
+		expected, err := filepath.Abs(filepath.Join(root, release.Digest))
+		if err != nil {
+			joined = errors.Join(joined, err)
+			continue
+		}
+		if filepath.Clean(release.BundleDir) != filepath.Clean(expected) {
+			joined = errors.Join(joined, fmt.Errorf("pending release %s bundle path is outside the content store", release.ID))
+			continue
+		}
+		storeInfo, storeErr := os.Lstat(filepath.Dir(root))
+		if storeErr == nil && (!storeInfo.IsDir() || storeInfo.Mode()&os.ModeSymlink != 0) {
+			joined = errors.Join(joined, errors.New("plugin store is not a regular directory"))
+			continue
+		}
+		if storeErr != nil && !errors.Is(storeErr, os.ErrNotExist) {
+			joined = errors.Join(joined, fmt.Errorf("inspect plugin store: %w", storeErr))
+			continue
+		}
+		rootInfo, err := os.Lstat(root)
+		if err == nil && (!rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0) {
+			joined = errors.Join(joined, errors.New("plugin content store is not a regular directory"))
+			continue
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			joined = errors.Join(joined, fmt.Errorf("inspect plugin content store: %w", err))
+			continue
+		}
+		info, err := os.Lstat(expected)
+		if err == nil {
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				joined = errors.Join(joined, fmt.Errorf("pending release %s bundle is not a regular directory", release.ID))
+				continue
+			}
+			if err = os.RemoveAll(expected); err != nil {
+				joined = errors.Join(joined, fmt.Errorf("remove unusable release bundle %s: %w", release.ID, err))
+				continue
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			joined = errors.Join(joined, fmt.Errorf("inspect unusable release bundle %s: %w", release.ID, err))
+			continue
+		}
+		if _, err = os.Lstat(expected); !errors.Is(err, os.ErrNotExist) {
+			if err == nil {
+				err = errors.New("bundle still exists after cleanup")
+			}
+			joined = errors.Join(joined, fmt.Errorf("verify unusable release bundle removal %s: %w", release.ID, err))
+			continue
+		}
+		event := AuditEvent{ID: newID("evt"), Action: "release.bundle_removed", CreatedAt: time.Now().UTC()}
+		if err := s.repo.MarkReleaseUnusableComplete(ctx, release.ID, event); err != nil {
+			joined = errors.Join(joined, fmt.Errorf("finalize unusable release %s: %w", release.ID, err))
+		}
+	}
+	return joined
+}
+func (s *Service) Restore(ctx context.Context) error {
+	joined := s.cleanupMarkedReleaseBundles(ctx)
+	installations, err := s.repo.ActiveInstallations(ctx)
+	if err != nil {
+		return errors.Join(joined, err)
+	}
 	for _, installation := range installations {
 		release, loadErr := s.repo.Release(ctx, installation.ActiveReleaseID)
+		if loadErr == nil && release.Availability != ReleaseAvailabilityAvailable {
+			loadErr = fmt.Errorf("active release %s is marked %s", release.ID, release.Availability)
+		}
 		if loadErr == nil {
 			loadErr = s.runtime.Activate(ctx, installation.UserID, release)
-			if loadErr == nil {
-				_, loadErr = s.repo.ActivateWithSurfaces(ctx, installation.UserID, release, s.runtime.SurfaceStates(installation.UserID, release.PluginID))
-			}
+		}
+		if loadErr == nil {
+			_, loadErr = s.repo.ActivateWithSurfaces(ctx, installation.UserID, release, s.runtime.SurfaceStates(installation.UserID, release.PluginID))
 		}
 		if loadErr != nil {
 			joined = errors.Join(joined, fmt.Errorf("restore %s: %w", installation.PluginID, loadErr))
@@ -605,9 +1064,15 @@ func (s *Service) Asset(ctx context.Context, userID, releaseID, asset string) (s
 	return absolute, nil
 }
 
-func (s *Service) audit(ctx context.Context, p Project, action string, details any) {
-	raw, _ := json.Marshal(details)
-	_ = s.repo.Audit(ctx, AuditEvent{ID: newID("evt"), UserID: p.UserID, ProjectID: p.ID, Action: action, Details: raw, CreatedAt: time.Now().UTC()})
+func (s *Service) audit(ctx context.Context, p Project, action string, details any) error {
+	raw, err := json.Marshal(details)
+	if err != nil {
+		return fmt.Errorf("encode plugin audit event: %w", err)
+	}
+	if err := s.repo.Audit(ctx, AuditEvent{ID: newID("evt"), UserID: p.UserID, ProjectID: p.ID, Action: action, Details: raw, CreatedAt: time.Now().UTC()}); err != nil {
+		return fmt.Errorf("persist plugin audit event %s: %w", action, err)
+	}
+	return nil
 }
 
 func newID(prefix string) string {
@@ -651,29 +1116,7 @@ func artifactDigest(manifest []byte, paths ...string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 func packageRelease(bundleDir, builtExe, frontendSource string, manifest []byte) error {
-	backendDir := filepath.Join(bundleDir, "backend")
-	frontendDir := filepath.Join(bundleDir, "frontend")
-	if err := os.MkdirAll(backendDir, 0o700); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(frontendDir, 0o700); err != nil {
-		return err
-	}
-	exeName := "plugin"
-	if runtime.GOOS == "windows" {
-		exeName += ".exe"
-	}
-	if err := copyIfMissing(builtExe, filepath.Join(backendDir, exeName), 0o700); err != nil {
-		return err
-	}
-	if err := copyIfMissing(frontendSource, filepath.Join(frontendDir, "index.html"), 0o600); err != nil {
-		return err
-	}
-	path := filepath.Join(bundleDir, "manifest.json")
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return os.WriteFile(path, manifest, 0o600)
-	}
-	return nil
+	return packageLegacyArtifactSet(bundleDir, manifest, builtExe, frontendSource)
 }
 func copyIfMissing(source, target string, mode os.FileMode) error {
 	if _, err := os.Stat(target); err == nil {

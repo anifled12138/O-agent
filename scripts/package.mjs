@@ -16,6 +16,12 @@ const rootDir = path.resolve(__dirname, '..');
 const desktopDir = path.join(rootDir, 'desktop');
 const frontendDir = path.join(rootDir, 'frontend');
 const backendDir = path.join(rootDir, 'backend');
+const rootPackage = JSON.parse(await fs.readFile(path.join(rootDir, 'package.json'), 'utf8'));
+const desktopPackage = JSON.parse(await fs.readFile(path.join(desktopDir, 'package.json'), 'utf8'));
+const releaseVersion = desktopPackage.version;
+if (!releaseVersion || rootPackage.version !== releaseVersion) {
+  throw new Error(`root and desktop package versions must match (root=${rootPackage.version}, desktop=${releaseVersion})`);
+}
 
 // 从 desktop 目录解析依赖 (如 @electron/packager)
 const desktopRequire = createRequire(path.join(desktopDir, 'package.json'));
@@ -205,7 +211,7 @@ async function main() {
   // 3. Electron 打包
   logStep(3, totalSteps, '使用 Electron Packager 封装独立桌面程序');
   const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*$/, 'Z');
-  const outputRoot = path.join(rootDir, 'release', `O-0.1.0-${timestamp}`);
+  const outputRoot = path.join(rootDir, 'release', `O-${releaseVersion}-${timestamp}`);
   await fs.mkdir(outputRoot, { recursive: true });
 
   const { packager } = desktopRequire('@electron/packager');
@@ -224,8 +230,8 @@ async function main() {
     overwrite: true,
     asar: false,
     icon: path.join(desktopDir, 'assets', 'icon.ico'),
-    appVersion: '0.1.0',
-    buildVersion: '0.1.0',
+    appVersion: releaseVersion,
+    buildVersion: releaseVersion,
     prune: true,
     ignore: [/^[/\\](?:.runtime|scripts|node_modules[/\\].cache)(?:[/\\]|$)/],
     win32metadata: { CompanyName: 'O', FileDescription: 'O local-first Agent', ProductName: 'O' },
@@ -250,9 +256,12 @@ async function main() {
     try {
       const baseZip = path.join(outputRoot, 'O-win32-x64-portable');
       execSync(`python -c "import sys, shutil; shutil.make_archive(sys.argv[1], 'zip', sys.argv[2])" "${baseZip}" "${appPaths[0]}"`);
+      if (!existsSync(portableZip) || (await fs.stat(portableZip)).size === 0) {
+        throw new Error('portable zip was not created or is empty');
+      }
       logSuccess(`便携压缩包生成成功: ${portableZip}`);
     } catch (zErr) {
-      logInfo(`Zip 压缩提示 (可选): ${zErr.message}`);
+      throw new Error(`required portable zip generation failed: ${zErr.message}`);
     }
 
     if (!skipInstaller) {

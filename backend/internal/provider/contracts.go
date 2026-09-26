@@ -1,13 +1,32 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 )
 
+type attemptBudgetContextKey struct{}
+
+// WithAttemptBudget limits the number of HTTP attempts used by one provider
+// completion. It lets the Agent runtime reserve retry attempts inside its
+// host-owned per-run model-call ceiling.
+func WithAttemptBudget(ctx context.Context, attempts int) context.Context {
+	if attempts < 1 {
+		return ctx
+	}
+	return context.WithValue(ctx, attemptBudgetContextKey{}, attempts)
+}
+
+func attemptBudget(ctx context.Context) (int, bool) {
+	value, ok := ctx.Value(attemptBudgetContextKey{}).(int)
+	return value, ok
+}
+
 const (
+	MaxCompletionAttempts = 3
 	KindNewAPI            = "new-api"
 	KindOneAPI            = "one-api"
 	KindOpenAICompatible  = "openai-compatible"
@@ -95,6 +114,7 @@ type ProviderError struct {
 	Class      ErrorClass
 	StatusCode int
 	RetryAfter time.Duration
+	Attempts   int
 	SafeDetail string
 	Cause      error
 }

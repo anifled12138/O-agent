@@ -12,8 +12,11 @@ import (
 	"axiom.local/agent/internal/capability"
 	"axiom.local/agent/internal/capsule"
 	"axiom.local/agent/internal/coretools"
+	"axiom.local/agent/internal/domain"
+	"axiom.local/agent/internal/permissions"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/provider"
+	"axiom.local/agent/internal/runfiles"
 )
 
 type capabilityCandidate struct {
@@ -32,41 +35,55 @@ type loadedTool struct {
 }
 
 type turnScope struct {
-	owner          *Service
-	userID         string
-	conversationID string
-	turnID         string
-	evaluation     bool
-	lease          pluginforge.TurnLease
-	coreTools      map[string]coretools.Tool
-	forceCompact   bool
-	tools          map[string]pluginforge.CapabilityBinding
-	skills         map[string]pluginforge.SkillBinding
-	creator        map[string]provider.ToolDefinition
-	loaded         map[string]loadedTool
-	loadedByID     map[string]string
-	loadedCreate   map[string]provider.ToolDefinition
-	loadedCapsules map[string]capsule.Manifest
-	contextTokens  int
+	owner             *Service
+	userID            string
+	conversationID    string
+	turnID            string
+	evaluation        bool
+	lease             pluginforge.TurnLease
+	runFiles          *runfiles.Scope
+	coreTools         map[string]coretools.Tool
+	forceCompact      bool
+	tools             map[string]pluginforge.CapabilityBinding
+	skills            map[string]pluginforge.SkillBinding
+	creator           map[string]provider.ToolDefinition
+	loaded            map[string]loadedTool
+	loadedByID        map[string]string
+	loadedCreate      map[string]provider.ToolDefinition
+	loadedCapsules    map[string]capsule.Manifest
+	contextTokens     int
+	permissionProfile domain.PermissionProfile
 }
 
-func newTurnScope(owner *Service, userID, conversationID, turnID string) *turnScope {
+func newTurnScope(owner *Service, userID, conversationID, turnID string) (*turnScope, error) {
 	return newScopedTurn(owner, userID, conversationID, turnID, false)
 }
 
-func newEvaluationScope(owner *Service, userID string) *turnScope {
+func newEvaluationScope(owner *Service, userID string) (*turnScope, error) {
 	return newScopedTurn(owner, userID, "", "", true)
 }
 
-func newScopedTurn(owner *Service, userID, conversationID, turnID string, evaluation bool) *turnScope {
+func newScopedTurn(owner *Service, userID, conversationID, turnID string, evaluation bool) (*turnScope, error) {
+	if owner == nil || owner.runfiles == nil {
+		return nil, fmt.Errorf("agent run file manager is unavailable")
+	}
+	runFiles, err := owner.runfiles.NewScope()
+	if err != nil {
+		return nil, err
+	}
 	lease := owner.forge.BeginTurn(userID)
 	creator := creatorTools()
 	if evaluation {
 		creator = map[string]provider.ToolDefinition{}
 	}
-	scope := &turnScope{owner: owner, userID: userID, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}, coreTools: map[string]coretools.Tool{}}
+	scope := &turnScope{owner: owner, userID: userID, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, runFiles: runFiles, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}, coreTools: map[string]coretools.Tool{}}
+	if evaluation {
+		scope.permissionProfile = domain.PermissionProfileReadOnly
+	} else {
+		scope.permissionProfile = domain.DefaultPermissionProfile()
+	}
 	if owner != nil {
-		for _, ct := range coretools.GetCoreTools(owner.workspaceRoot) {
+		for _, ct := range coretools.GetCoreTools(owner.workspaceRoot, runFiles) {
 			scope.coreTools[ct.Definition.Function.Name] = ct
 		}
 	}
@@ -82,12 +99,12 @@ func newScopedTurn(owner *Service, userID, conversationID, turnID string, evalua
 	for _, binding := range lease.Skills() {
 		scope.skills[binding.Skill.ID] = binding
 	}
-	return scope
+	return scope, nil
 }
 
 func (s *turnScope) setWorkspaceRoot(root string) {
 	if strings.TrimSpace(root) != "" {
-		for _, ct := range coretools.GetCoreTools(root) {
+		for _, ct := range coretools.GetCoreTools(root, s.runFiles) {
 			s.coreTools[ct.Definition.Function.Name] = ct
 		}
 	}
@@ -97,6 +114,99 @@ func (s *turnScope) setContextWindow(tokens int) {
 	if tokens > 0 {
 		s.contextTokens = tokens
 	}
+}
+
+// restoreCheckpointState rebuilds the small amount of read-only, turn-local
+// state that is not represented by the model transcript. Only replayed
+// capability loads and context-compaction requests are allowed here; tools
+// with other in-memory effects mark their checkpoints non-resumable.
+func (s *turnScope) restoreCheckpointState(messages []provider.ChatMessage) error {
+	calls := map[string]provider.ToolCall{}
+	for _, message := range messages {
+		if message.Role == "assistant" {
+			for _, call := range message.ToolCalls {
+				calls[call.ID] = call
+			}
+			continue
+		}
+		if message.Role != "tool" {
+			continue
+		}
+		call, ok := calls[message.ToolCallID]
+		if !ok || (call.Function.Name != "axiom_capability_load" && call.Function.Name != "axiom_compact_context") || !toolResultOK(json.RawMessage(message.Content)) {
+			continue
+		}
+		restored := s.execute(context.Background(), call.Function.Name, json.RawMessage(call.Function.Arguments))
+		if !sameJSON(restored, []byte(message.Content)) {
+			return fmt.Errorf("turn-local tool state for %q no longer matches the saved checkpoint", call.Function.Name)
+		}
+	}
+	return nil
+}
+
+func sameJSON(left, right []byte) bool {
+	var leftValue, rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return false
+	}
+	leftJSON, leftErr := json.Marshal(leftValue)
+	rightJSON, rightErr := json.Marshal(rightValue)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
+func (s *turnScope) authorizeTool(name string, arguments json.RawMessage) (permissions.Decision, permissions.Request) {
+	request := permissions.Request{ToolName: name, Source: "unknown", Effect: permissions.EffectUnknown}
+	var input map[string]any
+	_ = json.Unmarshal(arguments, &input)
+	if path, ok := input["path"].(string); ok {
+		request.Resource = path
+	}
+	switch name {
+	case "axiom_capability_search", "axiom_capability_load", "axiom_tool_usage_metrics", "fs_read", "fs_list", "grep_search":
+		request.Source, request.Effect = "host", permissions.EffectRead
+	case "fs_write", "file_edit":
+		request.Source, request.Effect = "host", permissions.EffectWorkspaceWrite
+	case "exec_command", "exec_script":
+		request.Source, request.Effect = "host", permissions.EffectShell
+	case "axiom_plugin_projects", "axiom_plugin_source_tree", "axiom_plugin_read_source", "axiom_plugin_source_diff":
+		request.Source, request.Effect = "plugin_creator", permissions.EffectRead
+	case "axiom_plugin_propose", "axiom_plugin_generate", "axiom_plugin_write_source", "axiom_plugin_apply_patch", "axiom_plugin_begin_revision":
+		request.Source, request.Effect = "plugin_creator", permissions.EffectWorkspaceWrite
+	case "axiom_plugin_build":
+		// Building executes a compiler over Agent-authored source and may resolve
+		// dependencies, so workspace write permission alone is insufficient.
+		request.Source, request.Effect = "plugin_creator", permissions.EffectSensitive
+	case "axiom_plugin_install", "axiom_plugin_rollback", "axiom_plugin_mark_unusable":
+		request.Source, request.Effect = "plugin_lifecycle", permissions.EffectSensitive
+		if releaseID, ok := input["releaseId"].(string); ok {
+			request.ReleaseID = releaseID
+		}
+	case "axiom_fragment_create", "axiom_fragment_invoke", "axiom_fragment_drop", "axiom_capsule_save":
+		request.Source, request.Effect = "plugin_lifecycle", permissions.EffectSensitive
+	case "axiom_compact_context":
+		request.Source, request.Effect = "host", permissions.EffectSensitive
+	default:
+		if _, ok := s.coreTools[name]; ok {
+			// Only explicit core read tools are allow-listed above. Any new core tool
+			// remains unknown until its host-owned effect is classified here.
+			request.Source = "host"
+		} else if item, ok := s.loaded[name]; ok {
+			request.Source, request.PluginID, request.ReleaseID = "plugin", item.Capability.PluginID, item.Capability.ReleaseID
+		} else if manifest, ok := s.loadedCapsules[name]; ok {
+			request.Source, request.PluginID, request.ReleaseID = "capsule", manifest.ID, manifest.Digest
+		} else if s.owner != nil && s.owner.plugins != nil {
+			request.Source = "mcp_or_plugin"
+			if serverID, _, found := strings.Cut(name, "__"); found {
+				request.PluginID = serverID
+			}
+		}
+	}
+	request.Profile = s.permissionProfile
+	return permissions.Evaluate(s.permissionProfile, request), request
+}
+
+func (s *turnScope) requestToolApproval(ctx context.Context, callID string, request permissions.Request, decision permissions.Decision, arguments json.RawMessage) (bool, error) {
+	return s.owner.requestToolApproval(ctx, s.userID, s.conversationID, s.turnID, callID, request, decision, arguments)
 }
 
 type turnCompaction struct {
@@ -135,17 +245,19 @@ func (s *turnScope) prepareTurnMessages(messages []provider.ChatMessage, _ int) 
 	return prepared, stats
 }
 
-func (s *turnScope) Close() {
+func (s *turnScope) Close() error {
 	if s.turnID != "" && s.owner != nil && s.owner.fragments != nil {
 		s.owner.fragments.DropTurn(s.userID, s.turnID)
 	}
 	s.lease.Close()
+	return s.runFiles.Close()
 }
 
 func (s *turnScope) definitions() []provider.ToolDefinition {
 	result := []provider.ToolDefinition{
 		tool("axiom_capability_search", "Search the compact capability index for relevant installed Agent tools, lazy skills, or creator actions. Results contain summaries only; call axiom_capability_load before use.", `{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}`),
 		tool("axiom_capability_load", "Load one exact capability from search results. Agent tools become callable with their exact schema; skills return their instructions lazily.", `{"type":"object","required":["capabilityId"],"properties":{"capabilityId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_tool_usage_metrics", "Read aggregated durable tool usage, failures, permission decisions, approvals, timing, and context compaction metrics over the recent time window. Use this to identify tools or context flows that may need investigation; metrics do not change tool code or permissions.", `{"type":"object","properties":{"days":{"type":"integer","minimum":1,"maximum":365,"default":30}},"additionalProperties":false}`),
 	}
 	if s.owner != nil && s.owner.plugins != nil && s.owner.plugins.IsContextCompactorEnabled() {
 		result = append(result, contextCompactionTool())
@@ -206,6 +318,21 @@ func (s *turnScope) execute(ctx context.Context, name string, arguments json.Raw
 			return toolError("invalid capability load arguments")
 		}
 		value, err := s.load(input.CapabilityID)
+		if err != nil {
+			return toolError(err.Error())
+		}
+		return toolOK(value)
+	case "axiom_tool_usage_metrics":
+		var input struct {
+			Days int `json:"days"`
+		}
+		if len(arguments) > 0 && json.Unmarshal(arguments, &input) != nil {
+			return toolError("invalid tool metrics arguments")
+		}
+		if input.Days == 0 {
+			input.Days = 30
+		}
+		value, err := s.owner.ToolUsageMetrics(ctx, s.userID, input.Days)
 		if err != nil {
 			return toolError(err.Error())
 		}
@@ -587,8 +714,9 @@ func creatorTools() map[string]provider.ToolDefinition {
 		tool("axiom_plugin_apply_patch", "Apply a revision-checked Git patch to allowed plugin text sources. Deletion, rename, binary, mode, and out-of-contract changes are rejected.", `{"type":"object","required":["projectId","expectedRevision","patch"],"properties":{"projectId":{"type":"string"},"expectedRevision":{"type":"string"},"patch":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_begin_revision", "Begin an update while the active release keeps serving pinned turns.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_build", "Build and verify declared plugin surfaces into an immutable release.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_install", "Install a tested immutable plugin release. Installation grants the release's declared permissions and activates its runtime surfaces.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_install", "Install one tested immutable plugin release by exact release ID. The host will show its digest and declared permissions for user approval before granting and activating that exact release.", `{"type":"object","required":["projectId","releaseId"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_rollback", "Atomically roll an active plugin back to a previously installed immutable release.", `{"type":"object","required":["projectId","releaseId"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_mark_unusable", "Propose marking a known-bad immutable release unusable. User approval is required; its bundle will be removed on the next startup while release metadata and audit records remain.", `{"type":"object","required":["projectId","releaseId","reason"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"},"reason":{"type":"string","minLength":3,"maxLength":500}},"additionalProperties":false}`),
 	}
 	result := map[string]provider.ToolDefinition{}
 	for _, item := range items {

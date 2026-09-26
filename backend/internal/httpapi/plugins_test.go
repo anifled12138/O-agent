@@ -213,7 +213,7 @@ func TestUnifiedPluginMCPManagement(t *testing.T) {
 		Enabled:     false,
 	}
 
-	body, _ := json.Marshal(cfg)
+	body, _ := json.Marshal(map[string]any{"config": cfg, "confirmLaunch": true})
 	req := httptest.NewRequest("POST", "/api/v1/plugins/mcp", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.unifiedPluginAddMCP(w, req)
@@ -237,7 +237,8 @@ func TestUnifiedPluginMCPManagement(t *testing.T) {
 	}
 
 	// Remove MCP
-	delReq := httptest.NewRequest("DELETE", "/api/v1/plugins/mcp/test-mcp-server", nil)
+	delBody, _ := json.Marshal(map[string]bool{"confirmRemove": true})
+	delReq := httptest.NewRequest("DELETE", "/api/v1/plugins/mcp/test-mcp-server", bytes.NewReader(delBody))
 	delReq.SetPathValue("id", "test-mcp-server")
 	delW := httptest.NewRecorder()
 	srv.unifiedPluginRemoveMCP(delW, delReq)

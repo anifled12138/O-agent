@@ -47,6 +47,8 @@ export default function ProjectModal({
   const [workdir, setWorkdir] = useState(project?.workdir ?? '');
   const [remoteRepoUrl, setRemoteRepoUrl] = useState(project?.remoteRepoUrl ?? '');
   const [remoteBranch, setRemoteBranch] = useState(project?.remoteBranch ?? 'main');
+  const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
+  const [deleteConsent, setDeleteConsent] = useState(false);
 
   const [busy, setBusy] = useState(false);
   const [pickingDir, setPickingDir] = useState(false);
@@ -135,11 +137,12 @@ export default function ProjectModal({
 
   async function handleDelete() {
     if (!project) return;
-    if (
-      !window.confirm(
-        `确定要删除项目文件夹“${project.name}”吗？\n删除后该项目下的对话将移至普通对话列表，不会被删除。`,
-      )
-    ) {
+    if (!deleteConfirmationOpen) {
+      setDeleteConfirmationOpen(true);
+      setDeleteConsent(false);
+      return;
+    }
+    if (!deleteConsent) {
       return;
     }
 
@@ -382,16 +385,29 @@ export default function ProjectModal({
 
           <footer className="project-footer">
             {isEditing ? (
-              <button
-                type="button"
-                className="project-btn-danger"
-                onClick={handleDelete}
-                disabled={busy}
-                title="删除此项目文件夹"
-              >
-                <Trash2 size={13} />
-                <span>删除项目</span>
-              </button>
+              <div>
+                <button
+                  type="button"
+                  className="project-btn-danger"
+                  onClick={handleDelete}
+                  disabled={busy}
+                  title="移除项目设置"
+                >
+                  <Trash2 size={13} />
+                  <span>移除项目</span>
+                </button>
+                {deleteConfirmationOpen && (
+                  <div className="project-delete-confirmation">
+                    <p>这会移除项目设置并将关联对话移回普通列表，不会删除工作区文件夹或对话内容。</p>
+                    <label className="permission-consent">
+                      <input type="checkbox" checked={deleteConsent} onChange={(event) => setDeleteConsent(event.target.checked)} />
+                      我确认移除此项目设置。
+                    </label>
+                    <button type="button" className="project-btn-danger" onClick={handleDelete} disabled={busy || !deleteConsent}>确认移除</button>
+                    <button type="button" className="upc-btn-secondary" onClick={() => setDeleteConfirmationOpen(false)} disabled={busy}>取消</button>
+                  </div>
+                )}
+              </div>
             ) : (
               <div />
             )}

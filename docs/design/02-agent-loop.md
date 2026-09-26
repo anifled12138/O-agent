@@ -1,6 +1,6 @@
 # 02 · Agent Loop
 
-状态：Accepted；durable journal/async receipt/cancel/event resume implemented，token streaming/inbox pending
+状态：Accepted；durable journal/async receipt/cancel/event resume、加密检查点续跑、保守副作用恢复、安全重试/编辑和持久 follow-up inbox 已实现；token streaming pending
 
 ## 目标
 
@@ -99,7 +99,7 @@ Agent 创建时固定 Reasoning Driver、Context Policy、系统提示段、Prov
 - steering 与 followup 竞争；
 - Provider/Plugin 更新时 lease 固定。
 
-## 当前实现（2026-09-12）
+## 当前实现（2026-09-26）
 
 - `agent_turns`、`agent_steps`、`agent_model_attempts` 保存执行投影；
 - 用户输入、Turn 创建和首事件在一个事务中提交；最终 assistant 消息、终态和末事件也
@@ -109,12 +109,21 @@ Agent 创建时固定 Reasoning Driver、Context Policy、系统提示段、Prov
 - 同一 Conversation 只允许一个 running/cancelling Turn；
 - 取消先写 `turn.cancel_requested`，再触发进程内 `CancelCauseFunc`；
 - Host 启动时把遗留活动 Turn 分类为 `interrupted/safe_to_retry`，存在未闭合 Tool Call
-  时分类为 `needs_reconciliation/unknown_external_effect`，绝不自动重放；
-- API 已提供 Turn 列表和取消，Web UI 在运行中显示 Stop。
+  或任何已开始的 Tool Call 时分类为 `needs_reconciliation/unknown_external_effect`，绝不自动重放；
+- 安全重试只允许对最后一条用户输入进行，并要求此前所有相关 Turn 都没有 `tool.started`；
+  重试保留原输入消息并创建新的 Turn 关联，编辑内容、修订记录和新 Turn 首事件原子提交；
+- 运行中的后续输入持久化到 Inbox；当前 Turn 结束后依序启动，Host 重启后继续处理尚未 claim 的输入；
+- 重启分类会追加 `turn.interrupted` 或 `turn.needs_reconciliation` durable event；
+- API 提供 Turn 查询、取消、重试和 Inbox 操作，Web UI 在输入消息旁呈现状态与可用操作。
 - V2 提交接口在 durable start 后返回 Receipt，执行绑定 Host 生命周期而不是浏览器请求；
 - SSE 使用 durable sequence 作为 cursor，内存 Broker 只发送唤醒信号，断线重连始终从
   SQLite 补齐，因此慢客户端不会成为运行时状态源。
 
 Web UI 打开已有活动 Turn 时会按 durable cursor 自动重新订阅，切换页面只断开观察连接，
-不会取消 Host 中的执行。下一小步是 Provider token/tool-call delta streaming、Inbox 和
-恢复执行策略。旧 V1 同步消息接口仍会随 HTTP 请求取消，仅用于兼容。
+不会取消 Host 中的执行。Host 重启会从加密检查点自动恢复已提交 transcript、工具结果和累计预算；
+`tool.completed` 与检查点同事务提交。若工具已开始但结果尚未提交，仍要求人工核对，不能猜测副作用
+是否发生。待处理审批在重启后会重新询问；已批准/拒绝的决定只有在 tool-call ID 和参数摘要完全匹配
+时才复用。run-scoped artifact、fragment 操作和插件路由变更仍不自动续跑。Provider 响应如果在
+检查点事务提交前丢失，会再次请求 Provider，预算会保留一次未决调用，但 Provider 计费/Token 用量
+无法在崩溃后精确读回。检查点只在运行绑定、Generation、Provider、权限策略、项目配置、Host 构建和
+工具 schema 指纹匹配时续跑。旧 V1 同步消息接口仍会随 HTTP 请求取消，仅用于兼容。

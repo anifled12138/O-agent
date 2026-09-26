@@ -83,10 +83,34 @@ runtime implementation is documented in
 | --- | --- | --- |
 | `O_ADDR` | `127.0.0.1:9171` | Backend listen address |
 | `O_DATA_DIR` | `../data` | SQLite database and encryption key directory |
+| `O_AGENT_TEMP_DIR` | `%TEMP%/Axiom/agent-runs` (or the platform temp directory) | Private temporary scripts and artifacts scoped to Agent runs |
+| `O_AGENT_MAX_CONCURRENT_RUNS` | `3` | Maximum Agent and evaluation runs using the Host at once (1–32) |
+| `O_AGENT_MAX_TOKENS_PER_RUN` | `60000` | Host-side token usage ceiling per run when the provider reports usage (1000–2000000) |
+| `O_AGENT_MAX_MODEL_CALLS` | `64` | Maximum counted provider attempts per run, including bounded retries (1–256) |
+| `O_AGENT_MAX_RUN_DURATION` | `30m` | Maximum duration of one Agent or evaluation run (1m–24h) |
 | `O_FRONTEND_ORIGIN` | `http://127.0.0.1:3000` | Allowed browser origin |
 | `O_WORKSPACE_ROOT` | `..` | Workspace exposed through approved Host brokers |
 
-Legacy `AXIOM_*` variables remain accepted for compatibility.
+Legacy `AXIOM_*` variables remain accepted for compatibility. Agent run
+directories are removed when each turn ends; startup and later run starts sweep
+owned run directories older than 24 hours after a crash. Large `grep_search` results are
+available only by their artifact ID during the current turn.
+
+Closing the desktop window hides O to the system tray; the Host and active turns
+continue until the tray's explicit **退出并停止任务** action is used. Provider
+requests make at most three attempts total (up to two retries) for transient
+transport, server, and rate-limit failures, within the per-run model attempt
+budget. At most 32 messages may wait in one conversation and 256 across a
+workspace; evaluation experiments also have a bounded persistent queue of 32.
+The Host resumes queued evaluations from their committed trial records and
+resumes regular Agent turns from encrypted checkpoints after restart when the
+runtime binding is unchanged and every started tool has a committed result.
+An unclosed tool operation, run-scoped artifact dependency, fragment operation,
+or plugin routing change remains an explicit reconciliation state. Provider
+responses that were received but not checkpointed may be requested again after
+a crash. If the desktop Host exits unexpectedly, the
+desktop process restarts it with an increasing delay while preserving the local
+API address; explicit application exit still stops it.
 
 ## Verify
 

@@ -1,19 +1,24 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
-func TestLoadPrefersOEnvironment(t *testing.T) {
-	t.Setenv("O_ADDR", "127.0.0.1:9000")
-	t.Setenv("AXIOM_ADDR", "127.0.0.1:9001")
-	if got := Load().Addr; got != "127.0.0.1:9000" {
-		t.Fatalf("O_ADDR was not preferred: %q", got)
+func TestAgentTempDirConfiguration(t *testing.T) {
+	for _, key := range []string{"O_AGENT_TEMP_DIR", "AXIOM_AGENT_TEMP_DIR"} {
+		t.Setenv(key, "")
 	}
-}
-
-func TestLoadAcceptsLegacyEnvironment(t *testing.T) {
-	t.Setenv("O_ADDR", "")
-	t.Setenv("AXIOM_ADDR", "127.0.0.1:9001")
-	if got := Load().Addr; got != "127.0.0.1:9001" {
-		t.Fatalf("legacy AXIOM_ADDR was not accepted: %q", got)
+	if got, want := Load().AgentTempDir, filepath.Join(os.TempDir(), "Axiom", "agent-runs"); got != want {
+		t.Fatalf("default AgentTempDir = %q, want %q", got, want)
+	}
+	t.Setenv("AXIOM_AGENT_TEMP_DIR", filepath.Join(t.TempDir(), "legacy"))
+	if got := Load().AgentTempDir; got != os.Getenv("AXIOM_AGENT_TEMP_DIR") {
+		t.Fatalf("legacy AgentTempDir = %q, want %q", got, os.Getenv("AXIOM_AGENT_TEMP_DIR"))
+	}
+	t.Setenv("O_AGENT_TEMP_DIR", filepath.Join(t.TempDir(), "current"))
+	if got := Load().AgentTempDir; got != os.Getenv("O_AGENT_TEMP_DIR") {
+		t.Fatalf("AgentTempDir = %q, want %q", got, os.Getenv("O_AGENT_TEMP_DIR"))
 	}
 }

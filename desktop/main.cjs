@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, net, protocol, session, ipcMain, clipboard } = require('electron');
+const { app, BrowserWindow, dialog, net, protocol, session, ipcMain, clipboard, Tray, Menu } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -25,9 +25,13 @@ try {
 } catch {}
 
 let mainWindow;
+let appTray;
 let backendProcess;
 let uiProcess;
 let runtimeOrigin = '';
+let runtimePort;
+let backendFrontendOrigin = '';
+let backendRestartPromise;
 let allowingQuit = false;
 let backendReady = false;
 
@@ -130,7 +134,9 @@ async function developmentBackend() {
 }
 
 async function startBackend(frontendOrigin) {
-  const port = await availablePort();
+  backendFrontendOrigin = frontendOrigin;
+  const port = runtimePort || await availablePort();
+  runtimePort = port;
   runtimeOrigin = `http://127.0.0.1:${port}`;
   const executable = development
     ? await developmentBackend()
@@ -138,6 +144,7 @@ async function startBackend(frontendOrigin) {
   if (!fs.existsSync(executable)) throw new Error(`缺少本地 Go Host：${executable}`);
   const localRepository = packagedRepositoryRoot();
   const dataDir = process.env.O_DATA_DIR || (localRepository ? path.join(localRepository, 'data') : path.join(app.getPath('userData'), 'data'));
+  const agentTempDir = process.env.O_AGENT_TEMP_DIR || path.join(app.getPath('temp'), 'Axiom', 'agent-runs');
   const workspaceRoot = process.env.O_WORKSPACE_ROOT || localRepository || app.getPath('documents');
   backendProcess = spawn(executable, [], {
     cwd: development ? path.join(repositoryRoot, 'backend') : path.dirname(executable),
@@ -145,6 +152,7 @@ async function startBackend(frontendOrigin) {
       ...process.env,
       O_ADDR: `127.0.0.1:${port}`,
       O_DATA_DIR: dataDir,
+      O_AGENT_TEMP_DIR: agentTempDir,
       O_WORKSPACE_ROOT: workspaceRoot,
       O_FRONTEND_ORIGIN: frontendOrigin,
       O_DESKTOP_STDIN: '1',
@@ -156,9 +164,9 @@ async function startBackend(frontendOrigin) {
   backendProcess.once('exit', (code, signal) => {
     if (!backendReady || allowingQuit) return;
     backendReady = false;
-    dialog.showErrorBox('O 本地运行时已停止', `Go Host 意外退出（${code ?? signal ?? 'unknown'}）。`);
-    allowingQuit = true;
-    void stopChildren().finally(() => app.quit());
+    console.error(`Go Host exited unexpectedly (${code ?? signal ?? 'unknown'}); scheduling recovery.`);
+    if (appTray) appTray.setToolTip('O — Agent Host is restarting');
+    void restartBackend();
   });
   await waitFor(`${runtimeOrigin}/api/v1/health`, 20_000, backendProcess);
   backendReady = true;
@@ -202,6 +210,11 @@ async function createWindow(url) {
       webSecurity: true,
     },
   });
+  mainWindow.on('close', (event) => {
+    if (allowingQuit) return;
+    event.preventDefault();
+    mainWindow.hide();
+  });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event, destination) => {
     if (destination !== url) event.preventDefault();
@@ -210,16 +223,64 @@ async function createWindow(url) {
   await mainWindow.loadURL(url);
 }
 
+function createTray() {
+  if (appTray) return;
+  appTray = new Tray(path.join(__dirname, 'assets', 'icon.ico'));
+  appTray.setToolTip('O — Agent Host continues while the window is closed');
+  appTray.setContextMenu(Menu.buildFromTemplate([
+    { label: '显示 O', click: () => showMainWindow() },
+    { type: 'separator' },
+    { label: '退出并停止任务', click: () => app.quit() },
+  ]));
+  appTray.on('click', () => showMainWindow());
+}
+
+function showMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
 async function stopChildren() {
-  if (backendProcess && backendProcess.exitCode === null && backendProcess.signalCode === null) {
-    backendProcess.stdin?.end();
+  await stopBackendProcess();
+  if (uiProcess && uiProcess.exitCode === null && uiProcess.signalCode === null) uiProcess.kill();
+}
+
+async function stopBackendProcess() {
+  const child = backendProcess;
+  if (child && child.exitCode === null && child.signalCode === null) {
+    child.stdin?.end();
     await Promise.race([
-      new Promise((resolve) => backendProcess.once('exit', resolve)),
+      new Promise((resolve) => child.once('exit', resolve)),
       new Promise((resolve) => setTimeout(resolve, 5_000)),
     ]);
-    if (backendProcess.exitCode === null && backendProcess.signalCode === null) backendProcess.kill();
+    if (child.exitCode === null && child.signalCode === null) child.kill();
   }
-  if (uiProcess && uiProcess.exitCode === null && uiProcess.signalCode === null) uiProcess.kill();
+}
+
+function restartBackend() {
+  if (backendRestartPromise || allowingQuit) return backendRestartPromise;
+  backendRestartPromise = (async () => {
+    let delay = 1_000;
+    while (!allowingQuit) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (allowingQuit) return;
+      try {
+        await startBackend(backendFrontendOrigin);
+        if (appTray) appTray.setToolTip('O — Agent Host continues while the window is closed');
+        return;
+      } catch (error) {
+        backendReady = false;
+        console.error('Go Host restart failed; will retry with backoff.', error);
+        await stopBackendProcess();
+        delay = Math.min(delay * 2, 30_000);
+      }
+    }
+  })().finally(() => {
+    backendRestartPromise = undefined;
+  });
+  return backendRestartPromise;
 }
 
 app.whenReady().then(async () => {
@@ -262,6 +323,7 @@ app.whenReady().then(async () => {
     if (!development) installLocalProtocol();
     await startBackend(development ? new URL(windowURL).origin : 'oapp://app');
     await createWindow(windowURL);
+    createTray();
   } catch (error) {
     dialog.showErrorBox('O 启动失败', error instanceof Error ? error.message : String(error));
     allowingQuit = true;
@@ -274,7 +336,11 @@ app.on('before-quit', (event) => {
   if (allowingQuit) return;
   event.preventDefault();
   allowingQuit = true;
-  void stopChildren().finally(() => app.quit());
+  void stopChildren().finally(() => {
+    if (appTray) {
+      appTray.destroy();
+      appTray = null;
+    }
+    app.quit();
+  });
 });
-
-app.on('window-all-closed', () => app.quit());

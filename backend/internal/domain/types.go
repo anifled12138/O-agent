@@ -10,6 +10,7 @@ var (
 	ErrConflict     = Error("conflict")
 	ErrUnauthorized = Error("unauthorized")
 	ErrInvalid      = Error("invalid input")
+	ErrBusy         = Error("runtime capacity is busy")
 )
 
 type Error string
@@ -50,15 +51,19 @@ type Project struct {
 }
 
 type Conversation struct {
-	ID                    string    `json:"id"`
-	UserID                string    `json:"-"`
-	Title                 string    `json:"title"`
-	ProviderID            string    `json:"providerId"`
-	AgentGenerationID     string    `json:"agentGenerationId,omitempty"`
-	AgentDefinitionDigest string    `json:"agentDefinitionDigest,omitempty"`
-	ProjectID             string    `json:"projectId,omitempty"`
-	CreatedAt             time.Time `json:"createdAt"`
-	UpdatedAt             time.Time `json:"updatedAt"`
+	ID                    string            `json:"id"`
+	UserID                string            `json:"-"`
+	Title                 string            `json:"title"`
+	ProviderID            string            `json:"providerId"`
+	AgentGenerationID     string            `json:"agentGenerationId,omitempty"`
+	AgentDefinitionDigest string            `json:"agentDefinitionDigest,omitempty"`
+	ProjectID             string            `json:"projectId,omitempty"`
+	PermissionProfile     PermissionProfile `json:"permissionProfile"`
+	ParentConversationID  string            `json:"parentConversationId,omitempty"`
+	BranchFromMessageID   string            `json:"branchFromMessageId,omitempty"`
+	ExecutionPaused       bool              `json:"executionPaused"`
+	CreatedAt             time.Time         `json:"createdAt"`
+	UpdatedAt             time.Time         `json:"updatedAt"`
 }
 
 type Message struct {
@@ -71,7 +76,16 @@ type Message struct {
 
 type ConversationDetail struct {
 	Conversation
-	Messages []Message `json:"messages"`
+	Messages        []Message                    `json:"messages"`
+	LifecycleEvents []ConversationLifecycleEvent `json:"lifecycleEvents"`
+}
+
+type ConversationLifecycleEvent struct {
+	ID             string          `json:"id"`
+	ConversationID string          `json:"conversationId"`
+	Kind           string          `json:"kind"`
+	Details        json.RawMessage `json:"details"`
+	CreatedAt      time.Time       `json:"createdAt"`
 }
 
 type TraceEvent struct {
@@ -85,22 +99,107 @@ type TraceEvent struct {
 }
 
 type AgentTurn struct {
-	ID                    string     `json:"id"`
-	ConversationID        string     `json:"conversationId"`
-	UserID                string     `json:"-"`
-	InputMessageID        string     `json:"inputMessageId"`
-	ResultMessageID       string     `json:"resultMessageId,omitempty"`
-	ProviderID            string     `json:"providerId"`
-	AgentGenerationID     string     `json:"agentGenerationId"`
-	AgentDefinitionDigest string     `json:"agentDefinitionDigest"`
-	Status                string     `json:"status"`
-	StopReason            string     `json:"stopReason,omitempty"`
-	RecoveryClass         string     `json:"recoveryClass,omitempty"`
-	CancelRequested       bool       `json:"cancelRequested"`
-	LastSequence          int        `json:"lastSequence"`
-	StartedAt             time.Time  `json:"startedAt"`
-	UpdatedAt             time.Time  `json:"updatedAt"`
-	CompletedAt           *time.Time `json:"completedAt,omitempty"`
+	ID                    string            `json:"id"`
+	ConversationID        string            `json:"conversationId"`
+	UserID                string            `json:"-"`
+	InputMessageID        string            `json:"inputMessageId"`
+	RetryOfTurnID         string            `json:"retryOfTurnId,omitempty"`
+	ResultMessageID       string            `json:"resultMessageId,omitempty"`
+	ProviderID            string            `json:"providerId"`
+	AgentGenerationID     string            `json:"agentGenerationId"`
+	AgentDefinitionDigest string            `json:"agentDefinitionDigest"`
+	PermissionProfile     PermissionProfile `json:"permissionProfile"`
+	Status                string            `json:"status"`
+	StopReason            string            `json:"stopReason,omitempty"`
+	RecoveryClass         string            `json:"recoveryClass,omitempty"`
+	ReconciliationNote    string            `json:"reconciliationNote,omitempty"`
+	CancelRequested       bool              `json:"cancelRequested"`
+	LastSequence          int               `json:"lastSequence"`
+	StartedAt             time.Time         `json:"startedAt"`
+	UpdatedAt             time.Time         `json:"updatedAt"`
+	CompletedAt           *time.Time        `json:"completedAt,omitempty"`
+}
+
+type ApprovalRequest struct {
+	ID                string            `json:"id"`
+	ConversationID    string            `json:"conversationId"`
+	TurnID            string            `json:"turnId"`
+	ToolCallID        string            `json:"toolCallId"`
+	ToolName          string            `json:"toolName"`
+	Source            string            `json:"source"`
+	PluginID          string            `json:"pluginId,omitempty"`
+	ReleaseID         string            `json:"releaseId,omitempty"`
+	Effect            string            `json:"effect"`
+	PermissionProfile PermissionProfile `json:"permissionProfile"`
+	Resource          string            `json:"resource,omitempty"`
+	Impact            string            `json:"impact,omitempty"`
+	Reason            string            `json:"reason"`
+	Arguments         string            `json:"arguments"`
+	Status            string            `json:"status"`
+	CreatedAt         time.Time         `json:"createdAt"`
+	ExpiresAt         time.Time         `json:"expiresAt"`
+}
+
+type ToolUsageMetric struct {
+	ToolName                 string    `json:"toolName"`
+	ProjectID                string    `json:"projectId,omitempty"`
+	PluginID                 string    `json:"pluginId,omitempty"`
+	ReleaseID                string    `json:"releaseId,omitempty"`
+	Calls                    int64     `json:"calls"`
+	Completed                int64     `json:"completed"`
+	Failures                 int64     `json:"failures"`
+	PermissionAllows         int64     `json:"permissionAllows"`
+	PermissionDenials        int64     `json:"permissionDenials"`
+	PermissionAsks           int64     `json:"permissionAsks"`
+	ApprovalRequests         int64     `json:"approvalRequests"`
+	ApprovalsPending         int64     `json:"approvalsPending"`
+	ApprovalsGranted         int64     `json:"approvalsGranted"`
+	ApprovalsDenied          int64     `json:"approvalsDenied"`
+	ApprovalsExpired         int64     `json:"approvalsExpired"`
+	ApprovalsCancelled       int64     `json:"approvalsCancelled"`
+	PluginBuilds             int64     `json:"pluginBuilds,omitempty"`
+	PluginBuildFailures      int64     `json:"pluginBuildFailures,omitempty"`
+	PluginActivations        int64     `json:"pluginActivations,omitempty"`
+	PluginDeactivations      int64     `json:"pluginDeactivations,omitempty"`
+	PluginRollbacks          int64     `json:"pluginRollbacks,omitempty"`
+	PluginPermissionRequests int64     `json:"pluginPermissionRequests,omitempty"`
+	PluginPermissionsGranted int64     `json:"pluginPermissionsGranted,omitempty"`
+	PluginRuntimeFailures    int64     `json:"pluginRuntimeFailures,omitempty"`
+	PluginSourceChanges      int64     `json:"pluginSourceChanges,omitempty"`
+	PluginUnusableMarks      int64     `json:"pluginUnusableMarks,omitempty"`
+	PluginBundleCleanups     int64     `json:"pluginBundleCleanups,omitempty"`
+	DurationMillis           int64     `json:"durationMillis"`
+	ContextCompactions       int64     `json:"contextCompactions,omitempty"`
+	OriginalContextChars     int64     `json:"originalContextChars,omitempty"`
+	CompactedContextChars    int64     `json:"compactedContextChars,omitempty"`
+	LastUsedAt               time.Time `json:"lastUsedAt,omitempty"`
+}
+
+type InboxInput struct {
+	ID             string    `json:"id"`
+	ConversationID string    `json:"conversationId"`
+	Content        string    `json:"content"`
+	Status         string    `json:"status"`
+	TurnID         string    `json:"turnId,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+}
+
+type ConversationCancelReceipt struct {
+	ConversationID       string `json:"conversationId"`
+	CancelledTurnID      string `json:"cancelledTurnId,omitempty"`
+	CancelledTurnStatus  string `json:"cancelledTurnStatus,omitempty"`
+	CancelledInboxCount  int64  `json:"cancelledInboxCount"`
+	QueuedInboxRemaining int    `json:"queuedInboxRemaining"`
+	ExecutionPaused      bool   `json:"executionPaused"`
+}
+
+type AgentTurnReconciliation struct {
+	ID             string    `json:"id"`
+	TurnID         string    `json:"turnId"`
+	ConversationID string    `json:"conversationId"`
+	Decision       string    `json:"decision"`
+	Note           string    `json:"note"`
+	CreatedAt      time.Time `json:"createdAt"`
 }
 
 type TurnReceipt struct {
@@ -178,13 +277,15 @@ type EvalCase struct {
 }
 
 type RunMetrics struct {
-	ModelCalls       int   `json:"modelCalls"`
-	ToolCalls        int   `json:"toolCalls"`
-	PromptTokens     int   `json:"promptTokens"`
-	CompletionTokens int   `json:"completionTokens"`
-	TotalTokens      int   `json:"totalTokens"`
-	DurationMillis   int64 `json:"durationMillis"`
-	ReachedStepLimit bool  `json:"reachedStepLimit"`
+	ModelCalls            int   `json:"modelCalls"`
+	ToolCalls             int   `json:"toolCalls"`
+	PromptTokens          int   `json:"promptTokens"`
+	CompletionTokens      int   `json:"completionTokens"`
+	TotalTokens           int   `json:"totalTokens"`
+	DurationMillis        int64 `json:"durationMillis"`
+	ReachedStepLimit      bool  `json:"reachedStepLimit"`
+	ReachedTokenLimit     bool  `json:"reachedTokenLimit,omitempty"`
+	ReachedModelCallLimit bool  `json:"reachedModelCallLimit,omitempty"`
 }
 
 type EvalTrial struct {
@@ -194,6 +295,8 @@ type EvalTrial struct {
 	Side         string     `json:"side"`
 	Repetition   int        `json:"repetition"`
 	Success      bool       `json:"success"`
+	Status       string     `json:"status"`
+	FailureClass string     `json:"failureClass,omitempty"`
 	Response     string     `json:"response,omitempty"`
 	Error        string     `json:"error,omitempty"`
 	Metrics      RunMetrics `json:"metrics"`
@@ -212,14 +315,17 @@ type EvalSideSummary struct {
 }
 
 type EvalReport struct {
-	Baseline            EvalSideSummary `json:"baseline"`
-	Candidate           EvalSideSummary `json:"candidate"`
-	FrontierWins        int             `json:"frontierWins"`
-	Regressions         int             `json:"regressions"`
-	PairedCases         int             `json:"pairedCases"`
-	Recommendation      string          `json:"recommendation"`
-	RecommendationCause string          `json:"recommendationCause"`
-	CompletedAt         time.Time       `json:"completedAt"`
+	Baseline             EvalSideSummary `json:"baseline"`
+	Candidate            EvalSideSummary `json:"candidate"`
+	FrontierWins         int             `json:"frontierWins"`
+	Regressions          int             `json:"regressions"`
+	PairedCases          int             `json:"pairedCases"`
+	EvidenceComplete     bool            `json:"evidenceComplete"`
+	IncompleteTrials     int             `json:"incompleteTrials"`
+	InfrastructureErrors int             `json:"infrastructureErrors"`
+	Recommendation       string          `json:"recommendation"`
+	RecommendationCause  string          `json:"recommendationCause"`
+	CompletedAt          time.Time       `json:"completedAt"`
 }
 
 type EvalExperiment struct {

@@ -21,6 +21,7 @@
 10. [`09-client-and-local-api.md`](09-client-and-local-api.md)：独立客户端、Web UI、流式协议和错误模型。
 11. [`10-storage-security-observability.md`](10-storage-security-observability.md)：存储、Secret、审计和可观测性。
 12. [`11-roadmap-and-acceptance.md`](11-roadmap-and-acceptance.md)：实施顺序和端到端验收。
+13. [`12-conversation-lifecycle.md`](12-conversation-lifecycle.md)：会话/Turn 状态、重试、分支、取消与恢复的实现/验证方案。
 
 ## 决策状态
 

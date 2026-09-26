@@ -1,9 +1,12 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,6 +205,7 @@ type Manager struct {
 	configFile    string
 	clients       map[string]*Client
 	configs       map[string]ServerConfig
+	runtimeErrors map[string]string
 	mu            sync.RWMutex
 }
 
@@ -223,6 +227,7 @@ func NewManagerWithWorkspace(workspaceRoot string) *Manager {
 		configFile:    cfgFile,
 		clients:       make(map[string]*Client),
 		configs:       make(map[string]ServerConfig),
+		runtimeErrors: make(map[string]string),
 	}
 	m.loadConfig()
 	return m
@@ -234,10 +239,14 @@ func (m *Manager) loadConfig() {
 	}
 	data, err := os.ReadFile(m.configFile)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Error("read MCP configuration", "path", m.configFile, "error", err)
+		}
 		return
 	}
 	var sf mcpStoreFile
 	if err := json.Unmarshal(data, &sf); err != nil {
+		slog.Error("parse MCP configuration", "path", m.configFile, "error", err)
 		return
 	}
 
@@ -250,6 +259,9 @@ func (m *Manager) loadConfig() {
 			cli, err := StartClient(cfg)
 			if err == nil {
 				m.clients[id] = cli
+			} else {
+				m.runtimeErrors[id] = err.Error()
+				slog.Error("restore MCP server", "server_id", id, "error", err)
 			}
 		}
 	}
@@ -260,9 +272,12 @@ func (m *Manager) saveConfigLocked() error {
 		return nil
 	}
 	dir := filepath.Dir(m.configFile)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
+	previous, readErr := os.ReadFile(m.configFile)
+	previousExists := readErr == nil
+	if readErr != nil && !os.IsNotExist(readErr) { return readErr }
 
 	sf := mcpStoreFile{
 		MCPServers: m.configs,
@@ -272,11 +287,46 @@ func (m *Manager) saveConfigLocked() error {
 		return err
 	}
 
-	tmpFile := m.configFile + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	tmp, err := os.CreateTemp(dir, ".mcp-config-*.tmp")
+	if err != nil { return err }
+	tmpName := tmp.Name()
+	writeErr := tmp.Chmod(0600)
+	if writeErr == nil { _, writeErr = tmp.Write(data) }
+	if writeErr == nil { writeErr = tmp.Sync() }
+	closeErr := tmp.Close()
+	if err = errors.Join(writeErr, closeErr); err != nil {
+		_ = os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpFile, m.configFile)
+	if err = os.Rename(tmpName, m.configFile); err != nil {
+		return errors.Join(err, os.Remove(tmpName))
+	}
+	readBack, readErr := os.ReadFile(m.configFile)
+	if readErr == nil && bytes.Equal(readBack, data) { return nil }
+	if readErr == nil { readErr = fmt.Errorf("MCP configuration read-back mismatch") }
+	var restoreErr error
+	if previousExists {
+		restoreErr = writeMCPConfigAtomically(dir, m.configFile, previous)
+	} else if removeErr := os.Remove(m.configFile); removeErr != nil && !os.IsNotExist(removeErr) {
+		restoreErr = removeErr
+	}
+	return errors.Join(readErr, restoreErr)
+}
+
+func writeMCPConfigAtomically(dir, path string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, ".mcp-restore-*.tmp")
+	if err != nil { return err }
+	tmpName := tmp.Name()
+	writeErr := tmp.Chmod(0600)
+	if writeErr == nil { _, writeErr = tmp.Write(data) }
+	if writeErr == nil { writeErr = tmp.Sync() }
+	closeErr := tmp.Close()
+	if err = errors.Join(writeErr, closeErr); err != nil { _ = os.Remove(tmpName); return err }
+	if err = os.Rename(tmpName, path); err != nil { return errors.Join(err, os.Remove(tmpName)) }
+	readBack, err := os.ReadFile(path)
+	if err != nil { return err }
+	if !bytes.Equal(readBack, data) { return fmt.Errorf("restored MCP configuration read-back mismatch") }
+	return nil
 }
 
 func (m *Manager) AddOrUpdateConfig(cfg ServerConfig) error {
@@ -287,21 +337,42 @@ func (m *Manager) AddOrUpdateConfig(cfg ServerConfig) error {
 		return fmt.Errorf("server ID cannot be empty")
 	}
 
-	// Stop existing client if any
-	if old, exists := m.clients[cfg.ID]; exists {
-		_ = old.Close()
-		delete(m.clients, cfg.ID)
-	}
-
-	m.configs[cfg.ID] = cfg
-	_ = m.saveConfigLocked()
-
+	var nextClient *Client
 	if cfg.Enabled {
-		cli, err := StartClient(cfg)
+		var err error
+		nextClient, err = StartClient(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to start MCP server '%s': %w", cfg.ID, err)
 		}
-		m.clients[cfg.ID] = cli
+	}
+
+	previous, existed := m.configs[cfg.ID]
+	m.configs[cfg.ID] = cfg
+	if err := m.saveConfigLocked(); err != nil {
+		if existed {
+			m.configs[cfg.ID] = previous
+		} else {
+			delete(m.configs, cfg.ID)
+		}
+		cleanupErr := error(nil)
+		if nextClient != nil {
+			cleanupErr = nextClient.Close()
+		}
+		return errors.Join(fmt.Errorf("persist MCP server '%s' configuration: %w", cfg.ID, err), cleanupErr)
+	}
+
+	old := m.clients[cfg.ID]
+	if cfg.Enabled {
+		m.clients[cfg.ID] = nextClient
+	} else {
+		delete(m.clients, cfg.ID)
+	}
+	delete(m.runtimeErrors, cfg.ID)
+	if old != nil {
+		if err := old.Close(); err != nil {
+			m.runtimeErrors[cfg.ID] = fmt.Sprintf("previous MCP client did not close cleanly: %v", err)
+			return fmt.Errorf("close previous MCP server '%s': %w", cfg.ID, err)
+		}
 	}
 
 	return nil
@@ -311,12 +382,33 @@ func (m *Manager) Remove(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if cli, exists := m.clients[id]; exists {
-		_ = cli.Close()
+	cli := m.clients[id]
+	if cli != nil {
+		if err := cli.Close(); err != nil {
+			m.runtimeErrors[id] = fmt.Sprintf("removed MCP client did not close cleanly: %v", err)
+			return fmt.Errorf("close removed MCP server '%s': %w", id, err)
+		}
 		delete(m.clients, id)
 	}
+	previous, existed := m.configs[id]
 	delete(m.configs, id)
-	_ = m.saveConfigLocked()
+	if err := m.saveConfigLocked(); err != nil {
+		if existed {
+			m.configs[id] = previous
+		}
+		if cli != nil && existed && previous.Enabled {
+			restarted, restartErr := StartClient(previous)
+			if restartErr != nil {
+				m.runtimeErrors[id] = fmt.Sprintf("restore MCP client after persistence failure: %v", restartErr)
+				err = errors.Join(err, restartErr)
+			} else {
+				m.clients[id] = restarted
+				delete(m.runtimeErrors, id)
+			}
+		}
+		return fmt.Errorf("persist removal of MCP server '%s': %w", id, err)
+	}
+	delete(m.runtimeErrors, id)
 	return nil
 }
 
@@ -329,28 +421,55 @@ func (m *Manager) SetEnabled(id string, enabled bool) error {
 		return fmt.Errorf("mcp server '%s' not found", id)
 	}
 
-	if cfg.Enabled == enabled {
+	if cfg.Enabled == enabled && (!enabled || m.clients[id] != nil) {
 		return nil
 	}
 
-	cfg.Enabled = enabled
-	m.configs[id] = cfg
-	_ = m.saveConfigLocked()
-
+	var nextClient *Client
 	if enabled {
+		cfg.Enabled = true
 		cli, err := StartClient(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to start MCP client '%s': %w", id, err)
 		}
-		m.clients[id] = cli
+		nextClient = cli
+	}
+
+	previous := m.configs[id]
+	cfg.Enabled = enabled
+	m.configs[id] = cfg
+	if err := m.saveConfigLocked(); err != nil {
+		m.configs[id] = previous
+		cleanupErr := error(nil)
+		if nextClient != nil {
+			cleanupErr = nextClient.Close()
+		}
+		return errors.Join(fmt.Errorf("persist MCP server '%s' state: %w", id, err), cleanupErr)
+	}
+
+	old := m.clients[id]
+	if enabled {
+		m.clients[id] = nextClient
+		delete(m.runtimeErrors, id)
 	} else {
-		if cli, ok := m.clients[id]; ok {
-			_ = cli.Close()
-			delete(m.clients, id)
+		delete(m.clients, id)
+		delete(m.runtimeErrors, id)
+	}
+	if old != nil {
+		if err := old.Close(); err != nil {
+			m.runtimeErrors[id] = fmt.Sprintf("previous MCP client did not close cleanly: %v", err)
+			return fmt.Errorf("close previous MCP server '%s': %w", id, err)
 		}
 	}
 
 	return nil
+}
+
+// RuntimeError reports the latest observed startup or shutdown failure for a server.
+func (m *Manager) RuntimeError(id string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.runtimeErrors[id]
 }
 
 func (m *Manager) ListConfigs() []ServerConfig {

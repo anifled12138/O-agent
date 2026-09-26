@@ -55,16 +55,17 @@ export interface McpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  enabled?: boolean;
 }
 
 export async function getUnifiedPlugins(): Promise<UnifiedPlugin[]> {
   return request<UnifiedPlugin[]>('/plugins');
 }
 
-export async function toggleUnifiedPlugin(id: string, enabled: boolean): Promise<{ id: string; enabled: boolean }> {
-  return request<{ id: string; enabled: boolean }>(`/plugins/${encodeURIComponent(id)}/toggle`, {
+export async function toggleUnifiedPlugin(id: string, enabled: boolean, confirmExternal = false): Promise<UnifiedPlugin> {
+	return request<UnifiedPlugin>(`/plugins/${encodeURIComponent(id)}/toggle`, {
     method: 'POST',
-    body: JSON.stringify({ enabled }),
+    body: JSON.stringify({ enabled, confirmExternal }),
   });
 }
 
@@ -77,13 +78,104 @@ export async function reloadUnifiedPlugins(): Promise<UnifiedPlugin[]> {
 export async function addMcpServerConfig(config: McpServerConfig): Promise<UnifiedPlugin[]> {
   return request<UnifiedPlugin[]>('/plugins/mcp', {
     method: 'POST',
-    body: JSON.stringify(config),
+    body: JSON.stringify({ config, confirmLaunch: true }),
   });
 }
 
 export async function removeMcpServerConfig(id: string): Promise<{ removed: string }> {
-  return request<{ removed: string }>(`/plugins/mcp/${encodeURIComponent(id)}`, {
+  const serverId = id.replace(/^mcp:/, '');
+  return request<{ removed: string }>(`/plugins/mcp/${encodeURIComponent(serverId)}`, {
     method: 'DELETE',
+    body: JSON.stringify({ confirmRemove: true }),
+  });
+}
+
+export type ConversationPermissionProfile = 'read_only' | 'workspace_autonomous' | 'ask_on_sensitive';
+
+export type ToolUsageMetric = {
+  toolName: string;
+  projectId?: string;
+  pluginId?: string;
+  releaseId?: string;
+  calls: number;
+  completed: number;
+  failures: number;
+  permissionAllows: number;
+  permissionDenials: number;
+  permissionAsks: number;
+  approvalRequests: number;
+  approvalsPending: number;
+  approvalsGranted: number;
+  approvalsDenied: number;
+  approvalsExpired: number;
+  approvalsCancelled: number;
+  pluginBuilds?: number;
+  pluginBuildFailures?: number;
+  pluginActivations?: number;
+  pluginDeactivations?: number;
+  pluginRollbacks?: number;
+  pluginPermissionRequests?: number;
+  pluginPermissionsGranted?: number;
+  pluginRuntimeFailures?: number;
+  pluginSourceChanges?: number;
+  pluginUnusableMarks?: number;
+  pluginBundleCleanups?: number;
+  durationMillis: number;
+  contextCompactions?: number;
+  originalContextChars?: number;
+  compactedContextChars?: number;
+  lastUsedAt?: string;
+};
+
+export type PluginStorageUsage = {
+  releaseCount: number;
+  uniqueBundleCount: number;
+  bundleBytes: number;
+  missingBundleCount: number;
+};
+
+export async function getToolUsageMetrics(days: number): Promise<ToolUsageMetric[]> {
+  return request<ToolUsageMetric[]>(`/observability/tools?days=${encodeURIComponent(days)}`);
+}
+
+export async function updateConversationPermissionProfile<T = unknown>(
+  conversationId: string,
+  profile: ConversationPermissionProfile
+): Promise<T> {
+  return request<T>(`/conversations/${encodeURIComponent(conversationId)}/permissions`, {
+    method: 'PUT',
+    body: JSON.stringify({ profile }),
+  });
+}
+
+export type ApprovalRequest = {
+  id: string;
+  conversationId: string;
+  turnId: string;
+  toolCallId: string;
+  toolName: string;
+  source: string;
+  effect: string;
+  permissionProfile: ConversationPermissionProfile;
+  pluginId?: string;
+  releaseId?: string;
+  resource?: string;
+  impact?: string;
+  reason: string;
+  arguments: string;
+  status: string;
+  createdAt: string;
+  expiresAt: string;
+};
+
+export async function getConversationApprovals(conversationId: string): Promise<ApprovalRequest[]> {
+  return request<ApprovalRequest[]>(`/conversations/${encodeURIComponent(conversationId)}/approvals`);
+}
+
+export async function resolveAgentApproval(id: string, choice: 'approve' | 'deny'): Promise<ApprovalRequest> {
+  return request<ApprovalRequest>(`/agent/approvals/${encodeURIComponent(id)}/decision`, {
+    method: 'POST',
+    body: JSON.stringify({ choice }),
   });
 }
 
@@ -151,6 +243,7 @@ export async function updateProject(
 export async function deleteProject(id: string): Promise<{ ok: boolean; deleted: string }> {
   return request<{ ok: boolean; deleted: string }>(`/projects/${encodeURIComponent(id)}`, {
     method: 'DELETE',
+    body: JSON.stringify({ confirmDelete: true }),
   });
 }
 

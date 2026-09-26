@@ -11,6 +11,9 @@ const desktopDir = path.resolve(__dirname, '..');
 const repositoryRoot = path.resolve(desktopDir, '..');
 const backendDir = path.join(repositoryRoot, 'backend');
 const frontendDir = path.join(repositoryRoot, 'frontend');
+const packageInfo = JSON.parse(await fs.readFile(path.join(desktopDir, 'package.json'), 'utf8'));
+const releaseVersion = packageInfo.version;
+if (!releaseVersion) throw new Error('desktop package version is missing');
 
 function run(command, args, cwd, extraEnv = {}) {
   return new Promise((resolve, reject) => {
@@ -33,7 +36,7 @@ const go = process.platform === 'win32' ? 'D:\\agent-harness\\work\\toolchains\\
 await run(npm, ['run', 'build:desktop-ui'], frontendDir);
 
 const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*$/, 'Z');
-const outputRoot = path.join(repositoryRoot, 'release', `O-0.1.0-${timestamp}`);
+const outputRoot = path.join(repositoryRoot, 'release', `O-${releaseVersion}-${timestamp}`);
 const backendOutput = path.join(desktopDir, '.runtime', 'package', process.platform === 'win32' ? 'o-host.exe' : 'o-host');
 const backendName = process.platform === 'win32' ? 'o-host.exe' : 'o-host';
 
@@ -60,8 +63,8 @@ const appPaths = await packager({
   overwrite: true,
   asar: false,
   icon: path.join(desktopDir, 'assets', 'icon.ico'),
-  appVersion: '0.1.0',
-  buildVersion: '0.1.0',
+  appVersion: releaseVersion,
+  buildVersion: releaseVersion,
   prune: true,
   ignore: [/^[\/\\](?:\.runtime|scripts|node_modules[\/\\]\.cache)(?:[\/\\]|$)/],
   win32metadata: { CompanyName: 'O', FileDescription: 'O local-first Agent', ProductName: 'O' },
@@ -101,8 +104,10 @@ if (process.platform === 'win32') {
     process.stdout.write('Generating portable distribution zip...\n');
     const baseZip = path.join(outputRoot, 'O-win32-x64-portable');
     execSync(`python -c "import sys, shutil; shutil.make_archive(sys.argv[1], 'zip', sys.argv[2])" "${baseZip}" "${appPaths[0]}"`);
+    const zipInfo = await fs.stat(portableZip);
+    if (zipInfo.size === 0) throw new Error('portable zip is empty');
     process.stdout.write(`O desktop portable zip: ${portableZip}\n`);
   } catch (zErr) {
-    process.stderr.write(`Zip compression note: ${zErr.message}\n`);
+    throw new Error(`Required portable zip generation failed: ${zErr.message}`);
   }
 }

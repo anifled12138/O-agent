@@ -2,18 +2,39 @@ package coretools
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf16"
+
+	"axiom.local/agent/internal/runfiles"
 )
 
 func TestCoreToolsExecution(t *testing.T) {
-	tempDir := t.TempDir()
-	toolList := GetCoreTools(tempDir)
-	if len(toolList) != 6 {
-		t.Fatalf("expected 6 tools, got %d", len(toolList))
+	tempDir := tempDirWithinWorkspace(t, "coretools-workspace-")
+	managerRoot := tempDirWithinWorkspace(t, "coretools-agent-runs-")
+	manager, err := runfiles.NewManager(managerRoot, tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runScope, err := manager.NewScope()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := runScope.Close(); err != nil {
+			t.Errorf("run scope cleanup failed: %v", err)
+		}
+	})
+	toolList := GetCoreTools(tempDir, runScope)
+	if len(toolList) != 7 {
+		t.Fatalf("expected 7 tools, got %d", len(toolList))
 	}
 
 	tools := make(map[string]Tool)
@@ -154,7 +175,76 @@ func TestCoreToolsExecution(t *testing.T) {
 		t.Fatalf("expected truncated output to preserve both head and tail: %s", truncated)
 	}
 
-	// 8. Test path traversal sandbox security
+	if runtime.GOOS == "windows" {
+		// 8. Script source remains a turn-scoped artifact; execution uses AppContainer TEMP.
+		scriptSource := "printf 'script-ok:%s' \"$TMPDIR\""
+		if runtime.GOOS == "windows" {
+			scriptSource = "Write-Output ('script-ok:' + $env:TEMP)"
+		}
+		scriptArgs, _ := json.Marshal(map[string]any{"language": "shell", "source": scriptSource})
+		scriptRes, err := tools["exec_script"].Handler(ctx, scriptArgs)
+		if err != nil {
+			t.Fatalf("exec_script failed: %v", err)
+		}
+		scriptResult := scriptRes.(map[string]any)
+		if scriptResult["exitCode"].(int) != 0 || !strings.Contains(strings.ToLower(scriptResult["stdout"].(string)), `\ac\temp\axiom-command-`) {
+			t.Fatalf("unexpected script result: %#v", scriptResult)
+		}
+		scriptArtifactArgs, _ := json.Marshal(map[string]any{"artifactId": scriptResult["scriptArtifactId"]})
+		scriptRead, err := readTool.Handler(ctx, scriptArtifactArgs)
+		if err != nil || !strings.Contains(scriptRead.(map[string]any)["content"].(string), scriptSource) {
+			t.Fatalf("script artifact was not readable: result=%#v err=%v", scriptRead, err)
+		}
+		orphanMarker := filepath.Join(tempDir, "orphan-survived.txt")
+		timeoutSource := "(sleep 2; printf orphan > '" + strings.ReplaceAll(orphanMarker, "'", "'\\''") + "') & sleep 10"
+		if runtime.GOOS == "windows" {
+			childSource := "Start-Sleep -Seconds 2; Set-Content -LiteralPath '" + strings.ReplaceAll(orphanMarker, "'", "''") + "' -Value orphan"
+			encodedUnits := utf16.Encode([]rune(childSource))
+			encodedBytes := make([]byte, len(encodedUnits)*2)
+			for index, unit := range encodedUnits {
+				binary.LittleEndian.PutUint16(encodedBytes[index*2:], unit)
+			}
+			timeoutSource = "Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','" + base64.StdEncoding.EncodeToString(encodedBytes) + "' -WindowStyle Hidden; Start-Sleep -Seconds 10"
+		}
+		timeoutArgs, _ := json.Marshal(map[string]any{"language": "shell", "source": timeoutSource, "timeoutSeconds": 1})
+		timeoutStart := time.Now()
+		timeoutRes, err := tools["exec_script"].Handler(ctx, timeoutArgs)
+		if err != nil {
+			t.Fatalf("timed script failed to return a bounded result: %v", err)
+		}
+		timeoutResult := timeoutRes.(map[string]any)
+		if timeoutResult["timedOut"] != true || time.Since(timeoutStart) > 5*time.Second {
+			t.Fatalf("script timeout was not enforced: elapsed=%s result=%#v", time.Since(timeoutStart), timeoutResult)
+		}
+		time.Sleep(2200 * time.Millisecond)
+		if _, err := os.Stat(orphanMarker); !os.IsNotExist(err) {
+			t.Fatalf("script child survived run cancellation: stat error=%v", err)
+		}
+	}
+
+	// 9. Large grep results are readable during this run and are never written
+	// into the workspace tree.
+	manyMatches := strings.Repeat("TARGET_MATCH\n", 40)
+	if err := os.WriteFile(filepath.Join(tempDir, "many.txt"), []byte(manyMatches), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	largeGrepArgs, _ := json.Marshal(map[string]any{"pattern": "TARGET_MATCH", "path": "many.txt", "maxMatches": 5})
+	largeGrep, err := grepTool.Handler(ctx, largeGrepArgs)
+	if err != nil {
+		t.Fatalf("large grep_search failed: %v", err)
+	}
+	largeResult := largeGrep.(map[string]any)
+	artifactID, ok := largeResult["artifactId"].(string)
+	if !ok || artifactID == "" {
+		t.Fatalf("expected large grep artifact ID, got %#v", largeResult)
+	}
+	grepArtifactArgs, _ := json.Marshal(map[string]any{"artifactId": artifactID, "offset": 3, "limit": 5})
+	grepArtifact, err := readTool.Handler(ctx, grepArtifactArgs)
+	if err != nil || !strings.Contains(grepArtifact.(map[string]any)["content"].(string), "TARGET_MATCH") {
+		t.Fatalf("large grep artifact could not be read: result=%#v err=%v", grepArtifact, err)
+	}
+
+	// 10. Test path traversal sandbox security
 	badArgs, _ := json.Marshal(map[string]any{
 		"path": "../../../outside.txt",
 	})
@@ -162,4 +252,30 @@ func TestCoreToolsExecution(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected path traversal error, got nil")
 	}
+
+	runDir := runScope.Dir()
+	if err := runScope.Close(); err != nil {
+		t.Fatalf("run scope cleanup failed: %v", err)
+	}
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Fatalf("expected run directory to be removed; stat err=%v", err)
+	}
+}
+
+func tempDirWithinWorkspace(t *testing.T, pattern string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(".", pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove test temp directory %q: %v", dir, err)
+		}
+	})
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
 }

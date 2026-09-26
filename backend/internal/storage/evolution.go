@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -123,7 +125,10 @@ WHERE c.id=? AND c.user_id=? AND g.definition_digest=?`, time.Now().UTC(), gener
 	if err != nil {
 		return err
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if rows > 0 {
 		return nil
 	}
@@ -175,7 +180,10 @@ func (s *Store) PromoteAgentGeneration(ctx context.Context, userID, generationID
 	if err != nil {
 		return err
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if rows != 1 {
 		return domain.ErrNotFound
 	}
@@ -245,6 +253,51 @@ func (s *Store) CreateEvalExperiment(ctx context.Context, experiment domain.Eval
 	return err
 }
 
+func (s *Store) StartEvalExperiment(ctx context.Context, experiment domain.EvalExperiment) error {
+	const maxOutstandingExperiments = 32
+	cases, err := json.Marshal(experiment.Cases)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var outstanding int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM eval_experiments WHERE user_id=? AND status IN ('queued','running')`, experiment.UserID).Scan(&outstanding); err != nil {
+		return err
+	}
+	if outstanding >= maxOutstandingExperiments {
+		return fmt.Errorf("%w: a workspace may hold at most %d outstanding evaluations", domain.ErrBusy, maxOutstandingExperiments)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO eval_experiments(id,user_id,challenge_id,baseline_generation_id,candidate_generation_id,provider_id,status,cases_json,repetitions,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, experiment.ID, experiment.UserID, experiment.ChallengeID, experiment.BaselineGenerationID, experiment.CandidateGenerationID, experiment.ProviderID, "queued", cases, experiment.Repetitions, experiment.CreatedAt, experiment.UpdatedAt); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE frontier_challenges SET status='evaluating',updated_at=? WHERE id=? AND user_id=?`, experiment.UpdatedAt, experiment.ChallengeID, experiment.UserID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return domain.ErrNotFound
+	}
+	var persistedExperiment, persistedChallenge string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM eval_experiments WHERE id=? AND user_id=?`, experiment.ID, experiment.UserID).Scan(&persistedExperiment); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM frontier_challenges WHERE id=? AND user_id=?`, experiment.ChallengeID, experiment.UserID).Scan(&persistedChallenge); err != nil {
+		return err
+	}
+	if persistedExperiment != "queued" || persistedChallenge != "evaluating" {
+		return fmt.Errorf("evaluation start read-back mismatch")
+	}
+	return tx.Commit()
+}
+
 func scanExperiment(scanner rowScanner) (domain.EvalExperiment, error) {
 	var experiment domain.EvalExperiment
 	var cases, report []byte
@@ -305,9 +358,94 @@ func (s *Store) UpdateEvalExperiment(ctx context.Context, userID, id, status str
 	if err != nil {
 		return err
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if rows == 0 {
 		return domain.ErrNotFound
+	}
+	var readBack string
+	if err := s.db.QueryRowContext(ctx, `SELECT status FROM eval_experiments WHERE id=? AND user_id=?`, id, userID).Scan(&readBack); err != nil {
+		return err
+	}
+	if readBack != status {
+		return fmt.Errorf("evaluation status read-back mismatch: got %s, want %s", readBack, status)
+	}
+	return nil
+}
+
+func (s *Store) FinishEvalExperiment(ctx context.Context, userID, id, status, challengeStatus, lastError string, report *domain.EvalReport) error {
+	var reportJSON []byte
+	var err error
+	if report != nil {
+		reportJSON, err = json.Marshal(report)
+		if err != nil {
+			return err
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var challengeID string
+	if err := tx.QueryRowContext(ctx, `SELECT challenge_id FROM eval_experiments WHERE id=? AND user_id=?`, id, userID).Scan(&challengeID); errors.Is(err, sql.ErrNoRows) {
+		return domain.ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `UPDATE eval_experiments SET status=?,report_json=?,last_error=?,updated_at=? WHERE id=? AND user_id=?`, status, nullableBytes(reportJSON), lastError, now, id, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return domain.ErrNotFound
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE frontier_challenges SET status=?,updated_at=? WHERE id=? AND user_id=?`, challengeStatus, now, challengeID, userID)
+	if err != nil {
+		return err
+	}
+	rows, err = result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return domain.ErrNotFound
+	}
+	var readExperiment, readChallenge string
+	var readReport []byte
+	var readError string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM eval_experiments WHERE id=? AND user_id=?`, id, userID).Scan(&readExperiment); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM frontier_challenges WHERE id=? AND user_id=?`, challengeID, userID).Scan(&readChallenge); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT report_json,last_error FROM eval_experiments WHERE id=? AND user_id=?`, id, userID).Scan(&readReport, &readError); err != nil {
+		return err
+	}
+	if readExperiment != status || readChallenge != challengeStatus || !bytes.Equal(readReport, reportJSON) || readError != lastError {
+		return fmt.Errorf("evaluation completion read-back mismatch")
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	var durableExperimentStatus, durableChallengeStatus, durableError string
+	var durableReport []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT status,report_json,last_error FROM eval_experiments WHERE id=? AND user_id=?`, id, userID).Scan(&durableExperimentStatus, &durableReport, &durableError); err != nil {
+		return err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT status FROM frontier_challenges WHERE id=? AND user_id=?`, challengeID, userID).Scan(&durableChallengeStatus); err != nil {
+		return err
+	}
+	if durableExperimentStatus != status || durableChallengeStatus != challengeStatus || !bytes.Equal(durableReport, reportJSON) || durableError != lastError {
+		return fmt.Errorf("evaluation completion durable read-back mismatch")
 	}
 	return nil
 }
@@ -324,12 +462,35 @@ func (s *Store) AddEvalTrial(ctx context.Context, trial domain.EvalTrial) error 
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO eval_trials(id,experiment_id,case_id,side,repetition,success,response,error,metrics_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, trial.ID, trial.ExperimentID, trial.CaseID, trial.Side, trial.Repetition, trial.Success, trial.Response, trial.Error, metrics, trial.CreatedAt)
-	return err
+	if trial.Status == "" {
+		trial.Status = "completed"
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO eval_trials(id,experiment_id,case_id,side,repetition,success,status,failure_class,response,error,metrics_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, trial.ID, trial.ExperimentID, trial.CaseID, trial.Side, trial.Repetition, trial.Success, trial.Status, trial.FailureClass, trial.Response, trial.Error, metrics, trial.CreatedAt)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("evaluation trial insert affected %d rows", rows)
+	}
+	var experimentID, caseID, side, status, failureClass, response, trialError string
+	var repetition, success int
+	var persistedMetrics []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT experiment_id,case_id,side,repetition,success,status,failure_class,response,error,metrics_json FROM eval_trials WHERE id=?`, trial.ID).Scan(&experimentID, &caseID, &side, &repetition, &success, &status, &failureClass, &response, &trialError, &persistedMetrics); err != nil {
+		return err
+	}
+	persistedSuccess := success != 0
+	if experimentID != trial.ExperimentID || caseID != trial.CaseID || side != trial.Side || repetition != trial.Repetition || persistedSuccess != trial.Success || status != trial.Status || failureClass != trial.FailureClass || response != trial.Response || trialError != trial.Error || !bytes.Equal(persistedMetrics, metrics) {
+		return fmt.Errorf("evaluation trial durable read-back mismatch")
+	}
+	return nil
 }
 
 func (s *Store) EvalTrials(ctx context.Context, experimentID string) ([]domain.EvalTrial, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,experiment_id,case_id,side,repetition,success,response,error,metrics_json,created_at FROM eval_trials WHERE experiment_id=? ORDER BY case_id,repetition,side`, experimentID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,experiment_id,case_id,side,repetition,success,status,failure_class,response,error,metrics_json,created_at FROM eval_trials WHERE experiment_id=? ORDER BY case_id,repetition,side`, experimentID)
 	if err != nil {
 		return nil, err
 	}
@@ -339,7 +500,7 @@ func (s *Store) EvalTrials(ctx context.Context, experimentID string) ([]domain.E
 		var trial domain.EvalTrial
 		var success int
 		var metrics []byte
-		if err := rows.Scan(&trial.ID, &trial.ExperimentID, &trial.CaseID, &trial.Side, &trial.Repetition, &success, &trial.Response, &trial.Error, &metrics, &trial.CreatedAt); err != nil {
+		if err := rows.Scan(&trial.ID, &trial.ExperimentID, &trial.CaseID, &trial.Side, &trial.Repetition, &success, &trial.Status, &trial.FailureClass, &trial.Response, &trial.Error, &metrics, &trial.CreatedAt); err != nil {
 			return nil, err
 		}
 		trial.Success = success != 0

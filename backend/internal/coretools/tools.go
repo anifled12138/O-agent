@@ -3,18 +3,19 @@ package coretools
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
 	"axiom.local/agent/internal/provider"
+	"axiom.local/agent/internal/runfiles"
 )
 
 type Tool struct {
@@ -22,17 +23,28 @@ type Tool struct {
 	Handler    func(ctx context.Context, args json.RawMessage) (any, error)
 }
 
-func GetCoreTools(workspaceRoot string) []Tool {
+type processPolicy struct {
+	readOnlyPaths               []string
+	privateTempWorkingDirectory bool
+	journalPath                 string
+}
+
+func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
+	var runScope *runfiles.Scope
+	if len(runScopes) > 0 {
+		runScope = runScopes[0]
+	}
 	return []Tool{
 		{
 			Definition: toolDef(
 				"fs_read",
-				"Read text content from a file in the workspace. Supports 1-based line offset and limit with line-numbered output.",
-				`{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"Relative path to the file"},"offset":{"type":"integer","description":"1-based starting line number (default 1)"},"limit":{"type":"integer","description":"Maximum number of lines to read (default 200)"},"withLineNumbers":{"type":"boolean","description":"Whether to prepend line numbers (default true)"}},"additionalProperties":false}`,
+				"Read workspace text files up to 32 MiB or page through a run-scoped temporary artifact by ID. Supports 1-based line offsets and line-numbered output.",
+				`{"type":"object","properties":{"path":{"type":"string","description":"Relative path to a file in the workspace; use this or artifactId"},"artifactId":{"type":"string","description":"Opaque ID returned by grep_search or exec_script for a temporary artifact; use this or path"},"offset":{"type":"integer","description":"1-based starting line number (default 1)"},"limit":{"type":"integer","description":"Maximum number of lines to read (default 200)"},"withLineNumbers":{"type":"boolean","description":"Whether to prepend line numbers (default true)"}},"additionalProperties":false}`,
 			),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var p struct {
 					Path            string `json:"path"`
+					ArtifactID      string `json:"artifactId"`
 					Offset          int    `json:"offset"`
 					Limit           int    `json:"limit"`
 					WithLineNumbers *bool  `json:"withLineNumbers"`
@@ -40,11 +52,30 @@ func GetCoreTools(workspaceRoot string) []Tool {
 				if err := json.Unmarshal(args, &p); err != nil {
 					return nil, err
 				}
-				targetPath, err := safeResolve(workspaceRoot, p.Path)
-				if err != nil {
-					return nil, err
+				if (p.Path == "") == (p.ArtifactID == "") {
+					return nil, fmt.Errorf("provide exactly one of path or artifactId")
 				}
-				data, err := os.ReadFile(targetPath)
+				var data []byte
+				var err error
+				if p.ArtifactID != "" {
+					if runScope == nil {
+						return nil, fmt.Errorf("temporary artifacts are unavailable outside an Agent run")
+					}
+					data, err = runScope.ReadArtifact(p.ArtifactID)
+				} else {
+					var targetPath string
+					targetPath, err = safeResolve(workspaceRoot, p.Path)
+					if err == nil {
+						var info os.FileInfo
+						info, err = os.Stat(targetPath)
+						if err == nil && info.Size() > 32<<20 {
+							err = fmt.Errorf("file exceeds the 32 MiB read limit")
+						}
+						if err == nil {
+							data, err = os.ReadFile(targetPath)
+						}
+					}
+				}
 				if err != nil {
 					return nil, err
 				}
@@ -102,6 +133,7 @@ func GetCoreTools(workspaceRoot string) []Tool {
 
 				return map[string]any{
 					"path":       p.Path,
+					"artifactId": p.ArtifactID,
 					"startLine":  start + 1,
 					"endLine":    end,
 					"totalLines": totalLines,
@@ -109,6 +141,94 @@ func GetCoreTools(workspaceRoot string) []Tool {
 					"nextOffset": nextOffset,
 					"content":    content,
 					"truncated":  truncated,
+				}, nil
+			},
+		},
+		{
+			Definition: toolDef(
+				"exec_script",
+				"Run a short-lived script from source stored as a turn-scoped artifact. The script can read the workspace; its working directory and temporary writes use a private per-command AppContainer directory that is removed when the command ends. On Windows it runs in an AppContainer with network access disabled and a 128-process limit; platforms without a native sandbox backend reject execution. Script source is capped at 1 MiB and execution at 180 seconds; each output stream captures at most 1 MiB. Use exec_command for intentional project commands.",
+				`{"type":"object","required":["language","source"],"properties":{"language":{"type":"string","enum":["python","node","powershell","shell"],"description":"Installed interpreter to use"},"source":{"type":"string","description":"Script source; maximum 1 MiB"},"timeoutSeconds":{"type":"integer","description":"Execution timeout in seconds (default 30, max 180)"}},"additionalProperties":false}`,
+			),
+			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
+				if runScope == nil {
+					return nil, fmt.Errorf("temporary script execution is available only inside an Agent run")
+				}
+				var p struct {
+					Language       string `json:"language"`
+					Source         string `json:"source"`
+					TimeoutSeconds int    `json:"timeoutSeconds"`
+				}
+				if err := json.Unmarshal(args, &p); err != nil {
+					return nil, err
+				}
+				p.Language = strings.ToLower(strings.TrimSpace(p.Language))
+				if len(p.Source) > 1<<20 {
+					return nil, fmt.Errorf("script source exceeds the 1 MiB limit")
+				}
+				if p.TimeoutSeconds <= 0 {
+					p.TimeoutSeconds = 30
+				}
+				if p.TimeoutSeconds > 180 {
+					p.TimeoutSeconds = 180
+				}
+				extension, candidates, prefixArgs, err := scriptRuntime(p.Language)
+				if err != nil {
+					return nil, err
+				}
+				artifact, err := runScope.WriteArtifact("script", extension, []byte(p.Source))
+				if err != nil {
+					return nil, err
+				}
+				journalPath, err := runScope.NewSandboxJournalPath()
+				if err != nil {
+					return nil, err
+				}
+				var interpreter string
+				for _, candidate := range candidates {
+					interpreter, err = exec.LookPath(candidate)
+					if err == nil {
+						break
+					}
+				}
+				if err != nil {
+					return nil, fmt.Errorf("no interpreter found for %s script: tried %s", p.Language, strings.Join(candidates, ", "))
+				}
+				cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(p.TimeoutSeconds)*time.Second)
+				defer cancel()
+				cmdArgs := make([]string, 0, len(prefixArgs)+1)
+				if p.Language == "python" && runtime.GOOS == "windows" && strings.EqualFold(filepath.Base(interpreter), "py.exe") {
+					cmdArgs = append(cmdArgs, "-3")
+				}
+				cmdArgs = append(cmdArgs, prefixArgs...)
+				cmd := exec.CommandContext(cmdCtx, interpreter, cmdArgs...)
+				cmd.Dir = workspaceRoot
+				stdout, stderr := cappedBuffer{limit: 1 << 20}, cappedBuffer{limit: 1 << 20}
+				cmd.Stdout = &stdout
+				cmd.Stderr = &stderr
+				policy := processPolicy{readOnlyPaths: []string{workspaceRoot}, privateTempWorkingDirectory: true, journalPath: journalPath}
+				runErr, cleanupErr := runProcessTree(cmdCtx, cmd, []byte(p.Source), policy)
+				if cleanupErr != nil {
+					return nil, errors.Join(runErr, cleanupErr)
+				}
+				exitCode := 0
+				if runErr != nil {
+					var exited bool
+					exitCode, exited = processExitCode(runErr)
+					if !exited && cmdCtx.Err() == nil {
+						return nil, runErr
+					}
+				}
+				outStr, outTruncated := balanceTruncate(stdout.String(), 24*1024)
+				errStr, errTruncated := balanceTruncate(stderr.String(), 16*1024)
+				return map[string]any{
+					"language":         p.Language,
+					"scriptArtifactId": artifact.ID,
+					"stdout":           outStr,
+					"stderr":           errStr,
+					"exitCode":         exitCode,
+					"timedOut":         errors.Is(cmdCtx.Err(), context.DeadlineExceeded),
+					"outTruncated":     outTruncated || errTruncated || stdout.truncated || stderr.truncated,
 				}, nil
 			},
 		},
@@ -214,12 +334,18 @@ func GetCoreTools(workspaceRoot string) []Tool {
 					Depth          int    `json:"depth"`
 					IncludeIgnored bool   `json:"includeIgnored"`
 				}
-				_ = json.Unmarshal(args, &p)
+				if err := json.Unmarshal(args, &p); err != nil {
+					return nil, err
+				}
 				if p.Depth <= 0 {
 					p.Depth = 2
 				}
 				if p.Depth > 5 {
 					p.Depth = 5
+				}
+				workspaceAbs, err := filepath.Abs(workspaceRoot)
+				if err != nil {
+					return nil, err
 				}
 				targetDir, err := safeResolve(workspaceRoot, p.Path)
 				if err != nil {
@@ -240,19 +366,29 @@ func GetCoreTools(workspaceRoot string) []Tool {
 					}
 					files, err := os.ReadDir(current)
 					if err != nil {
-						return nil
+						return err
 					}
 					for _, f := range files {
+						if len(entries) >= 300 {
+							return nil
+						}
 						name := f.Name()
 						if !p.IncludeIgnored && (name == ".git" || name == "node_modules") {
 							continue
 						}
 						full := filepath.Join(current, name)
-						rel, _ := filepath.Rel(workspaceRoot, full)
+						rel, err := filepath.Rel(workspaceAbs, full)
+						if err != nil {
+							return err
+						}
 						cleanRel := filepath.ToSlash(rel)
 
 						var size int64
-						if info, err := f.Info(); err == nil && !f.IsDir() {
+						info, err := f.Info()
+						if err != nil {
+							return err
+						}
+						if !f.IsDir() {
 							size = info.Size()
 						}
 						entries = append(entries, Entry{
@@ -262,16 +398,17 @@ func GetCoreTools(workspaceRoot string) []Tool {
 						})
 
 						if f.IsDir() && currentDepth < p.Depth {
-							_ = walkDir(full, currentDepth+1)
-						}
-						if len(entries) >= 300 {
-							return nil
+							if err := walkDir(full, currentDepth+1); err != nil {
+								return err
+							}
 						}
 					}
 					return nil
 				}
 
-				_ = walkDir(targetDir, 1)
+				if err := walkDir(targetDir, 1); err != nil {
+					return nil, fmt.Errorf("list workspace: %w", err)
+				}
 
 				return map[string]any{
 					"path":       p.Path,
@@ -284,8 +421,8 @@ func GetCoreTools(workspaceRoot string) []Tool {
 		{
 			Definition: toolDef(
 				"grep_search",
-				"Search for text matching regex pattern across files with intelligent snippets and result persistence.",
-				`{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Regex search pattern"},"path":{"type":"string","description":"Relative directory or specific file path to search"},"maxMatches":{"type":"integer","description":"Maximum snippets to return directly in context (default 30, max 100)"},"includeIgnored":{"type":"boolean","description":"Whether to include .git and node_modules (default false)"}},"additionalProperties":false}`,
+				"Search workspace files using a regular expression. Large result sets are stored as run-scoped temporary artifacts and can be paged with fs_read; artifacts retain at most the first 10000 matches.",
+				`{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Regex search pattern; maximum 4 KiB"},"path":{"type":"string","description":"Relative directory or specific file path to search"},"maxMatches":{"type":"integer","description":"Maximum snippets to return directly in context (default 30, max 100)"},"includeIgnored":{"type":"boolean","description":"Whether to include .git and node_modules (default false)"}},"additionalProperties":false}`,
 			),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var p struct {
@@ -302,6 +439,9 @@ func GetCoreTools(workspaceRoot string) []Tool {
 				}
 				if p.MaxMatches > 100 {
 					p.MaxMatches = 100
+				}
+				if len(p.Pattern) > 4096 {
+					return nil, fmt.Errorf("regex pattern exceeds the 4 KiB limit")
 				}
 				re, err := regexp.Compile(p.Pattern)
 				if err != nil {
@@ -323,12 +463,13 @@ func GetCoreTools(workspaceRoot string) []Tool {
 				var matches []MatchSnippet
 				var allMatches []MatchSnippet
 				totalFound := 0
+				const maxArtifactMatches = 10000
 
 				isExplicitTarget := p.Path != "" && p.Path != "." && p.Path != "./"
 
-				_ = filepath.Walk(targetPath, func(path string, info os.FileInfo, err error) error {
+				walkErr := filepath.Walk(targetPath, func(path string, info os.FileInfo, err error) error {
 					if err != nil {
-						return nil
+						return err
 					}
 					if info.IsDir() {
 						name := info.Name()
@@ -340,9 +481,13 @@ func GetCoreTools(workspaceRoot string) []Tool {
 						return nil
 					}
 
-					rel, relErr := filepath.Rel(workspaceRoot, path)
+					workspaceAbs, absErr := filepath.Abs(workspaceRoot)
+					if absErr != nil {
+						return absErr
+					}
+					rel, relErr := filepath.Rel(workspaceAbs, path)
 					if relErr != nil {
-						rel = path
+						return relErr
 					}
 					cleanRel := filepath.ToSlash(rel)
 
@@ -352,7 +497,7 @@ func GetCoreTools(workspaceRoot string) []Tool {
 
 					data, err := os.ReadFile(path)
 					if err != nil {
-						return nil
+						return err
 					}
 
 					lines := strings.Split(string(data), "\n")
@@ -391,13 +536,18 @@ func GetCoreTools(workspaceRoot string) []Tool {
 							TotalLineLength: lineLen,
 						}
 
-						allMatches = append(allMatches, item)
+						if len(allMatches) < maxArtifactMatches {
+							allMatches = append(allMatches, item)
+						}
 						if len(matches) < p.MaxMatches {
 							matches = append(matches, item)
 						}
 					}
 					return nil
 				})
+				if walkErr != nil {
+					return nil, fmt.Errorf("search workspace: %w", walkErr)
+				}
 
 				res := map[string]any{
 					"pattern":    p.Pattern,
@@ -407,24 +557,26 @@ func GetCoreTools(workspaceRoot string) []Tool {
 				}
 
 				if totalFound > len(matches) {
-					offloadDir := filepath.Join(workspaceRoot, ".axiom", "outputs")
-					_ = os.MkdirAll(offloadDir, 0755)
-					randSuffix := make([]byte, 4)
-					_, _ = rand.Read(randSuffix)
-					dumpFile := filepath.Join(offloadDir, fmt.Sprintf("grep_%s_%s.json", time.Now().Format("20060102_150405"), hex.EncodeToString(randSuffix)))
+					if runScope == nil {
+						return nil, fmt.Errorf("large grep results require an Agent run artifact scope")
+					}
 					dumpPayload, dumpErr := json.MarshalIndent(map[string]any{
 						"pattern":    p.Pattern,
 						"path":       p.Path,
 						"totalFound": totalFound,
 						"matches":    allMatches,
+						"truncated":  totalFound > len(allMatches),
 					}, "", "  ")
-					if dumpErr == nil {
-						if writeErr := os.WriteFile(dumpFile, dumpPayload, 0644); writeErr == nil {
-							relDump, _ := filepath.Rel(workspaceRoot, dumpFile)
-							res["offloadedFile"] = filepath.ToSlash(relDump)
-							res["notice"] = fmt.Sprintf("Found %d matches. Returning top %d snippets. Full results saved to %s for inspection via fs_read.", totalFound, len(matches), filepath.ToSlash(relDump))
-						}
+					if dumpErr != nil {
+						return nil, fmt.Errorf("encode large grep results: %w", dumpErr)
 					}
+					artifact, writeErr := runScope.WriteArtifact("grep-results", "json", dumpPayload)
+					if writeErr != nil {
+						return nil, fmt.Errorf("save large grep results: %w", writeErr)
+					}
+					res["artifactId"] = artifact.ID
+					res["artifactTruncated"] = totalFound > len(allMatches)
+					res["notice"] = fmt.Sprintf("Found %d matches. Returning the first %d snippets; read artifactId %s with fs_read to page through the retained results.", totalFound, len(matches), artifact.ID)
 				}
 
 				return res, nil
@@ -433,10 +585,13 @@ func GetCoreTools(workspaceRoot string) []Tool {
 		{
 			Definition: toolDef(
 				"exec_command",
-				"Execute a shell command with a timeout in the workspace or specified subdirectory. Long outputs are balanced with head and tail preservation.",
-				`{"type":"object","required":["cmd"],"properties":{"cmd":{"type":"string","description":"Shell command to execute"},"workdir":{"type":"string","description":"Relative directory to run command in (default workspace root)"},"timeoutSeconds":{"type":"integer","description":"Command timeout in seconds (default 30, max 180)"}},"additionalProperties":false}`,
+				"Execute a read-only project command with a timeout in the workspace or specified subdirectory. On Windows the process runs in an AppContainer with workspace read access, writes limited to its private per-command temporary storage, network access disabled, and a 128-process limit; platforms without a native sandbox backend reject execution. Use the workspace file tools for project changes. Process descendants are terminated with the command; output capture is capped at 1 MiB per stream and returned head/tail are bounded.",
+				`{"type":"object","required":["cmd"],"properties":{"cmd":{"type":"string","description":"Shell command to execute; maximum 1 MiB"},"workdir":{"type":"string","description":"Relative directory to run command in (default workspace root)"},"timeoutSeconds":{"type":"integer","description":"Command timeout in seconds (default 30, max 180)"}},"additionalProperties":false}`,
 			),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
+				if runScope == nil {
+					return nil, fmt.Errorf("command execution is available only inside an Agent run")
+				}
 				var p struct {
 					Cmd            string `json:"cmd"`
 					Workdir        string `json:"workdir"`
@@ -444,6 +599,9 @@ func GetCoreTools(workspaceRoot string) []Tool {
 				}
 				if err := json.Unmarshal(args, &p); err != nil {
 					return nil, err
+				}
+				if len(p.Cmd) > 1<<20 {
+					return nil, fmt.Errorf("command exceeds the 1 MiB limit")
 				}
 				if p.TimeoutSeconds <= 0 {
 					p.TimeoutSeconds = 30
@@ -464,23 +622,30 @@ func GetCoreTools(workspaceRoot string) []Tool {
 				}
 
 				var cmd *exec.Cmd
-				if os.Getenv("OS") == "Windows_NT" {
-					cmd = exec.CommandContext(cmdCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", p.Cmd)
+				if runtime.GOOS == "windows" {
+					cmd = exec.CommandContext(cmdCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", "-")
 				} else {
-					cmd = exec.CommandContext(cmdCtx, "sh", "-c", p.Cmd)
+					cmd = exec.CommandContext(cmdCtx, "sh")
 				}
 				cmd.Dir = targetWorkdir
-				var stdout, stderr bytes.Buffer
+				journalPath, err := runScope.NewSandboxJournalPath()
+				if err != nil {
+					return nil, err
+				}
+				stdout, stderr := cappedBuffer{limit: 1 << 20}, cappedBuffer{limit: 1 << 20}
 				cmd.Stdout = &stdout
 				cmd.Stderr = &stderr
-
-				err := cmd.Run()
+				policy := processPolicy{readOnlyPaths: []string{workspaceRoot}, journalPath: journalPath}
+				err, cleanupErr := runProcessTree(cmdCtx, cmd, []byte(p.Cmd), policy)
+				if cleanupErr != nil {
+					return nil, errors.Join(err, cleanupErr)
+				}
 				exitCode := 0
 				if err != nil {
-					if exitErr, ok := err.(*exec.ExitError); ok {
-						exitCode = exitErr.ExitCode()
-					} else {
-						exitCode = -1
+					var exited bool
+					exitCode, exited = processExitCode(err)
+					if !exited && cmdCtx.Err() == nil {
+						return nil, err
 					}
 				}
 
@@ -493,10 +658,64 @@ func GetCoreTools(workspaceRoot string) []Tool {
 					"stdout":       outStr,
 					"stderr":       errStr,
 					"exitCode":     exitCode,
-					"outTruncated": outTruncated || errTruncated,
+					"timedOut":     errors.Is(cmdCtx.Err(), context.DeadlineExceeded),
+					"outTruncated": outTruncated || errTruncated || stdout.truncated || stderr.truncated,
 				}, nil
 			},
 		},
+	}
+}
+
+func processExitCode(err error) (int, bool) {
+	var exitErr interface{ ExitCode() int }
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), true
+	}
+	return -1, false
+}
+
+type cappedBuffer struct {
+	bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *cappedBuffer) Write(value []byte) (int, error) {
+	originalLength := len(value)
+	remaining := b.limit - b.Len()
+	if remaining <= 0 {
+		b.truncated = b.truncated || originalLength > 0
+		return originalLength, nil
+	}
+	if len(value) > remaining {
+		value = value[:remaining]
+		b.truncated = true
+	}
+	_, err := b.Buffer.Write(value)
+	return originalLength, err
+}
+
+func scriptRuntime(language string) (string, []string, []string, error) {
+	switch language {
+	case "python":
+		if runtime.GOOS == "windows" {
+			return "py", []string{"python", "python3", "py"}, []string{"-"}, nil
+		}
+		return "py", []string{"python3", "python"}, []string{"-"}, nil
+	case "node":
+		return "js", []string{"node"}, []string{"-"}, nil
+	case "powershell":
+		if runtime.GOOS == "windows" {
+			return "ps1", []string{"powershell.exe", "pwsh.exe"}, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"}, nil
+		}
+		return "ps1", []string{"pwsh", "powershell"}, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"}, nil
+	case "shell":
+		if runtime.GOOS == "windows" {
+			return "ps1", []string{"powershell.exe", "pwsh.exe"}, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"}, nil
+		}
+		return "sh", []string{"sh"}, nil, nil
+	default:
+		return "", nil, nil, fmt.Errorf("unsupported script language %q", language)
 	}
 }
 

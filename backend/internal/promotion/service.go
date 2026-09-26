@@ -207,7 +207,7 @@ func (s *Service) run(ctx context.Context, id string) {
 		job = s.update(id, func(next *Job) { next.ReleaseID = release.ID })
 	}
 	if project.State == pluginforge.StateTested {
-		project, _, err = s.forge.RequestApproval(ctx, job.UserID, project.ID)
+		project, _, err = s.forge.RequestApproval(ctx, job.UserID, project.ID, job.ReleaseID)
 		if err != nil {
 			s.fail(id, StatusFailed, err.Error())
 			return

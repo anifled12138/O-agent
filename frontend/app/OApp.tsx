@@ -1,20 +1,22 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Plus, MessageSquare, Layers, Settings as SettingsIcon, ArrowUp, Square, Sparkles, KeyRound, AlertCircle, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight } from 'lucide-react';
+import { Plus, Layers, Settings as SettingsIcon, Activity, ArrowUp, Square, Sparkles, KeyRound, AlertCircle, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight } from 'lucide-react';
 import UnifiedPluginCenter from './UnifiedPluginCenter';
+import ObservabilityModal from './ObservabilityModal';
 import { Settings } from './SettingsModal';
 import ProjectModal from './ProjectModal';
 import { MarkdownView } from './MarkdownView';
-import { API_V2, request, UnifiedPlugin, getUnifiedPlugins, updateConversationTitle, generateConversationTitle, Project, getProjects, updateConversationProject } from './api';
+import { API_V2, request, UnifiedPlugin, getUnifiedPlugins, updateConversationTitle, generateConversationTitle, Project, getProjects, updateConversationProject, updateConversationPermissionProfile, ConversationPermissionProfile, resolveAgentApproval } from './api';
 
 export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; contextWindow: number; hasApiKey: boolean };
-type Conversation = { id: string; title: string; providerId: string; agentGenerationId?: string; agentDefinitionDigest?: string; projectId?: string; updatedAt: string };
+type Conversation = { id: string; title: string; providerId: string; agentGenerationId?: string; agentDefinitionDigest?: string; projectId?: string; permissionProfile: ConversationPermissionProfile; parentConversationId?: string; branchFromMessageId?: string; executionPaused: boolean; updatedAt: string };
 type Message = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string };
-type ConversationDetail = Conversation & { messages: Message[] };
+type ConversationDetail = Conversation & { messages: Message[]; lifecycleEvents?: { id: string; kind: string; createdAt: string }[] };
 type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; details: Record<string, unknown>; createdAt: string };
-type AgentTurn = { id: string; conversationId: string; inputMessageId: string; resultMessageId?: string; providerId: string; status: string; stopReason?: string; recoveryClass?: string; cancelRequested: boolean; lastSequence: number; startedAt: string; completedAt?: string };
+type AgentTurn = { id: string; conversationId: string; inputMessageId: string; retryOfTurnId?: string; resultMessageId?: string; providerId: string; permissionProfile?: ConversationPermissionProfile; status: string; stopReason?: string; recoveryClass?: string; reconciliationNote?: string; cancelRequested: boolean; lastSequence: number; startedAt: string; completedAt?: string };
 type TurnReceipt = { turnId: string; conversationId: string; inputMessageId: string; status: string };
+type InboxInput = { id: string; conversationId: string; content: string; status: string; turnId?: string; createdAt: string };
 
 export function cleanTitleString(rawTitle?: string): string {
   if (!rawTitle) return '';
@@ -47,6 +49,7 @@ export default function OApp() {
   const [active, setActive] = useState<ConversationDetail | null>(null);
   const [selectedProviderId, setSelectedProviderId] = useState<string>('');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [observabilityOpen, setObservabilityOpen] = useState(false);
   const [pluginsOpen, setPluginsOpen] = useState<false | 'all' | 'mcp' | 'skill' | 'core' | 'release'>(false);
   const [unifiedPlugins, setUnifiedPlugins] = useState<UnifiedPlugin[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -93,10 +96,12 @@ export default function OApp() {
   runningConvosRef.current = runningConvos;
 
   const observersRef = useRef<Map<string, { turnId: string; controller: AbortController; promise: Promise<void> }>>(new Map());
+  const observeTurnRef = useRef<(turnId: string, conversationId: string) => Promise<void>>(async () => {});
 
   const [notice, setNotice] = useState('');
   const [trace, setTrace] = useState<TraceEvent[]>([]);
   const [turns, setTurns] = useState<AgentTurn[]>([]);
+  const [queuedInputs, setQueuedInputs] = useState<Record<string, InboxInput[]>>({});
   const activeIdRef = useRef('');
   const activeRef = useRef<ConversationDetail | null>(null);
   activeRef.current = active;
@@ -243,6 +248,10 @@ export default function OApp() {
         if (activeIdRef.current === conversationId) {
           setTrace((items) => (items.some((item) => item.id === event.id) ? items : [...items, event]));
         }
+        if (event.kind === 'approval.requested' || event.kind === 'approval.resolved') {
+          const status = event.kind === 'approval.requested' ? 'awaiting_approval' : 'running';
+          setTurns((items) => items.map((turn) => turn.id === turnId ? { ...turn, status } : turn));
+        }
         if (event.kind === 'turn.failed') {
           const errText = typeof event.details.error === 'string' ? event.details.error : 'Agent 运行失败';
           if (/image|vision|multimodal|400 Bad Request/i.test(errText)) {
@@ -252,8 +261,9 @@ export default function OApp() {
           }
         }
 		if (event.kind === 'turn.cancelled') setNotice('任务已停止，已完成的过程仍保留在运行记录中。');
+		if (event.kind === 'turn.interrupted') setNotice('运行进程已中断；可从原始输入重新执行。');
 		if (event.kind === 'turn.incomplete') setNotice('任务已达到执行步数上限；当前总结和已完成过程已保留，但任务尚未完成。');
-		if (event.kind === 'turn.needs_reconciliation') setNotice('任务产生了需要确认的外部影响，处理后才能重试。');
+		if (event.kind === 'turn.needs_reconciliation') setNotice('任务可能已执行外部工具；请人工核对影响后再显式重试或创建分支，系统不会自动重放。');
       },
       controller.signal
     )
@@ -269,10 +279,13 @@ export default function OApp() {
           delete next[conversationId];
           return next;
         });
-        void refreshConversation(conversationId).then((refreshed) => {
+        void refreshConversation(conversationId).then(async (refreshed) => {
           if (refreshed && shouldAutoTitle(refreshed.title) && refreshed.messages.length >= 1 && isTitlePluginEnabled) {
             void autoUpdateTitle(conversationId, refreshed.providerId || selectedProviderId);
           }
+          const refreshedTurns = await request<AgentTurn[]>(`/conversations/${conversationId}/turns`).catch(() => [] as AgentTurn[]);
+          const nextActiveTurn = refreshedTurns.find((turn) => turn.id !== turnId && (turn.status === 'running' || turn.status === 'cancelling' || turn.status === 'awaiting_approval'));
+          if (nextActiveTurn) void observeTurn(nextActiveTurn.id, conversationId);
         });
       });
 
@@ -280,17 +293,21 @@ export default function OApp() {
     return promise;
   }
 
+  observeTurnRef.current = observeTurn;
+
   async function refreshConversation(id: string): Promise<ConversationDetail | null> {
     try {
-    const [detail, events, conversationTurns] = await Promise.all([
+    const [detail, events, conversationTurns, inbox] = await Promise.all([
       request<ConversationDetail>(`/conversations/${id}`),
       request<TraceEvent[]>(`/conversations/${id}/trace`),
       request<AgentTurn[]>(`/conversations/${id}/turns`),
+      request<InboxInput[]>(`${API_V2}/agent/conversations/${encodeURIComponent(id)}/inbox`),
     ]);
     if (activeIdRef.current === id) {
       setActive(detail);
       setTrace(events);
       setTurns(conversationTurns);
+      setQueuedInputs((prev) => ({ ...prev, [id]: inbox }));
       }
       setConversations((items) => items.map((item) => (item.id === detail.id ? detail : item)));
       return detail;
@@ -299,17 +316,48 @@ export default function OApp() {
     }
   }
 
+  useEffect(() => {
+    const conversationId = active?.id;
+    if (!conversationId || !(queuedInputs[conversationId]?.length)) return;
+    let polling = false;
+    const timer = window.setInterval(async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const [inbox, conversationTurns] = await Promise.all([
+          request<InboxInput[]>(`${API_V2}/agent/conversations/${encodeURIComponent(conversationId)}/inbox`),
+          request<AgentTurn[]>(`/conversations/${encodeURIComponent(conversationId)}/turns`),
+        ]);
+        if (activeIdRef.current !== conversationId) return;
+        setQueuedInputs((prev) => {
+          const existing = prev[conversationId] ?? [];
+          if (existing.length === inbox.length && existing.every((item, index) => item.id === inbox[index]?.id)) return prev;
+          return { ...prev, [conversationId]: inbox };
+        });
+        const running = conversationTurns.find((turn) => turn.status === 'running' || turn.status === 'cancelling' || turn.status === 'awaiting_approval');
+        if (running && !runningConvosRef.current[conversationId]) void observeTurnRef.current(running.id, conversationId);
+      } catch {
+        // The next poll retries the read; the durable inbox remains authoritative.
+      } finally {
+        polling = false;
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [active?.id, queuedInputs]);
+
   async function openConversation(id: string) {
     setEditingTitle(false);
     activeIdRef.current = id;
-    const [detail, events, turns] = await Promise.all([
+    const [detail, events, turns, inbox] = await Promise.all([
       request<ConversationDetail>(`/conversations/${id}`),
       request<TraceEvent[]>(`/conversations/${id}/trace`),
       request<AgentTurn[]>(`/conversations/${id}/turns`),
+      request<InboxInput[]>(`${API_V2}/agent/conversations/${encodeURIComponent(id)}/inbox`),
     ]);
     if (activeIdRef.current !== id) return;
     setActive(detail);
     setTurns(turns);
+    setQueuedInputs((prev) => ({ ...prev, [id]: inbox }));
     setNotice('');
 
     const runningItem = runningConvosRef.current[id];
@@ -323,7 +371,7 @@ export default function OApp() {
       void autoUpdateTitle(id, detail.providerId || selectedProviderId);
     }
 
-    const running = turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling');
+    const running = turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling' || turn.status === 'awaiting_approval');
     if (running) {
       void observeTurn(running.id, id);
     }
@@ -388,9 +436,30 @@ export default function OApp() {
     setNotice('');
   }
 
-  async function send(content: string) {
-    if (!content.trim()) return;
-    if (active && runningConvosRef.current[active.id]) return;
+  async function send(content: string): Promise<boolean> {
+    if (!content.trim()) return false;
+    if (active && runningConvosRef.current[active.id]) {
+      try {
+        const item = await request<InboxInput>(`${API_V2}/agent/conversations/${encodeURIComponent(active.id)}/inbox`, {
+          method: 'POST',
+          body: JSON.stringify({ content }),
+        });
+        if (item.status === 'queued') {
+          setQueuedInputs((prev) => ({ ...prev, [active.id]: [...(prev[active.id] ?? []), item] }));
+          setNotice('消息已加入队列，当前任务结束后会自动开始。');
+        } else if (item.turnId) {
+          void observeTurn(item.turnId, active.id);
+          void refreshConversation(active.id);
+          setNotice(item.status === 'claimed' ? '消息已开始处理。' : inboxTurnStatusLabel(item.status));
+        } else {
+          setNotice(`消息状态：${item.status}`);
+        }
+        return true;
+      } catch (error) {
+        setNotice(error instanceof Error ? error.message : '加入消息队列失败');
+        return false;
+      }
+    }
 
     setNotice('');
     try {
@@ -398,7 +467,7 @@ export default function OApp() {
       if (!target) {
         if (!providers.length) {
           setSettingsOpen(true);
-          return;
+          return false;
         }
         const created = await request<Conversation>('/conversations', {
           method: 'POST',
@@ -415,26 +484,125 @@ export default function OApp() {
         method: 'POST',
         body: JSON.stringify({ content }),
       });
-      void observeTurn(receipt.turnId, target.id);
+      if (receipt.status === 'queued') {
+        setNotice('运行容量已满，消息已安全加入队列，空闲时会自动开始。');
+        void refreshConversation(target.id);
+      } else {
+        if (receipt.turnId) void observeTurn(receipt.turnId, target.id);
+        void refreshConversation(target.id);
+      }
+      return true;
     } catch (error) {
+      if (activeRef.current?.id) await refreshConversation(activeRef.current.id);
       setNotice(error instanceof Error ? error.message : 'Agent 运行失败');
+      return false;
     }
   }
 
   async function cancelTurn() {
     if (!active) return;
-    const runningItem = runningConvosRef.current[active.id];
-    if (!runningItem) return;
     try {
-      await request(`/agent/turns/${runningItem.turnId}/cancel`, { method: 'POST', body: JSON.stringify({ reason: 'user_requested' }) });
-      setNotice('正在安全停止当前任务…');
+      const receipt = await request<{ cancelledTurnId?: string; cancelledTurnStatus?: string; cancelledInboxCount: number; queuedInboxRemaining: number; executionPaused: boolean }>(`${API_V2}/agent/conversations/${encodeURIComponent(active.id)}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: 'user_requested' }),
+      });
+      if (!receipt.executionPaused || receipt.queuedInboxRemaining !== 0) {
+        throw new Error('停止请求已提交，但会话或排队状态未完成读回，请刷新确认。');
+      }
+      await refreshConversation(active.id);
+      const stopState = receipt.cancelledTurnStatus === 'cancelling' ? '停止请求已提交' : '会话已停止';
+      setNotice(`${stopState}；${receipt.cancelledInboxCount} 条未开始的排队消息已取消。`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : '无法停止当前任务');
+      setNotice(error instanceof Error ? error.message : '无法停止会话');
     }
+  }
+
+  async function retryTurn(turnId: string, editedContent?: string): Promise<boolean> {
+    const conversationId = activeRef.current?.id;
+    if (!conversationId) return false;
+    const inputMessageId = turns.find((turn) => turn.id === turnId)?.inputMessageId;
+    const prior = activeRef.current;
+    if (editedContent !== undefined && prior && inputMessageId) {
+      setActive({
+        ...prior,
+        messages: prior.messages.map((message) => message.id === inputMessageId ? { ...message, content: editedContent } : message),
+      });
+    }
+    try {
+      const receipt = await request<TurnReceipt>(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/retry`, {
+        method: 'POST',
+        body: JSON.stringify(editedContent === undefined ? {} : { content: editedContent }),
+      });
+      void observeTurn(receipt.turnId, receipt.conversationId);
+      await refreshConversation(conversationId);
+      setNotice(editedContent === undefined ? '已从原消息重新开始任务。' : '已保存修改并重新开始任务。');
+      return true;
+    } catch (error) {
+      await refreshConversation(conversationId);
+      setNotice(error instanceof Error ? error.message : '重新开始任务失败');
+      return false;
+    }
+  }
+
+  async function branchTurn(turnId: string, editedContent?: string): Promise<boolean> {
+    let receipt: TurnReceipt;
+    try {
+      receipt = await request<TurnReceipt>(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/branch`, {
+        method: 'POST',
+        body: JSON.stringify(editedContent === undefined ? {} : { content: editedContent }),
+      });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '创建会话分支失败');
+      return false;
+    }
+    try {
+      const conversationsReadback = await request<Conversation[]>('/conversations');
+      setConversations(conversationsReadback);
+      await openConversation(receipt.conversationId);
+      setNotice(receipt.status === 'failed'
+        ? '分支已创建，但 Turn 启动失败；请查看分支中的运行状态。'
+        : editedContent === undefined ? '已从此消息创建并启动分支。' : '已创建分支并在其中运行修改后的消息。');
+      return true;
+    } catch (error) {
+      setNotice(`分支已启动，但界面无法重新读取它：${error instanceof Error ? error.message : '请刷新会话列表'}`);
+      return true;
+    }
+  }
+
+  async function reconcileTurn(turnId: string, note: string): Promise<boolean> {
+    const conversationId = activeRef.current?.id;
+    if (!conversationId) return false;
+    let reconciliation: { note: string; conversationId: string };
+    try {
+      reconciliation = await request<{ note: string; conversationId: string }>(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/reconcile`, {
+        method: 'POST',
+        body: JSON.stringify({ note }),
+      });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '保存核对记录失败');
+      return false;
+    }
+    setTurns((items) => items.map((turn) => turn.id === turnId ? { ...turn, recoveryClass: 'manually_reconciled', reconciliationNote: reconciliation.note } : turn));
+    const refreshed = await refreshConversation(conversationId);
+    if (!refreshed) {
+      setNotice('核对记录已保存；但会话刷新失败，请手动刷新状态。');
+      return true;
+    }
+    try {
+      const refreshedTurns = await request<AgentTurn[]>(`/conversations/${encodeURIComponent(conversationId)}/turns`);
+      const nextActiveTurn = refreshedTurns.find((turn) => turn.status === 'running' || turn.status === 'cancelling' || turn.status === 'awaiting_approval');
+      if (nextActiveTurn) void observeTurn(nextActiveTurn.id, conversationId);
+    } catch (error) {
+      setNotice(`核对记录已保存；但无法读取后续 Turn 状态：${error instanceof Error ? error.message : '请刷新会话'}`);
+      return true;
+    }
+    setNotice('核对记录已保存；后续新 Turn 与排队输入现在可以按 FIFO 继续。');
+    return true;
   }
 
 
   const isCurrentSending = active ? !!runningConvos[active.id] : false;
+  const currentTurn = active ? turns.find((turn) => turn.id === runningConvos[active.id]?.turnId) : undefined;
   const currentTrace = active ? (runningConvos[active.id]?.trace ?? trace) : [];
   const backgroundRunningCount = useMemo(() => {
     return Object.keys(runningConvos).filter((id) => id !== active?.id).length;
@@ -660,10 +828,13 @@ export default function OApp() {
             </div>
           )}
           <div className="header-actions">
+            <button type="button" className="icon-button" aria-label="打开工具可观测性" title="工具可观测性" onClick={() => setObservabilityOpen(true)}>
+              <Activity size={16} strokeWidth={1.75} aria-hidden="true" />
+            </button>
             {isCurrentSending ? (
               <span className="status-pill active" aria-live="polite">
                 <i className="status-dot" aria-hidden="true" />
-                <span>任务运行中</span>
+                <span>{currentTurn?.status === 'awaiting_approval' ? '等待授权' : '任务运行中'}</span>
               </span>
             ) : backgroundRunningCount > 0 ? (
               <span className="status-pill background" aria-live="polite" title="后台任务运行中">
@@ -695,10 +866,25 @@ export default function OApp() {
             trace={trace}
             liveTrace={currentTrace}
             turns={turns}
+            onPermissionProfileChange={async (profile) => {
+              if (!active) return;
+              try {
+                const saved = await updateConversationPermissionProfile<ConversationDetail>(active.id, profile);
+                setActive(saved);
+                setConversations((items) => items.map((item) => item.id === saved.id ? { ...item, permissionProfile: saved.permissionProfile } : item));
+                setNotice('会话权限已保存；降低权限时，当前任务会收到停止请求。');
+              } catch (error) {
+                setNotice(error instanceof Error ? error.message : '会话权限保存失败');
+              }
+            }}
+            queuedInputs={active ? queuedInputs[active.id] ?? [] : []}
             unifiedPlugins={unifiedPlugins}
             onNotice={setNotice}
             onSend={send}
             onCancel={cancelTurn}
+            onRetry={retryTurn}
+            onBranch={branchTurn}
+            onReconcile={reconcileTurn}
             onConfigure={() => setSettingsOpen(true)}
             onOpenPlugins={(type) => setPluginsOpen(type || 'all')}
           />
@@ -723,6 +909,8 @@ export default function OApp() {
           }}
         />
       )}
+
+      {observabilityOpen && <ObservabilityModal onClose={() => setObservabilityOpen(false)} />}
 
       {pluginsOpen && (
         <UnifiedPluginCenter
@@ -783,6 +971,7 @@ function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void, signa
 		  event.kind === 'turn.incomplete' ||
 		  event.kind === 'turn.failed' ||
           event.kind === 'turn.cancelled' ||
+          event.kind === 'turn.interrupted' ||
           event.kind === 'turn.needs_reconciliation'
         ) {
           source.close();
@@ -1001,7 +1190,6 @@ function Sidebar({
                                   onClick={() => onOpen(item.id)}
                                   title={displayTitle}
                                 >
-                                  <MessageSquare size={13} strokeWidth={1.75} aria-hidden="true" />
                                   <span className="sidebar-convo-title">{displayTitle}</span>
                                   {!!runningConvos?.[item.id] && <span className="sidebar-running-dot" title="任务运行中" />}
                                 </button>
@@ -1107,7 +1295,6 @@ function Sidebar({
                     onClick={() => onOpen(item.id)}
                     title={displayTitle}
                   >
-                    <MessageSquare size={14} strokeWidth={1.75} aria-hidden="true" />
                     <span className="sidebar-convo-title">{displayTitle}</span>
                     {!!runningConvos?.[item.id] && <span className="sidebar-running-dot" title="任务运行中" />}
                   </button>
@@ -1282,15 +1469,21 @@ function Chat({
   trace,
   liveTrace,
   turns,
+  queuedInputs,
   onSend,
   onCancel,
+  onRetry,
+  onBranch,
+  onReconcile,
   onConfigure,
   onOpenPlugins,
   unifiedPlugins,
   onNotice,
+  onPermissionProfileChange,
 }: {
   unifiedPlugins: UnifiedPlugin[];
   onNotice?: (msg: string) => void;
+  onPermissionProfileChange: (profile: ConversationPermissionProfile) => void;
   active: ConversationDetail | null;
   providers: Provider[];
   selectedProviderId: string;
@@ -1300,12 +1493,21 @@ function Chat({
   trace: TraceEvent[];
   liveTrace: TraceEvent[];
   turns: AgentTurn[];
-  onSend: (content: string) => void;
+  queuedInputs: InboxInput[];
+  onSend: (content: string) => Promise<boolean>;
   onCancel: () => void;
+  onRetry: (turnId: string, editedContent?: string) => Promise<boolean>;
+  onBranch: (turnId: string, editedContent?: string) => Promise<boolean>;
+  onReconcile: (turnId: string, note: string) => Promise<boolean>;
   onConfigure: () => void;
   onOpenPlugins: (type?: 'all' | 'mcp' | 'skill' | 'core' | 'release') => void;
 }) {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [editingMessageId, setEditingMessageId] = useState('');
+  const [editingMessageContent, setEditingMessageContent] = useState('');
+  const [reconcileTurnId, setReconcileTurnId] = useState('');
+  const [reconcileNote, setReconcileNote] = useState('');
+  const [messageActionBusy, setMessageActionBusy] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -1332,6 +1534,8 @@ function Chat({
     return providers[0] || null;
   }, [active, selectedProviderId, providers]);
   const sessionId = active?.id || '__new__';
+  const pendingApprovalEvents = liveTrace.filter((event) => event.kind.startsWith('permission.') || event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied');
+  const hasPendingApproval = liveTrace.some((event) => event.kind === 'approval.requested' && !liveTrace.some((candidate) => candidate.kind === 'approval.resolved' && textDetail(candidate.details, 'approvalId') === textDetail(event.details, 'id')));
 
   const [draftsMap, setDraftsMap] = useState<Record<string, ConversationDraft>>(() => loadStoredDrafts());
   const draftsMapRef = useRef(draftsMap);
@@ -1484,27 +1688,50 @@ function Chat({
   }, [unifiedPlugins]);
   const activeMcpCount = useMemo(() => unifiedPlugins.filter((p) => p.type === 'mcp' && p.status === 'enabled').length, [unifiedPlugins]);
   const activeSkillCount = useMemo(() => unifiedPlugins.filter((p) => p.type === 'skill' && p.status === 'enabled').length, [unifiedPlugins]);
+  const hasUnreconciledToolEffects = turns.some((turn) => turn.recoveryClass === 'unknown_external_effect');
   const activePluginCount = useMemo(
     () => unifiedPlugins.filter((p) => (p.type === 'core' || p.type === 'release') && p.status === 'enabled').length,
     [unifiedPlugins]
   );
 
-  const submit = () => {
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async () => {
     const textValue = draft.trim();
-    if (!sending && (textValue || attachments.length > 0)) {
+    if (!submitting && (textValue || attachments.length > 0)) {
       let fullContent = textValue;
       if (attachments.length > 0) {
         const imgPart = attachments.map((a) => '![' + a.name + '](' + a.dataUrl + ')').join('\n\n');
         fullContent = fullContent ? fullContent + '\n\n' + imgPart : imgPart;
       }
-      clearCurrentDraft();
-      onSend(fullContent);
+      setSubmitting(true);
+      try {
+        if (await onSend(fullContent)) clearCurrentDraft();
+      } finally {
+        setSubmitting(false);
+      }
     }
   };
 
   return (
     <div className="chat-column">
       <div className="messages">
+        {active?.parentConversationId && (
+          <div className="conversation-lifecycle-banner" role="status">
+            这是从原会话分出的新分支。原会话和其中的消息保持不变。
+          </div>
+        )}
+        {active?.executionPaused && (
+          <div className="conversation-lifecycle-banner paused" role="status">
+            会话已停止，未开始的排队消息已取消。发送新消息会恢复执行；若上轮工具影响未确定，需先完成核对。
+          </div>
+        )}
+        {queuedInputs.length > 0 && (
+          <div className="queued-inputs" role="status">
+            <b>{queuedInputs.length} 条消息已排队</b>
+            <span>{queuedInputs[0]?.content.slice(0, 160)}{(queuedInputs[0]?.content.length ?? 0) > 160 ? '…' : ''}</span>
+            {hasUnreconciledToolEffects && <small>上一轮可能已产生外部影响；请先核对，排队消息会在核对后继续。</small>}
+          </div>
+        )}
         {!active?.messages.length ? (
           <div className="empty-chat">
             <div className="empty-hero">
@@ -1538,7 +1765,21 @@ function Chat({
           </div>
         ) : (
           active.messages.map((message) => {
-            const messageTurn = message.role === 'assistant' ? turns.find((turn) => turn.resultMessageId === message.id) : undefined;
+            const associatedTurns = turns.filter((turn) => message.role === 'assistant' ? turn.resultMessageId === message.id : turn.inputMessageId === message.id);
+            const messageTurn = associatedTurns.sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt))[0];
+            const latestMessage = active.messages[active.messages.length - 1]?.id === message.id;
+            const safeToRepeat = messageTurn?.recoveryClass === 'safe_to_retry' || messageTurn?.recoveryClass === 'manually_reconciled';
+            const retryableStatus = !!messageTurn && (
+              ['failed', 'cancelled', 'interrupted', 'incomplete'].includes(messageTurn.status) ||
+              (messageTurn.status === 'needs_reconciliation' && messageTurn.recoveryClass === 'manually_reconciled')
+            );
+            const retryable = !!messageTurn && latestMessage && message.role === 'user' && retryableStatus && safeToRepeat;
+            const branchable = !!messageTurn && message.role === 'user' && !retryable && safeToRepeat &&
+              ['completed', 'failed', 'cancelled', 'interrupted', 'incomplete', 'needs_reconciliation'].includes(messageTurn.status);
+            const reconciliationRequired = !!messageTurn && !safeToRepeat &&
+              ['unknown_external_effect', 'not_replayable'].includes(messageTurn.recoveryClass || '');
+            const reconciled = messageTurn?.recoveryClass === 'manually_reconciled';
+            const editUsesBranch = branchable;
             return (
               <article key={message.id} className={`message ${message.role}`}>
                 <div className="message-role">{message.role === 'user' ? '你' : 'O'}</div>
@@ -1546,7 +1787,87 @@ function Chat({
                   {isRunInspectorEnabled && messageTurn && (
                     <ActivityTrace turn={messageTurn} trace={trace.filter((event) => event.turnId === messageTurn.id)} />
                   )}
-                  <MarkdownView content={message.content} />
+                  {editingMessageId === message.id ? (
+                    <div className="message-edit-form">
+                      <textarea value={editingMessageContent} onChange={(event) => setEditingMessageContent(event.target.value)} aria-label="编辑并重新发送消息" />
+                      <div className="message-edit-actions">
+                        <button type="button" onClick={() => setEditingMessageId('')}>取消</button>
+                        <button type="button" disabled={!editingMessageContent.trim() || messageActionBusy} onClick={async () => {
+                          if (!messageTurn) return;
+                          setMessageActionBusy(true);
+                          try {
+                            const applied = editUsesBranch
+                              ? await onBranch(messageTurn.id, editingMessageContent)
+                              : await onRetry(messageTurn.id, editingMessageContent);
+                            if (applied) setEditingMessageId('');
+                          } finally {
+                            setMessageActionBusy(false);
+                          }
+                        }}>{editUsesBranch ? '保存并分支重跑' : '保存并重试'}</button>
+                      </div>
+                    </div>
+                  ) : <MarkdownView content={message.content} />}
+                  {message.role === 'user' && messageTurn && (
+                    <div className="message-state-row">
+                      <span className={`message-state ${reconciliationRequired ? 'needs-reconciliation' : ''}`}>
+                        {reconciliationRequired ? '存在需要核对的工具影响' : reconciled ? '已记录人工核对' : turnStatusLabel(messageTurn.status)}
+                      </span>
+                      {reconciled && messageTurn.reconciliationNote && (
+                        <small className="message-reconciliation-note">核对说明：{messageTurn.reconciliationNote}</small>
+                      )}
+                      {retryable && editingMessageId !== message.id && (
+                        <div className="message-action-buttons">
+                          <button type="button" disabled={messageActionBusy} onClick={async () => {
+                            setMessageActionBusy(true);
+                            try { await onRetry(messageTurn.id); } finally { setMessageActionBusy(false); }
+                          }}>{messageTurn.status === 'interrupted' ? '从原始输入重跑' : '重试'}</button>
+                          <button type="button" onClick={() => {
+                            setEditingMessageId(message.id);
+                            setEditingMessageContent(message.content);
+                          }}>编辑并重试</button>
+                        </div>
+                      )}
+                      {branchable && editingMessageId !== message.id && (
+                        <div className="message-action-buttons">
+                          <button type="button" disabled={messageActionBusy} onClick={async () => {
+                            setMessageActionBusy(true);
+                            try { await onBranch(messageTurn.id); } finally { setMessageActionBusy(false); }
+                          }}>从此处新建分支</button>
+                          <button type="button" disabled={messageActionBusy} onClick={() => {
+                            setEditingMessageId(message.id);
+                            setEditingMessageContent(message.content);
+                          }}>编辑并分支重跑</button>
+                        </div>
+                      )}
+                      {reconciliationRequired && (
+                        <div className="message-reconciliation">
+                          <p>工具可能已经产生外部影响。先人工核对，再记录说明；确认后系统才允许你显式重跑。</p>
+                          {reconcileTurnId === messageTurn.id ? (
+                            <>
+                              <textarea value={reconcileNote} onChange={(event) => setReconcileNote(event.target.value)} maxLength={2000} aria-label="人工核对说明" placeholder="写明核对了哪些影响，以及为什么可以再次执行。" />
+                              <div className="message-edit-actions">
+                                <button type="button" onClick={() => { setReconcileTurnId(''); setReconcileNote(''); }}>取消</button>
+                                <button type="button" disabled={!reconcileNote.trim() || messageActionBusy} onClick={async () => {
+                                  setMessageActionBusy(true);
+                                  try {
+                                    if (await onReconcile(messageTurn.id, reconcileNote)) {
+                                      setReconcileTurnId('');
+                                      setReconcileNote('');
+                                    }
+                                  } finally {
+                                    setMessageActionBusy(false);
+                                  }
+                                }}>记录核对并允许重跑</button>
+                              </div>
+                              <small>此操作会授权后续再次执行，可能重复尚未确认的外部操作。</small>
+                            </>
+                          ) : (
+                            <button type="button" disabled={messageActionBusy} onClick={() => setReconcileTurnId(messageTurn.id)}>填写核对说明</button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </article>
             );
@@ -1556,10 +1877,10 @@ function Chat({
           <article className="message assistant running-message">
             <div className="message-role">O</div>
             <div className="thinking-stack">
-              {isRunInspectorEnabled ? (
+              {isRunInspectorEnabled || hasPendingApproval ? (
                 <ActivityTrace
-                  trace={liveTrace}
-                  turn={turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling')}
+                  trace={isRunInspectorEnabled ? liveTrace : pendingApprovalEvents}
+                  turn={turns.find((turn) => turn.status === 'running' || turn.status === 'cancelling' || turn.status === 'awaiting_approval')}
                   running
                 />
               ) : (
@@ -1608,9 +1929,9 @@ function Chat({
           onChange={(e) => setDraft(e.target.value)}
           onPaste={handlePaste}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey && !sending) {
+            if (e.key === 'Enter' && !e.shiftKey && !submitting) {
               e.preventDefault();
-              submit();
+              void submit();
             }
           }}
           placeholder={
@@ -1657,6 +1978,16 @@ function Chat({
             </button>
           </div>
           <div className="composer-actions-right">
+            {active && (
+              <label className="permission-profile-control" title="权限只影响之后启动的任务">
+                <span>权限</span>
+                <select aria-label="当前会话权限等级" value={active.permissionProfile || 'workspace_autonomous'} onChange={(event) => onPermissionProfileChange(event.target.value as ConversationPermissionProfile)}>
+                  <option value="read_only">只读</option>
+                  <option value="workspace_autonomous">工作区自主</option>
+                  <option value="ask_on_sensitive">敏感操作询问</option>
+                </select>
+              </label>
+            )}
             {isModelSelectorEnabled && (
               <div className="model-selector-anchor" ref={modelMenuRef}>
               <button
@@ -1729,20 +2060,19 @@ function Chat({
             </div>
             )}
 
-            {sending ? (
-              <button type="button" className="composer-icon-button stop-btn" onClick={onCancel} title="停止任务" aria-label="停止">
+            <button
+              type="button"
+              className="composer-icon-button send-btn"
+              onClick={() => void submit()}
+              disabled={(!draft.trim() && attachments.length === 0) || !providers.length || submitting}
+              title={sending ? '加入当前会话队列' : '发送'}
+              aria-label={sending ? '加入消息队列' : '发送'}
+            >
+              <ArrowUp size={15} strokeWidth={2.4} />
+            </button>
+            {sending && (
+              <button type="button" className="composer-icon-button stop-btn" onClick={onCancel} title="停止会话并清空排队消息" aria-label="停止会话">
                 <Square size={12} fill="currentColor" strokeWidth={0} />
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="composer-icon-button send-btn"
-                onClick={submit}
-                disabled={(!draft.trim() && attachments.length === 0) || !providers.length}
-                title="发送"
-                aria-label="发送"
-              >
-                <ArrowUp size={15} strokeWidth={2.4} />
               </button>
             )}
           </div>
@@ -1763,6 +2093,8 @@ function ActivityTrace({
   running?: boolean;
 }) {
   const [now, setNow] = useState(() => Date.now());
+  const [approvalBusy, setApprovalBusy] = useState(false);
+  const [approvalError, setApprovalError] = useState('');
   useEffect(() => {
     if (!running) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -1785,8 +2117,28 @@ function ActivityTrace({
     return sum + (typeof usage.totalTokens === 'number' ? usage.totalTokens : 0);
   }, 0);
   const tokenCount = typeof metrics.totalTokens === 'number' ? metrics.totalTokens : liveTokenCount;
-  const status = running ? (turn?.status === 'cancelling' ? '正在停止' : '运行中') : turnStatusLabel(turn?.status || terminal?.kind || 'completed');
+  const hasTerminalTurnEvent = events.some((event) => ['turn.completed', 'turn.incomplete', 'turn.failed', 'turn.cancelled', 'turn.needs_reconciliation', 'turn.interrupted'].includes(event.kind));
+  const approvalRequest = hasTerminalTurnEvent ? undefined : [...events].reverse().find((event) => {
+    if (event.kind !== 'approval.requested') return false;
+    const approvalId = textDetail(event.details, 'id');
+    return !events.some((candidate) => candidate.kind === 'approval.resolved' && textDetail(candidate.details, 'approvalId') === approvalId);
+  });
+  const approvalId = approvalRequest ? textDetail(approvalRequest.details, 'id') : '';
+  const status = approvalRequest ? '等待授权' : running ? (turn?.status === 'cancelling' ? '正在停止' : '运行中') : turnStatusLabel(turn?.status || terminal?.kind || 'completed');
   const toolRuns = buildToolRuns(events);
+
+  async function decideApproval(choice: 'approve' | 'deny') {
+    if (!approvalId || approvalBusy) return;
+    setApprovalBusy(true);
+    setApprovalError('');
+    try {
+      await resolveAgentApproval(approvalId, choice);
+    } catch (error) {
+      setApprovalError(error instanceof Error ? error.message : '提交授权决定失败');
+    } finally {
+      setApprovalBusy(false);
+    }
+  }
 
   return (
     <details className={`activity-trace ${running ? 'is-running' : ''}`}>
@@ -1802,6 +2154,20 @@ function ActivityTrace({
           <span>{startedAt ? `${formatClock(startedAt)} 开始` : '等待运行时事件'}</span>
           <span>{status} · 运行详情保存在本地会话中</span>
         </div>
+        {approvalRequest && (
+          <section className="approval-request-card" aria-label="工具调用授权请求">
+            <div className="approval-request-heading"><b>Agent 正在等待你的授权</b><span>{textDetail(approvalRequest.details, 'source')} · {textDetail(approvalRequest.details, 'effect')} · {textDetail(approvalRequest.details, 'permissionProfile')}{textDetail(approvalRequest.details, 'releaseId') ? ` · ${textDetail(approvalRequest.details, 'releaseId')}` : ''} · 截止 {formatClock(textDetail(approvalRequest.details, 'expiresAt'))}</span></div>
+            <p><strong>{textDetail(approvalRequest.details, 'toolName')}</strong>{textDetail(approvalRequest.details, 'pluginId') ? ` · ${textDetail(approvalRequest.details, 'pluginId')}` : ''}{textDetail(approvalRequest.details, 'resource') ? ` · ${textDetail(approvalRequest.details, 'resource')}` : ''}</p>
+            <p>{textDetail(approvalRequest.details, 'reason')}</p>
+            {textDetail(approvalRequest.details, 'impact') && <pre>{(() => { const raw = textDetail(approvalRequest.details, 'impact'); try { return JSON.stringify(JSON.parse(raw), null, 2); } catch { return raw; } })()}</pre>}
+            <pre>{(() => { const raw = textDetail(approvalRequest.details, 'arguments'); try { return JSON.stringify(JSON.parse(raw), null, 2); } catch { return raw; } })()}</pre>
+            {approvalError && <p className="approval-request-error">{approvalError}</p>}
+            <div className="approval-request-actions">
+              <button type="button" disabled={approvalBusy} onClick={() => void decideApproval('deny')}>拒绝</button>
+              <button type="button" className="approve" disabled={approvalBusy} onClick={() => void decideApproval('approve')}>{approvalBusy ? '提交中…' : '仅此次允许'}</button>
+            </div>
+          </section>
+        )}
         {toolRuns.length ? (
           <div className="tool-runs">
             {toolRuns.map((run) => <ToolRunDetail key={run.id} run={run} />)}
@@ -1812,12 +2178,21 @@ function ActivityTrace({
               <article key={event.id} className={eventTone(event.kind)}>
                 <div className="activity-event-content">
                   <div className="activity-event-title"><b>{eventLabel(event.kind)}</b><span>{eventSummary(event)}</span></div>
-                </div>
-              </article>
-            ))}
+            </div>
+          </article>
+          ))}
           </div>
         ) : (
           <p className="activity-empty">正在等待第一条运行事件…</p>
+        )}
+        {events.some((event) => event.kind.startsWith('permission.') || event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied') && (
+          <div className="activity-events compact-events permission-events">
+            {events.filter((event) => event.kind.startsWith('permission.') || event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied').map((event) => (
+              <article key={event.id} className={eventTone(event.kind)}>
+                <div className="activity-event-content"><div className="activity-event-title"><b>{eventLabel(event.kind)}</b><span>{eventSummary(event)}</span></div></div>
+              </article>
+            ))}
+          </div>
         )}
       </div>
     </details>
@@ -1926,14 +2301,27 @@ function turnStatusLabel(status: string) {
 	incomplete: '未完成',
     failed: '运行失败',
     cancelled: '已停止',
-    needs_reconciliation: '等待确认',
+	    interrupted: '进程中断，可从原输入重跑',
+	    needs_reconciliation: '需人工核对',
 	'turn.completed': '已完成',
 	'turn.incomplete': '未完成',
     'turn.failed': '运行失败',
     'turn.cancelled': '已停止',
-    'turn.needs_reconciliation': '等待确认',
+	    'turn.interrupted': '进程中断，可从原输入重跑',
+	    'turn.needs_reconciliation': '需人工核对',
   };
   return labels[status] || '已结束';
+}
+
+function inboxTurnStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    completed: '消息已处理完成。',
+    failed: '消息已开始处理，但运行失败。',
+    cancelled: '消息已开始处理后被停止。',
+    interrupted: '消息对应的 Turn 已中断，可从原始输入重跑。',
+    needs_reconciliation: '消息对应的 Turn 需要先人工核对外部影响。',
+  };
+  return labels[status] || `消息状态：${status}`;
 }
 
 function formatDuration(milliseconds: number) {
@@ -1964,8 +2352,9 @@ function eventLabel(value: string) {
 	'turn.incomplete': '达到步数上限',
     'turn.failed': '任务失败',
     'turn.cancelled': '任务已取消',
+	    'turn.interrupted': '进程中断，可从原输入重跑',
     'turn.cancel_requested': '正在停止任务',
-    'turn.needs_reconciliation': '等待确认',
+	    'turn.needs_reconciliation': '需人工核对',
     'model.requested': '正在请求模型',
     'model.started': '模型调用',
     'model.completed': '模型完成',
@@ -1977,6 +2366,10 @@ function eventLabel(value: string) {
     'tools.completed': '工具批次完成',
     'tool.started': '工具调用',
     'tool.completed': '工具完成',
+    'permission.checked': '权限检查',
+    'approval.requested': '等待用户授权',
+    'approval.resolved': '用户已决定',
+    'tool.authorization_denied': '调用已拦截',
     'context.compacted': '上下文已压缩',
     'provider.compatibility_warning': '模型兼容性提示',
     'loop.step_limit_reached': '达到步骤上限',
@@ -1985,7 +2378,7 @@ function eventLabel(value: string) {
 }
 
 function eventTone(kind: string) {
-  if (kind.includes('failed')) return 'failed';
+  if (kind.includes('failed') || kind === 'tool.authorization_denied') return 'failed';
   if (kind.includes('cancelled') || kind.includes('warning')) return 'warning';
   if (kind.includes('completed')) return 'completed';
   return 'running';
@@ -2011,6 +2404,10 @@ function eventSummary(event: TraceEvent) {
   }
   if (event.kind === 'tool.completed')
     return `${text('name') || '未命名工具'} · ${details.ok === false ? '执行失败' : '执行成功'} · ${number('durationMillis') ?? 0} ms`;
+  if (event.kind === 'permission.checked') return `${text('tool') || '工具'} · ${text('outcome') || '未知'} · ${text('reason')}`;
+  if (event.kind === 'approval.requested') return `${text('toolName') || '工具'} · ${text('effect') || '未知影响'} · 等待表单决定`;
+  if (event.kind === 'approval.resolved') return `${text('decision') || '未知'} · ${text('status') || '状态已更新'}`;
+  if (event.kind === 'tool.authorization_denied') return `${text('name') || '工具'} · ${text('reason') || '未通过当前会话权限策略'}`;
   if (event.kind === 'tools.dispatched' || event.kind === 'tools.completed')
     return `第 ${step ?? 1} 步 · ${number('toolCallCount') ?? 0} 个工具`;
 	if (event.kind === 'context.compacted') {

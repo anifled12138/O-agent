@@ -119,6 +119,17 @@ type ProjectView struct {
 
 // SourceEntry is the compact, content-addressed view exposed to the Agent.
 // Source contents stay lazy and are read explicitly through ReadSourceFile.
+// StorageUsage reports verified, content-addressed release bundles only. It is
+// intentionally not a deletion plan: old releases remain available for rollback.
+type StorageUsage struct {
+	ReleaseCount       int64 `json:"releaseCount"`
+	UniqueBundleCount  int64 `json:"uniqueBundleCount"`
+	BundleBytes        int64 `json:"bundleBytes"`
+	MissingBundleCount int64 `json:"missingBundleCount"`
+}
+
+// SourceEntry is the compact, content-addressed view exposed to the Agent.
+// Source contents stay lazy and are read explicitly through ReadSourceFile.
 type SourceEntry struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
@@ -147,6 +158,12 @@ type SourceDiff struct {
 	Truncated bool   `json:"truncated"`
 }
 
+const (
+	ReleaseAvailabilityAvailable      = "available"
+	ReleaseAvailabilityPendingCleanup = "unusable_pending_cleanup"
+	ReleaseAvailabilityUnusable       = "unusable"
+)
+
 type Release struct {
 	ID             string                       `json:"id"`
 	ProjectID      string                       `json:"projectId"`
@@ -159,6 +176,7 @@ type Release struct {
 	PermissionHash string                       `json:"permissionHash"`
 	CreatedAt      time.Time                    `json:"createdAt"`
 	SourceVersion  pluginmanifest.SourceVersion `json:"sourceVersion"`
+	Availability   string                       `json:"availability"`
 }
 
 type Installation struct {

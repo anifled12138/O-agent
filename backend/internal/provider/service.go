@@ -54,6 +54,7 @@ type Completion struct {
 	ToolCalls []ToolCall
 	Model     string
 	Usage     Usage
+	Attempts  int
 	Warnings  []CompatibilityWarning
 }
 type Usage struct {
@@ -69,6 +70,16 @@ type Service struct {
 
 func New(store *storage.Store, vault *secure.Vault) *Service {
 	return &Service{store: store, vault: vault, client: &http.Client{Timeout: 90 * time.Second}}
+}
+
+// SealRunCheckpoint protects the replay transcript and tool payloads at rest
+// with the same local master key used for provider credentials.
+func (s *Service) SealRunCheckpoint(plain []byte) ([]byte, []byte, error) {
+	return s.vault.Seal(plain)
+}
+
+func (s *Service) OpenRunCheckpoint(ciphertext, nonce []byte) ([]byte, error) {
+	return s.vault.Open(ciphertext, nonce)
 }
 
 func (s *Service) Create(ctx context.Context, userID string, in Input) (domain.Provider, error) {
@@ -291,26 +302,118 @@ func (s *Service) CompleteWithTools(ctx context.Context, userID, id string, mess
 	if err != nil {
 		return Completion{}, err
 	}
-	resp, err := s.client.Do(req)
+	resp, attempts, err := s.doCompletionRequest(req)
 	if err != nil {
-		return Completion{}, transportError(err)
+		return Completion{}, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return Completion{}, err
+		return Completion{}, &ProviderError{Class: ErrorProtocol, Attempts: attempts, SafeDetail: "could not read the model provider response", Cause: err}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Completion{}, httpProviderError(resp, raw)
+		providerErr := asProviderError(httpProviderError(resp, raw))
+		providerErr.Attempts = attempts
+		return Completion{}, providerErr
 	}
 	if !json.Valid(raw) {
-		return Completion{}, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, SafeDetail: fmt.Sprintf("provider returned non-JSON content from %s (%s); check the API base URL", req.URL.String(), responseType(resp))}
+		return Completion{}, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, Attempts: attempts, SafeDetail: fmt.Sprintf("provider returned non-JSON content from %s (%s); check the API base URL", req.URL.String(), responseType(resp))}
 	}
 	completion, err := adapter.decodeCompletion(raw)
 	if err != nil {
-		return Completion{}, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, SafeDetail: err.Error(), Cause: err}
+		return Completion{}, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, Attempts: attempts, SafeDetail: err.Error(), Cause: err}
 	}
+	completion.Attempts = attempts
 	return completion, nil
+}
+
+const (
+	maxProviderAttempts  = MaxCompletionAttempts
+	maxProviderRetryWait = 5 * time.Second
+)
+
+func (s *Service) doCompletionRequest(request *http.Request) (*http.Response, int, error) {
+	attemptLimit := maxProviderAttempts
+	if budget, ok := attemptBudget(request.Context()); ok && budget < attemptLimit {
+		attemptLimit = budget
+	}
+	for attempt := 1; attempt <= attemptLimit; attempt++ {
+		current := request.Clone(request.Context())
+		if request.Body != nil {
+			if request.GetBody == nil {
+				return nil, attempt, errors.New("provider request body cannot be replayed safely")
+			}
+			body, err := request.GetBody()
+			if err != nil {
+				return nil, attempt, err
+			}
+			current.Body = body
+		}
+		resp, err := s.client.Do(current)
+		if err != nil {
+			providerErr := transportError(err).(*ProviderError)
+			providerErr.Attempts = attempt
+			if attempt == attemptLimit || !retryableProviderError(providerErr) {
+				return nil, attempt, providerErr
+			}
+			if waitErr := waitProviderRetry(request.Context(), providerRetryDelay(attempt, 0)); waitErr != nil {
+				providerErr.Cause = errors.Join(providerErr.Cause, waitErr)
+				return nil, attempt, providerErr
+			}
+			continue
+		}
+		if resp.StatusCode < http.StatusInternalServerError && resp.StatusCode != http.StatusTooManyRequests {
+			return resp, attempt, nil
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, attempt, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, Attempts: attempt, SafeDetail: "could not read the model provider error response", Cause: readErr}
+		}
+		providerErr := asProviderError(httpProviderError(resp, body))
+		providerErr.Attempts = attempt
+		if attempt == attemptLimit || !retryableProviderError(providerErr) || providerErr.RetryAfter > maxProviderRetryWait {
+			return nil, attempt, providerErr
+		}
+		if waitErr := waitProviderRetry(request.Context(), providerRetryDelay(attempt, providerErr.RetryAfter)); waitErr != nil {
+			providerErr.Cause = errors.Join(providerErr.Cause, waitErr)
+			return nil, attempt, providerErr
+		}
+	}
+	return nil, attemptLimit, &ProviderError{Class: ErrorUnavailable, Attempts: attemptLimit, SafeDetail: "model provider request failed after bounded retries"}
+}
+
+func retryableProviderError(err *ProviderError) bool {
+	return err.Class == ErrorUnavailable || err.Class == ErrorRateLimit
+}
+
+func asProviderError(err error) *ProviderError {
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) {
+		return providerErr
+	}
+	return &ProviderError{Class: ErrorProtocol, SafeDetail: err.Error(), Cause: err}
+}
+
+func providerRetryDelay(attempt int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		return retryAfter
+	}
+	return time.Duration(attempt*attempt) * 250 * time.Millisecond
+}
+
+func waitProviderRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 || delay > maxProviderRetryWait {
+		return errors.New("provider retry delay exceeds the configured limit")
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func transportError(err error) error {
