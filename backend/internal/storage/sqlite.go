@@ -564,7 +564,7 @@ func (s *Store) Conversation(ctx context.Context, userID, id string) (domain.Con
 	if err != nil {
 		return d, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,conversation_id,role,content,created_at FROM messages WHERE conversation_id=? ORDER BY created_at`, id)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,conversation_id,role,content,created_at FROM messages WHERE conversation_id=? ORDER BY created_at,rowid`, id)
 	if err != nil {
 		return d, err
 	}

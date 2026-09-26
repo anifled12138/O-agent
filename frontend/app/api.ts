@@ -69,12 +69,6 @@ export async function toggleUnifiedPlugin(id: string, enabled: boolean, confirmE
   });
 }
 
-export async function reloadUnifiedPlugins(): Promise<UnifiedPlugin[]> {
-  return request<UnifiedPlugin[]>('/plugins/reload', {
-    method: 'POST',
-  });
-}
-
 export async function addMcpServerConfig(config: McpServerConfig): Promise<UnifiedPlugin[]> {
   return request<UnifiedPlugin[]>('/plugins/mcp', {
     method: 'POST',
@@ -90,7 +84,7 @@ export async function removeMcpServerConfig(id: string): Promise<{ removed: stri
   });
 }
 
-export type ConversationPermissionProfile = 'read_only' | 'workspace_autonomous' | 'ask_on_sensitive';
+export type ConversationPermissionProfile = 'read_only' | 'workspace_autonomous' | 'ask_on_sensitive' | 'fully_autonomous';
 
 export type ToolUsageMetric = {
   toolName: string;

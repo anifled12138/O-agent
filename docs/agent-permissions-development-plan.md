@@ -47,8 +47,8 @@
 1. 为 Conversation 增加受校验的 `permissionProfile`，数据库迁移提供保守、兼容旧会话的默认值。
 2. 增加读取/更新会话权限 profile 的后端 API；用户界面展示当前值，保存后读回并确认后再更新显示。
 3. 每次 turn 启动时将 profile 和其具体限制复制到 turn 的不可变策略快照；切换权限只影响后续 turn。显式降低权限时，取消或重新检查尚未执行的请求。
-4. 预设建议：`read_only`、`workspace_autonomous`、`ask_on_sensitive`。每个预设映射到明确的文件、网络、shell、MCP 和破坏性操作规则；不能由 Agent 或插件更改。
-5. 暂不提供不能由当前运行环境强制落实的“完全访问”选项；完成系统级隔离后另行设计高风险 profile。
+4. 可选权限档位：`read_only`、`workspace_autonomous`、`fully_autonomous`。`fully_autonomous` 自动批准所有已由宿主分类的工具效果，但未分类操作仍拒绝执行；OS/AppContainer 沙箱和工具可用范围独立生效，权限档位不能关闭它们。旧会话的 `ask_on_sensitive` 保持兼容，但不作为新会话的默认档位。
+5. “完全自动”只取消逐项用户审批，不等于无沙箱或可访问任意资源；文件、网络、进程、凭据边界仍由执行层强制落实。
 
 **完成条件**：profile 跨应用重启保留；前端、API、DB、turn 快照使用相同枚举及默认值；不能通过伪造 profile 越权。
 

@@ -1,13 +1,12 @@
 'use client';
 
 import { FormEvent, useCallback, useEffect, useState } from 'react';
-import { X, Plus, RotateCw } from 'lucide-react';
+import { X, Plus } from 'lucide-react';
 import {
   UnifiedPlugin,
   McpServerConfig,
   getUnifiedPlugins,
   toggleUnifiedPlugin,
-  reloadUnifiedPlugins,
   addMcpServerConfig,
   removeMcpServerConfig,
 } from './api';
@@ -118,19 +117,6 @@ export default function UnifiedPluginCenter({
     }
   }
 
-  async function handleReload() {
-    setBusy('reload');
-    try {
-      const data = await reloadUnifiedPlugins();
-      setPlugins(data);
-      onPluginsChanged?.();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '重载插件失败');
-    } finally {
-      setBusy('');
-    }
-  }
-
   async function handleAddMcp(e: FormEvent) {
     e.preventDefault();
     if (!mcpId.trim() || !mcpCommand.trim()) {
@@ -223,7 +209,7 @@ export default function UnifiedPluginCenter({
     skill: {
       eyebrow: 'AGENT SKILLS',
       title: 'Markdown 动态技能',
-      subtitle: '查看、管理或重载本地 Markdown 形式的 Agent 任务技能。',
+      subtitle: '查看和管理本地 Markdown 形式的 Agent 任务技能。',
     },
     core: {
       eyebrow: 'CORE CAPABILITIES',
@@ -266,16 +252,6 @@ export default function UnifiedPluginCenter({
             <p className="upc-subtitle">{currentConfig.subtitle}</p>
           </div>
           <div className="upc-header-actions">
-            <button
-              type="button"
-              onClick={handleReload}
-              disabled={busy !== ''}
-              className="upc-btn-secondary"
-              aria-label="重载 Skills 并刷新插件状态"
-            >
-              <RotateCw size={12} className={busy === 'reload' ? 'spin' : ''} aria-hidden="true" />
-              <span>{busy === 'reload' ? '正在重载…' : '重载 Skills'}</span>
-            </button>
             {filterType === 'mcp' && (
               <button
                 type="button"

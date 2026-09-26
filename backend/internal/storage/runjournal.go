@@ -144,6 +144,99 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,'running',1,?,?)`, turn.ID, turn.ConversationID, us
 	return tx.Commit()
 }
 
+// ForkCompletedConversation copies the message prefix through a completed
+// assistant answer into a new conversation without creating an agent turn.
+func (s *Store) ForkCompletedConversation(ctx context.Context, userID, sourceTurnID string, branch domain.Conversation) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if branch.ID == "" || branch.UserID != userID || branch.ParentConversationID == "" || branch.BranchFromMessageID == "" || !branch.PermissionProfile.Valid() {
+		return domain.ErrInvalid
+	}
+	var sourceConversationID, resultMessageID, status string
+	var sourceProviderID, sourceProjectID string
+	var sourcePermissionProfile domain.PermissionProfile
+	var sourceGenerationID, sourceDefinitionDigest string
+	err = tx.QueryRowContext(ctx, `SELECT t.conversation_id,COALESCE(t.result_message_id,''),t.status,c.provider_id,COALESCE(c.project_id,''),c.permission_profile,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,'')
+FROM agent_turns t JOIN conversations c ON c.id=t.conversation_id AND c.user_id=t.user_id
+LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id AND b.user_id=c.user_id
+WHERE t.id=? AND t.user_id=?`, sourceTurnID, userID).Scan(&sourceConversationID, &resultMessageID, &status, &sourceProviderID, &sourceProjectID, &sourcePermissionProfile, &sourceGenerationID, &sourceDefinitionDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if status != "completed" || resultMessageID == "" || branch.ParentConversationID != sourceConversationID || branch.BranchFromMessageID != resultMessageID {
+		return fmt.Errorf("%w: only a completed assistant answer can be forked", domain.ErrConflict)
+	}
+	if branch.ProviderID != sourceProviderID || branch.ProjectID != sourceProjectID || branch.PermissionProfile != sourcePermissionProfile || branch.AgentGenerationID != sourceGenerationID || branch.AgentDefinitionDigest != sourceDefinitionDigest {
+		return fmt.Errorf("%w: fork execution binding must match its source conversation", domain.ErrConflict)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id,role,content,created_at FROM messages WHERE conversation_id=? ORDER BY created_at,rowid`, sourceConversationID)
+	if err != nil {
+		return err
+	}
+	type prefixMessage struct {
+		role, content string
+		createdAt     time.Time
+	}
+	prefix := make([]prefixMessage, 0)
+	foundAnswer := false
+	for rows.Next() {
+		var id, role, content string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &role, &content, &createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		prefix = append(prefix, prefixMessage{role: role, content: content, createdAt: createdAt})
+		if id == resultMessageID {
+			foundAnswer = role == "assistant"
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !foundAnswer || len(prefix) == 0 {
+		return domain.ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO conversations(id,user_id,title,provider_id,project_id,permission_profile,parent_conversation_id,branch_from_message_id,created_at,updated_at)
+SELECT ?,user_id,?,?,?,?,?,?,?,? FROM conversations WHERE id=? AND user_id=?`, branch.ID, branch.Title, branch.ProviderID, branch.ProjectID, branch.PermissionProfile, sourceConversationID, resultMessageID, branch.CreatedAt, branch.UpdatedAt, sourceConversationID, userID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO conversation_agent_bindings(conversation_id,user_id,generation_id,definition_digest,bound_at)
+SELECT ?,user_id,generation_id,definition_digest,? FROM conversation_agent_bindings WHERE conversation_id=? AND user_id=?`, branch.ID, branch.CreatedAt, sourceConversationID, userID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return fmt.Errorf("%w: source conversation has no agent generation binding", domain.ErrConflict)
+	}
+	idPrefix := strings.TrimPrefix(branch.ID, "conv_")
+	for index, message := range prefix {
+		cloneID := fmt.Sprintf("msg_%s_fork_%06d", idPrefix, index+1)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?)`, cloneID, branch.ID, message.role, message.content, message.createdAt); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?`, branch.UpdatedAt, branch.ID, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) RecordAgentTurnReconciliation(ctx context.Context, userID, turnID, note string, at time.Time) (domain.AgentTurnReconciliation, error) {
 	var result domain.AgentTurnReconciliation
 	result.ID = "reconcile_" + turnID

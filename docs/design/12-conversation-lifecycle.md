@@ -38,6 +38,7 @@
 - 安全重试保留原用户消息，创建新的 Turn，并记录 `retry_of_turn_id`。
 - 安全重试中的编辑、消息 revision、新 Turn 与首事件原子提交；只允许改写没有成功回答的最新用户消息。
 - 编辑或重跑已完成对话中的历史输入时创建新 Conversation 分支。分支复制目标输入之前的消息、复用 Provider/项目/权限/Generation 绑定，并从修改后的输入开始；原会话保持只读历史不变。
+- 对已完成的 Assistant 回答执行 Fork 时，新 Conversation 复制对话消息到该回答（含该回答），记录父会话与源回答 ID，并复用 Provider/项目/权限/Generation 绑定；Fork 不创建输入消息、不创建 Turn，也不调用模型。
 - 有 Tool 外部影响的失败/取消/中断/未完成 Turn 必须先提交人工核对说明，之后才允许开始同一 Conversation 的新 Turn 或消费排队项。核对记录只允许授权用户创建，追加 `turn.reconciled`；重试和分支事务会再次检查 Conversation 中所有不确定的工具影响。
 
 ## API 与 UI
@@ -47,14 +48,16 @@
 - `GET/POST /api/v2/agent/conversations/{id}/inbox`：读取/排队后续输入。
 - `POST /api/v2/agent/turns/{id}/retry`：安全重跑或编辑重跑。
 - `POST /api/v2/agent/turns/{id}/reconcile`：提交必填核对说明；不自动重放，核对成功后按 FIFO 恢复排队输入。
-- `POST /api/v2/agent/turns/{id}/branch`：从已完成/已核对的用户输入创建分支并重跑，可提交编辑内容。
+- `POST /api/v2/agent/turns/{id}/branch`：兼容的显式分支重跑接口；从用户输入创建分支并立即启动新的 Turn，可提交编辑内容。对话 UI 的 Fork 操作不使用此接口。
+- `POST /api/v2/agent/turns/{id}/fork`：要求 `core:conversation_fork` 插件启用且源 Turn 已完成；从源 Assistant 回答创建持久分支，只返回读回的 Conversation，不会启动模型。
 
-UI 为用户消息呈现 Turn 状态；为安全终态提供重跑、编辑重跑；为带外部影响的 Turn 提供核对说明表单；对历史输入提供分支编辑入口。停止整个会话时明确展示会清空的排队数量。所有成功操作后重新读取 Conversation、Turn、Inbox 和事件投影。
+UI 为用户消息呈现 Turn 状态；为安全终态提供重跑、编辑重跑；为带外部影响的 Turn 提供核对说明表单；已完成 Assistant 回答下的 Fork 插件操作只创建分支，不自动提交问题。会话暂停用紧凑状态图标表示，操作成功不显示错误样式提示。所有成功操作后重新读取 Conversation、Turn、Inbox 和事件投影。
 
 ## 事务与失败处理
 
 - 队列插入与 Conversation 更新时间原子提交；队列 claim、user message、Turn 和首事件原子提交。新 Turn 开始事务会重新检查同会话的不确定工具影响，防止恢复时越过人工核对。
 - 编辑 revision、消息改写和新 Turn 原子提交；分支记录、消息前缀、分支输入、generation binding、Turn 和首事件原子提交。
+- Fork 的分支记录、目标消息前缀与 generation binding 在单个事务中提交；Fork 不写入 Turn 或 trace event，提交后必须读回父会话、源回答和完整消息前缀。
 - 核对记录、recovery class 和 `turn.reconciled` 事件原子提交。
 - Conversation 暂停事件、活动 Turn 的 `cancelling` 状态及未 claim Inbox 的取消原子提交；随后再触发进程内取消信号。已 claim Inbox 的终态与 Turn 终态/重启分类同事务提交。
 - 任一查询、RowsAffected 检查或 Commit 失败都返回错误；异步终态写入失败记结构化错误日志，数据库状态不得伪装为完成。
@@ -69,7 +72,8 @@ UI 为用户消息呈现 Turn 状态；为安全终态提供重跑、编辑重�
 4. 恢复测试覆盖 `checkpoint_resumable`、无检查点的 `interrupted/safe_to_retry`、未闭合工具调用的 `needs_reconciliation/unknown_external_effect`，并验证已完成工具不会重复执行、事件 cursor 增长。
 5. 取消整个 Conversation 后，当前 Turn 为 `cancelling`、排队项为 `cancelled`、Conversation 为暂停状态；关闭并重开 Store 后仍可读回暂停事件，显式新 Turn 会原子恢复执行状态；失败事务不得留下半套状态。
 6. 分支只包含目标消息之前的上下文；原会话不变；分支 start 失败时不残留分支 Conversation 或消息。
-7. 未核对的 Tool 影响无法重试；无论 Turn 以完成、失败、取消或 Host 中断结束都可先记录核对说明；所有相关 Tool 尝试都必须核对，事件、说明与 recovery class 可读回。
+7. Assistant 回答 Fork 后，分支包含该回答且之后的消息不复制；父会话、源回答、Provider/项目/权限/Generation 绑定读回一致；数据库中没有新 Turn；即使重复点击两次也各生成独立分支。
+8. 未核对的 Tool 影响无法重试；无论 Turn 以完成、失败、取消或 Host 中断结束都可先记录核对说明；所有相关 Tool 尝试都必须核对，事件、说明与 recovery class 可读回。
 
 ### API / UI
 

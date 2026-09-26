@@ -44,8 +44,8 @@ type Decision struct {
 }
 
 // Evaluate intentionally fails closed for invalid profiles and unknown
-// effects. Only a narrowly defined read or workspace write can run without
-// prompting under the corresponding profile.
+// effects. Fully autonomous sessions skip approval only for host-classified
+// effects; the execution sandbox remains an independent enforcement boundary.
 func Evaluate(profile domain.PermissionProfile, request Request) Decision {
 	request.Profile = profile
 	if !profile.Valid() {
@@ -58,6 +58,15 @@ func Evaluate(profile domain.PermissionProfile, request Request) Decision {
 
 	if profile == domain.PermissionProfileReadOnly {
 		return Decision{Outcome: OutcomeDeny, Reason: "当前会话为只读权限；请切换会话权限后重试"}
+	}
+
+	if profile == domain.PermissionProfileFullyAutonomous {
+		switch request.Effect {
+		case EffectWorkspaceWrite, EffectShell, EffectExternalRead, EffectExternalWrite, EffectDestructive, EffectSensitive:
+			return Decision{Outcome: OutcomeAllow, Reason: "当前会话为完全自动权限；操作仍受工具范围与系统沙箱限制"}
+		default:
+			return Decision{Outcome: OutcomeDeny, Reason: "完全自动模式仍会阻止未分类的工具操作"}
+		}
 	}
 
 	if profile == domain.PermissionProfileWorkspaceAutonomy && request.Effect == EffectWorkspaceWrite {

@@ -9,11 +9,12 @@ const (
 	PermissionProfileReadOnly          PermissionProfile = "read_only"
 	PermissionProfileWorkspaceAutonomy PermissionProfile = "workspace_autonomous"
 	PermissionProfileAskOnSensitive    PermissionProfile = "ask_on_sensitive"
+	PermissionProfileFullyAutonomous   PermissionProfile = "fully_autonomous"
 )
 
 func (p PermissionProfile) Valid() bool {
 	switch p {
-	case PermissionProfileReadOnly, PermissionProfileWorkspaceAutonomy, PermissionProfileAskOnSensitive:
+	case PermissionProfileReadOnly, PermissionProfileWorkspaceAutonomy, PermissionProfileAskOnSensitive, PermissionProfileFullyAutonomous:
 		return true
 	default:
 		return false

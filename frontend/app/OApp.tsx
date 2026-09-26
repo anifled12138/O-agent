@@ -1,12 +1,12 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Plus, Layers, Settings as SettingsIcon, Activity, ArrowUp, Square, Sparkles, KeyRound, AlertCircle, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight } from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Plus, Layers, Settings as SettingsIcon, Activity, ArrowUp, Square, Pause, Sparkles, KeyRound, AlertCircle, Info, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight, GitFork, Shield, Copy } from 'lucide-react';
 import UnifiedPluginCenter from './UnifiedPluginCenter';
 import ObservabilityModal from './ObservabilityModal';
 import { Settings } from './SettingsModal';
 import ProjectModal from './ProjectModal';
-import { MarkdownView } from './MarkdownView';
+import { copyToClipboard, MarkdownView } from './MarkdownView';
 import { API_V2, request, UnifiedPlugin, getUnifiedPlugins, updateConversationTitle, generateConversationTitle, Project, getProjects, updateConversationProject, updateConversationPermissionProfile, ConversationPermissionProfile, resolveAgentApproval } from './api';
 
 export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; contextWindow: number; hasApiKey: boolean };
@@ -98,7 +98,12 @@ export default function OApp() {
   const observersRef = useRef<Map<string, { turnId: string; controller: AbortController; promise: Promise<void> }>>(new Map());
   const observeTurnRef = useRef<(turnId: string, conversationId: string) => Promise<void>>(async () => {});
 
-  const [notice, setNotice] = useState('');
+  const [notice, setNoticeMessage] = useState('');
+  const [noticeTone, setNoticeTone] = useState<'info' | 'error'>('info');
+  const setNotice = useCallback((message: string, tone: 'info' | 'error' = 'info') => {
+    setNoticeMessage(message);
+    setNoticeTone(tone);
+  }, []);
   const [trace, setTrace] = useState<TraceEvent[]>([]);
   const [turns, setTurns] = useState<AgentTurn[]>([]);
   const [queuedInputs, setQueuedInputs] = useState<Record<string, InboxInput[]>>({});
@@ -175,7 +180,7 @@ export default function OApp() {
       setConversations((items) => items.map((c) => (c.id === convoId ? { ...c, title: serverCleaned } : c)));
       setNotice('会话标题已更新');
     } catch (err) {
-      setNotice(err instanceof Error ? err.message : '更新标题失败');
+      setNotice(err instanceof Error ? err.message : '更新标题失败', 'error');
     } finally {
       isSavingTitleRef.current = false;
       setEditingTitle(false);
@@ -217,9 +222,9 @@ export default function OApp() {
         if (pluginList.length > 0) setUnifiedPlugins(pluginList);
         if (projectList) setProjects(projectList);
       })
-      .catch((error) => setNotice(error instanceof Error ? error.message : '无法连接本地运行时'))
+      .catch((error) => setNotice(error instanceof Error ? error.message : '无法连接本地运行时', 'error'))
       .finally(() => setLoading(false));
-  }, []);
+  }, [setNotice]);
 
   function observeTurn(turnId: string, conversationId: string): Promise<void> {
     const existing = observersRef.current.get(conversationId);
@@ -255,21 +260,17 @@ export default function OApp() {
         if (event.kind === 'turn.failed') {
           const errText = typeof event.details.error === 'string' ? event.details.error : 'Agent 运行失败';
           if (/image|vision|multimodal|400 Bad Request/i.test(errText)) {
-            setNotice('模型调用失败：上游接口返回「' + errText + '」。若该模型不支持图片输入，可在左下角「模型设置」中将其标记为纯文本，或在右下角切换为支持多模态的模型。');
+            setNotice('模型调用失败：上游接口返回「' + errText + '」。若该模型不支持图片输入，可在左下角「模型设置」中将其标记为纯文本，或在右下角切换为支持多模态的模型。', 'error');
           } else {
-            setNotice(errText);
+            setNotice(errText, 'error');
           }
         }
-		if (event.kind === 'turn.cancelled') setNotice('任务已停止，已完成的过程仍保留在运行记录中。');
-		if (event.kind === 'turn.interrupted') setNotice('运行进程已中断；可从原始输入重新执行。');
-		if (event.kind === 'turn.incomplete') setNotice('任务已达到执行步数上限；当前总结和已完成过程已保留，但任务尚未完成。');
-		if (event.kind === 'turn.needs_reconciliation') setNotice('任务可能已执行外部工具；请人工核对影响后再显式重试或创建分支，系统不会自动重放。');
       },
       controller.signal
     )
       .catch((error) => {
         if (!controller.signal.aborted) {
-          setNotice(error instanceof Error ? error.message : '运行异常中断');
+          setNotice(error instanceof Error ? error.message : '运行异常中断', 'error');
         }
       })
       .finally(() => {
@@ -389,9 +390,9 @@ export default function OApp() {
       const targetProject = projects.find((p) => p.id === projectId);
       setNotice(projectId ? `对话已归入「${targetProject?.name || '项目'}」` : '对话已移出项目');
     } catch (err) {
-      setNotice(err instanceof Error ? err.message : '转移项目失败');
+      setNotice(err instanceof Error ? err.message : '转移项目失败', 'error');
     }
-  }, [projects]);
+  }, [projects, setNotice]);
 
   async function handleNewInProject(projectId: string) {
     if (!providers.length) {
@@ -410,7 +411,7 @@ export default function OApp() {
       setConversations((items) => [created, ...items]);
       await openConversation(created.id);
     } catch (err) {
-      setNotice(err instanceof Error ? err.message : '创建对话失败');
+      setNotice(err instanceof Error ? err.message : '创建对话失败', 'error');
     }
   }
 
@@ -456,7 +457,7 @@ export default function OApp() {
         }
         return true;
       } catch (error) {
-        setNotice(error instanceof Error ? error.message : '加入消息队列失败');
+        setNotice(error instanceof Error ? error.message : '加入消息队列失败', 'error');
         return false;
       }
     }
@@ -494,7 +495,7 @@ export default function OApp() {
       return true;
     } catch (error) {
       if (activeRef.current?.id) await refreshConversation(activeRef.current.id);
-      setNotice(error instanceof Error ? error.message : 'Agent 运行失败');
+      setNotice(error instanceof Error ? error.message : 'Agent 运行失败', 'error');
       return false;
     }
   }
@@ -510,10 +511,9 @@ export default function OApp() {
         throw new Error('停止请求已提交，但会话或排队状态未完成读回，请刷新确认。');
       }
       await refreshConversation(active.id);
-      const stopState = receipt.cancelledTurnStatus === 'cancelling' ? '停止请求已提交' : '会话已停止';
-      setNotice(`${stopState}；${receipt.cancelledInboxCount} 条未开始的排队消息已取消。`);
+      setNotice('');
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : '无法停止会话');
+      setNotice(error instanceof Error ? error.message : '无法停止会话', 'error');
     }
   }
 
@@ -535,37 +535,33 @@ export default function OApp() {
       });
       void observeTurn(receipt.turnId, receipt.conversationId);
       await refreshConversation(conversationId);
-      setNotice(editedContent === undefined ? '已从原消息重新开始任务。' : '已保存修改并重新开始任务。');
+      setNotice('');
       return true;
     } catch (error) {
       await refreshConversation(conversationId);
-      setNotice(error instanceof Error ? error.message : '重新开始任务失败');
+      setNotice(error instanceof Error ? error.message : '重新开始任务失败', 'error');
       return false;
     }
   }
 
-  async function branchTurn(turnId: string, editedContent?: string): Promise<boolean> {
-    let receipt: TurnReceipt;
+  async function forkTurn(turnId: string): Promise<boolean> {
     try {
-      receipt = await request<TurnReceipt>(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/branch`, {
-        method: 'POST',
-        body: JSON.stringify(editedContent === undefined ? {} : { content: editedContent }),
-      });
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : '创建会话分支失败');
-      return false;
-    }
-    try {
+      const created = await request<ConversationDetail>(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/fork`, { method: 'POST' });
+      const readback = await request<ConversationDetail>(`/conversations/${encodeURIComponent(created.id)}`);
+      if (readback.id !== created.id || !readback.parentConversationId || !readback.branchFromMessageId || !readback.messages.length || readback.messages[readback.messages.length - 1].role !== 'assistant') {
+        throw new Error('分支会话读回与源回答不一致');
+      }
       const conversationsReadback = await request<Conversation[]>('/conversations');
+      if (!conversationsReadback.some((item) => item.id === readback.id && item.parentConversationId === readback.parentConversationId && item.branchFromMessageId === readback.branchFromMessageId)) {
+        throw new Error('会话列表尚未读到新分支');
+      }
       setConversations(conversationsReadback);
-      await openConversation(receipt.conversationId);
-      setNotice(receipt.status === 'failed'
-        ? '分支已创建，但 Turn 启动失败；请查看分支中的运行状态。'
-        : editedContent === undefined ? '已从此消息创建并启动分支。' : '已创建分支并在其中运行修改后的消息。');
+      await openConversation(readback.id);
+      setNotice('');
       return true;
     } catch (error) {
-      setNotice(`分支已启动，但界面无法重新读取它：${error instanceof Error ? error.message : '请刷新会话列表'}`);
-      return true;
+      setNotice(error instanceof Error ? error.message : '创建会话分支失败', 'error');
+      return false;
     }
   }
 
@@ -579,13 +575,13 @@ export default function OApp() {
         body: JSON.stringify({ note }),
       });
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : '保存核对记录失败');
+      setNotice(error instanceof Error ? error.message : '保存核对记录失败', 'error');
       return false;
     }
     setTurns((items) => items.map((turn) => turn.id === turnId ? { ...turn, recoveryClass: 'manually_reconciled', reconciliationNote: reconciliation.note } : turn));
     const refreshed = await refreshConversation(conversationId);
     if (!refreshed) {
-      setNotice('核对记录已保存；但会话刷新失败，请手动刷新状态。');
+      setNotice('核对记录已保存；但会话刷新失败，请手动刷新状态。', 'error');
       return true;
     }
     try {
@@ -593,7 +589,7 @@ export default function OApp() {
       const nextActiveTurn = refreshedTurns.find((turn) => turn.status === 'running' || turn.status === 'cancelling' || turn.status === 'awaiting_approval');
       if (nextActiveTurn) void observeTurn(nextActiveTurn.id, conversationId);
     } catch (error) {
-      setNotice(`核对记录已保存；但无法读取后续 Turn 状态：${error instanceof Error ? error.message : '请刷新会话'}`);
+      setNotice(`核对记录已保存；但无法读取后续 Turn 状态：${error instanceof Error ? error.message : '请刷新会话'}`, 'error');
       return true;
     }
     setNotice('核对记录已保存；后续新 Turn 与排队输入现在可以按 FIFO 继续。');
@@ -863,18 +859,45 @@ export default function OApp() {
             }}
             sending={isCurrentSending}
             notice={notice}
+            noticeTone={noticeTone}
             trace={trace}
             liveTrace={currentTrace}
             turns={turns}
             onPermissionProfileChange={async (profile) => {
-              if (!active) return;
               try {
-                const saved = await updateConversationPermissionProfile<ConversationDetail>(active.id, profile);
-                setActive(saved);
-                setConversations((items) => items.map((item) => item.id === saved.id ? { ...item, permissionProfile: saved.permissionProfile } : item));
-                setNotice('会话权限已保存；降低权限时，当前任务会收到停止请求。');
+                if (active) {
+                  const saved = await updateConversationPermissionProfile<ConversationDetail>(active.id, profile);
+                  if (saved.id !== active.id || saved.permissionProfile !== profile) {
+                    throw new Error('会话权限读回与所选档位不一致');
+                  }
+                  setActive(saved);
+                  setConversations((items) => items.map((item) => item.id === saved.id ? { ...item, permissionProfile: saved.permissionProfile } : item));
+                  setNotice('会话权限已保存；降低权限时，当前任务会收到停止请求。');
+                  return true;
+                }
+
+                const providerId = selectedProviderId || providers[0]?.id;
+                if (!providerId) {
+                  setNotice('请先配置模型服务，再为新会话保存权限。', 'error');
+                  return false;
+                }
+                const created = await request<Conversation>('/conversations', {
+                  method: 'POST',
+                  body: JSON.stringify({ title: '新对话', providerId, permissionProfile: profile }),
+                });
+                if (created.permissionProfile !== profile) {
+                  throw new Error('新会话权限读回与所选档位不一致');
+                }
+                activeIdRef.current = created.id;
+                setActive({ ...created, messages: [] });
+                setConversations((items) => [created, ...items.filter((item) => item.id !== created.id)]);
+                setTrace([]);
+                setTurns([]);
+                setNotice('新会话权限已保存，首条消息将使用此权限。');
+                return true;
               } catch (error) {
-                setNotice(error instanceof Error ? error.message : '会话权限保存失败');
+                setNotice(error instanceof Error ? error.message : '会话权限保存失败', 'error');
+                return false;
               }
             }}
             queuedInputs={active ? queuedInputs[active.id] ?? [] : []}
@@ -883,7 +906,7 @@ export default function OApp() {
             onSend={send}
             onCancel={cancelTurn}
             onRetry={retryTurn}
-            onBranch={branchTurn}
+            onFork={forkTurn}
             onReconcile={reconcileTurn}
             onConfigure={() => setSettingsOpen(true)}
             onOpenPlugins={(type) => setPluginsOpen(type || 'all')}
@@ -1473,23 +1496,25 @@ function Chat({
   onSend,
   onCancel,
   onRetry,
-  onBranch,
+  onFork,
   onReconcile,
   onConfigure,
   onOpenPlugins,
   unifiedPlugins,
   onNotice,
   onPermissionProfileChange,
+  noticeTone,
 }: {
   unifiedPlugins: UnifiedPlugin[];
-  onNotice?: (msg: string) => void;
-  onPermissionProfileChange: (profile: ConversationPermissionProfile) => void;
+  onNotice?: (msg: string, tone?: 'info' | 'error') => void;
+  onPermissionProfileChange: (profile: ConversationPermissionProfile) => Promise<boolean>;
   active: ConversationDetail | null;
   providers: Provider[];
   selectedProviderId: string;
   onSelectProvider: (id: string) => void;
   sending: boolean;
   notice: string;
+  noticeTone: 'info' | 'error';
   trace: TraceEvent[];
   liveTrace: TraceEvent[];
   turns: AgentTurn[];
@@ -1497,7 +1522,7 @@ function Chat({
   onSend: (content: string) => Promise<boolean>;
   onCancel: () => void;
   onRetry: (turnId: string, editedContent?: string) => Promise<boolean>;
-  onBranch: (turnId: string, editedContent?: string) => Promise<boolean>;
+  onFork: (turnId: string) => Promise<boolean>;
   onReconcile: (turnId: string, note: string) => Promise<boolean>;
   onConfigure: () => void;
   onOpenPlugins: (type?: 'all' | 'mcp' | 'skill' | 'core' | 'release') => void;
@@ -1505,10 +1530,30 @@ function Chat({
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState('');
   const [editingMessageContent, setEditingMessageContent] = useState('');
+  const [copiedMessageId, setCopiedMessageId] = useState('');
   const [reconcileTurnId, setReconcileTurnId] = useState('');
   const [reconcileNote, setReconcileNote] = useState('');
   const [messageActionBusy, setMessageActionBusy] = useState(false);
+  const [permissionMenuConversationId, setPermissionMenuConversationId] = useState('');
+  const permissionMenuKey = active?.id ?? '__new__';
+  const permissionMenuOpen = permissionMenuConversationId === permissionMenuKey;
+  const currentPermissionProfile = active?.permissionProfile || 'workspace_autonomous';
+  const [permissionSaving, setPermissionSaving] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
+  const permissionMenuRef = useRef<HTMLDivElement>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
+
+  async function copyMessage(message: Message) {
+    const copied = await copyToClipboard(message.content);
+    if (!copied) {
+      onNotice?.('复制失败，请检查剪贴板权限。', 'error');
+      return;
+    }
+    setCopiedMessageId(message.id);
+    window.setTimeout(() => {
+      setCopiedMessageId((current) => current === message.id ? '' : current);
+    }, 1400);
+  }
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -1521,6 +1566,25 @@ function Chat({
       return () => document.removeEventListener('mousedown', handleClickOutside);
     }
   }, [modelMenuOpen]);
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (permissionMenuRef.current && !permissionMenuRef.current.contains(event.target as Node)) {
+        setPermissionMenuConversationId('');
+      }
+    }
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') setPermissionMenuConversationId('');
+    }
+    if (permissionMenuOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('keydown', handleEscape);
+      return () => {
+        document.removeEventListener('mousedown', handleClickOutside);
+        document.removeEventListener('keydown', handleEscape);
+      };
+    }
+  }, [permissionMenuOpen]);
 
   const currentProvider = useMemo(() => {
     if (active?.providerId) {
@@ -1559,6 +1623,26 @@ function Chat({
   const currentDraftObj = draftsMap[sessionId];
   const draft = currentDraftObj?.text ?? '';
   const attachments = currentDraftObj?.attachments ?? [];
+
+  useLayoutEffect(() => {
+    const textarea = composerInputRef.current;
+    if (!textarea) return;
+
+    const resize = () => {
+      const style = window.getComputedStyle(textarea);
+      const minHeight = Number.parseFloat(style.minHeight) || 0;
+      const maxHeight = Number.parseFloat(style.maxHeight) || 240;
+      textarea.style.height = 'auto';
+      const contentHeight = textarea.scrollHeight;
+      const nextHeight = Math.min(Math.max(contentHeight, minHeight), maxHeight);
+      textarea.style.height = `${nextHeight}px`;
+      textarea.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+    };
+
+    resize();
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, [draft, sessionId]);
 
   const setDraft = useCallback((textOrUpdater: string | ((prev: string) => string)) => {
     setDraftsMap((prev) => {
@@ -1686,13 +1770,15 @@ function Chat({
     const p = unifiedPlugins.find((item) => item.id === 'core:run_inspector');
     return p ? p.status === 'enabled' : true;
   }, [unifiedPlugins]);
-  const activeMcpCount = useMemo(() => unifiedPlugins.filter((p) => p.type === 'mcp' && p.status === 'enabled').length, [unifiedPlugins]);
-  const activeSkillCount = useMemo(() => unifiedPlugins.filter((p) => p.type === 'skill' && p.status === 'enabled').length, [unifiedPlugins]);
-  const hasUnreconciledToolEffects = turns.some((turn) => turn.recoveryClass === 'unknown_external_effect');
-  const activePluginCount = useMemo(
-    () => unifiedPlugins.filter((p) => (p.type === 'core' || p.type === 'release') && p.status === 'enabled').length,
+  const activeExtensionCount = useMemo(
+    () => unifiedPlugins.filter((p) => ['mcp', 'skill', 'core', 'release'].includes(p.type) && p.status === 'enabled').length,
     [unifiedPlugins]
   );
+  const conversationForkEnabled = useMemo(
+    () => unifiedPlugins.some((p) => p.id === 'core:conversation_fork' && p.status === 'enabled'),
+    [unifiedPlugins]
+  );
+  const hasUnreconciledToolEffects = turns.some((turn) => turn.recoveryClass === 'unknown_external_effect');
 
   const [submitting, setSubmitting] = useState(false);
   const submit = async () => {
@@ -1716,13 +1802,9 @@ function Chat({
     <div className="chat-column">
       <div className="messages">
         {active?.parentConversationId && (
-          <div className="conversation-lifecycle-banner" role="status">
-            这是从原会话分出的新分支。原会话和其中的消息保持不变。
-          </div>
-        )}
-        {active?.executionPaused && (
-          <div className="conversation-lifecycle-banner paused" role="status">
-            会话已停止，未开始的排队消息已取消。发送新消息会恢复执行；若上轮工具影响未确定，需先完成核对。
+          <div className="conversation-context-status" title="此会话从另一条对话分支而来" aria-label="分支会话">
+            <GitFork size={13} strokeWidth={1.8} aria-hidden="true" />
+            <span>分支会话</span>
           </div>
         )}
         {queuedInputs.length > 0 && (
@@ -1774,20 +1856,18 @@ function Chat({
               (messageTurn.status === 'needs_reconciliation' && messageTurn.recoveryClass === 'manually_reconciled')
             );
             const retryable = !!messageTurn && latestMessage && message.role === 'user' && retryableStatus && safeToRepeat;
-            const branchable = !!messageTurn && message.role === 'user' && !retryable && safeToRepeat &&
-              ['completed', 'failed', 'cancelled', 'interrupted', 'incomplete', 'needs_reconciliation'].includes(messageTurn.status);
             const reconciliationRequired = !!messageTurn && !safeToRepeat &&
               ['unknown_external_effect', 'not_replayable'].includes(messageTurn.recoveryClass || '');
             const reconciled = messageTurn?.recoveryClass === 'manually_reconciled';
-            const editUsesBranch = branchable;
+            const isEditingMessage = editingMessageId === message.id && retryable;
             return (
               <article key={message.id} className={`message ${message.role}`}>
                 <div className="message-role">{message.role === 'user' ? '你' : 'O'}</div>
                 <div className="message-body">
-                  {isRunInspectorEnabled && messageTurn && (
+                  {isRunInspectorEnabled && message.role === 'assistant' && messageTurn && (
                     <ActivityTrace turn={messageTurn} trace={trace.filter((event) => event.turnId === messageTurn.id)} />
                   )}
-                  {editingMessageId === message.id ? (
+                  {isEditingMessage ? (
                     <div className="message-edit-form">
                       <textarea value={editingMessageContent} onChange={(event) => setEditingMessageContent(event.target.value)} aria-label="编辑并重新发送消息" />
                       <div className="message-edit-actions">
@@ -1796,48 +1876,19 @@ function Chat({
                           if (!messageTurn) return;
                           setMessageActionBusy(true);
                           try {
-                            const applied = editUsesBranch
-                              ? await onBranch(messageTurn.id, editingMessageContent)
-                              : await onRetry(messageTurn.id, editingMessageContent);
+                            const applied = await onRetry(messageTurn.id, editingMessageContent);
                             if (applied) setEditingMessageId('');
                           } finally {
                             setMessageActionBusy(false);
                           }
-                        }}>{editUsesBranch ? '保存并分支重跑' : '保存并重试'}</button>
+                        }}>保存并重试</button>
                       </div>
                     </div>
                   ) : <MarkdownView content={message.content} />}
-                  {message.role === 'user' && messageTurn && (
+                  {message.role === 'user' && messageTurn && ((reconciled && messageTurn.reconciliationNote) || reconciliationRequired) && (
                     <div className="message-state-row">
-                      <span className={`message-state ${reconciliationRequired ? 'needs-reconciliation' : ''}`}>
-                        {reconciliationRequired ? '存在需要核对的工具影响' : reconciled ? '已记录人工核对' : turnStatusLabel(messageTurn.status)}
-                      </span>
                       {reconciled && messageTurn.reconciliationNote && (
                         <small className="message-reconciliation-note">核对说明：{messageTurn.reconciliationNote}</small>
-                      )}
-                      {retryable && editingMessageId !== message.id && (
-                        <div className="message-action-buttons">
-                          <button type="button" disabled={messageActionBusy} onClick={async () => {
-                            setMessageActionBusy(true);
-                            try { await onRetry(messageTurn.id); } finally { setMessageActionBusy(false); }
-                          }}>{messageTurn.status === 'interrupted' ? '从原始输入重跑' : '重试'}</button>
-                          <button type="button" onClick={() => {
-                            setEditingMessageId(message.id);
-                            setEditingMessageContent(message.content);
-                          }}>编辑并重试</button>
-                        </div>
-                      )}
-                      {branchable && editingMessageId !== message.id && (
-                        <div className="message-action-buttons">
-                          <button type="button" disabled={messageActionBusy} onClick={async () => {
-                            setMessageActionBusy(true);
-                            try { await onBranch(messageTurn.id); } finally { setMessageActionBusy(false); }
-                          }}>从此处新建分支</button>
-                          <button type="button" disabled={messageActionBusy} onClick={() => {
-                            setEditingMessageId(message.id);
-                            setEditingMessageContent(message.content);
-                          }}>编辑并分支重跑</button>
-                        </div>
                       )}
                       {reconciliationRequired && (
                         <div className="message-reconciliation">
@@ -1869,6 +1920,46 @@ function Chat({
                     </div>
                   )}
                 </div>
+                <div className="message-action-toolbar" aria-label={`${message.role === 'user' ? '用户' : '助手'}消息操作`}>
+                  <button
+                    type="button"
+                    className="message-action-icon"
+                    title={copiedMessageId === message.id ? '已复制' : '复制消息'}
+                    aria-label={copiedMessageId === message.id ? '已复制消息' : '复制消息'}
+                    onClick={() => { void copyMessage(message); }}
+                  >
+                    {copiedMessageId === message.id ? <Check size={14} strokeWidth={2} aria-hidden="true" /> : <Copy size={14} strokeWidth={1.8} aria-hidden="true" />}
+                  </button>
+                  {message.role === 'user' && retryable && !isEditingMessage && (
+                    <button
+                      type="button"
+                      className="message-action-icon"
+                      title="编辑并重新运行"
+                      aria-label="编辑此消息并重新运行"
+                      onClick={() => {
+                        setEditingMessageId(message.id);
+                        setEditingMessageContent(message.content);
+                      }}
+                    >
+                      <Pencil size={14} strokeWidth={1.8} aria-hidden="true" />
+                    </button>
+                  )}
+                  {message.role === 'assistant' && messageTurn?.status === 'completed' && messageTurn.resultMessageId === message.id && conversationForkEnabled && (
+                    <button
+                      type="button"
+                      className="message-action-icon"
+                      disabled={messageActionBusy}
+                      title={messageActionBusy ? '正在创建分支' : '从此回答创建分支'}
+                      aria-label="从这条回答创建分支，不启动模型"
+                      onClick={async () => {
+                        setMessageActionBusy(true);
+                        try { await onFork(messageTurn.id); } finally { setMessageActionBusy(false); }
+                      }}
+                    >
+                      <GitFork size={14} strokeWidth={1.8} aria-hidden="true" />
+                    </button>
+                  )}
+                </div>
               </article>
             );
           })
@@ -1894,8 +1985,8 @@ function Chat({
       </div>
       {notice && (
         <div className="notice-wrap">
-          <div className="notice" role="status">
-            <AlertCircle size={14} strokeWidth={2} className="notice-icon" />
+          <div className={`notice ${noticeTone === 'error' ? 'is-error' : 'is-info'}`} role={noticeTone === 'error' ? 'alert' : 'status'}>
+            {noticeTone === 'error' ? <AlertCircle size={14} strokeWidth={2} className="notice-icon" /> : <Info size={14} strokeWidth={1.8} className="notice-icon" />}
             <span className="notice-text">{notice}</span>
             <button type="button" onClick={() => onNotice?.('')} className="notice-close" aria-label="关闭提示">✕</button>
           </div>
@@ -1925,11 +2016,12 @@ function Chat({
         )}
         <textarea
           key={sessionId}
+          ref={composerInputRef}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onPaste={handlePaste}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey && !submitting) {
+            if (e.key === 'Enter' && !e.shiftKey && !submitting && !permissionSaving) {
               e.preventDefault();
               void submit();
             }
@@ -1941,7 +2033,7 @@ function Chat({
               ? '可以先输入下一条消息，当前任务完成后发送…'
               : '描述目标、约束，或者下一步行动…'
           }
-          disabled={!providers.length}
+          disabled={!providers.length || permissionSaving}
           aria-label="输入消息内容"
         />
         <div className="composer-row">
@@ -1949,45 +2041,76 @@ function Chat({
             <button
               type="button"
               className="capability-btn"
-              onClick={() => onOpenPlugins('mcp')}
-              title="管理 MCP 服务"
-              aria-label={`MCP 服务，已启用 ${activeMcpCount} 个`}
-            >
-              <span>MCP</span>
-              <span className="cap-badge">{activeMcpCount}</span>
-            </button>
-            <button
-              type="button"
-              className="capability-btn"
-              onClick={() => onOpenPlugins('skill')}
-              title="管理 Markdown 技能"
-              aria-label={`技能，已启用 ${activeSkillCount} 个`}
-            >
-              <span>Skill</span>
-              <span className="cap-badge">{activeSkillCount}</span>
-            </button>
-            <button
-              type="button"
-              className="capability-btn"
-              onClick={() => onOpenPlugins('core')}
-              title="管理核心插件"
-              aria-label={`插件，已启用 ${activePluginCount} 个`}
+              onClick={() => onOpenPlugins('all')}
+              title="查看和管理插件、Skill 与 MCP 服务"
+              aria-label={`Plugin，已启用 ${activeExtensionCount} 个能力`}
             >
               <span>Plugin</span>
-              <span className="cap-badge">{activePluginCount}</span>
+              <span className="cap-badge">{activeExtensionCount}</span>
             </button>
+            <div className="permission-profile-anchor" ref={permissionMenuRef}>
+              <button
+                type="button"
+                className={`capability-btn permission-profile-trigger ${permissionMenuOpen ? 'active' : ''}`}
+                title={active ? '仅影响之后启动的任务' : '先为新会话选择权限；该设置会在首条消息前保存'}
+                aria-label={`会话权限模式：${permissionProfileLabel(currentPermissionProfile)}`}
+                aria-haspopup="dialog"
+                aria-expanded={permissionMenuOpen}
+                disabled={permissionSaving}
+                onClick={() => setPermissionMenuConversationId(permissionMenuOpen ? '' : permissionMenuKey)}
+              >
+                <Shield size={13} strokeWidth={1.8} aria-hidden="true" />
+                <span className="permission-profile-current">{permissionProfileLabel(currentPermissionProfile)}</span>
+                <ChevronDown size={12} strokeWidth={1.8} className={`chevron-icon ${permissionMenuOpen ? 'open' : ''}`} aria-hidden="true" />
+              </button>
+              {permissionMenuOpen && (
+                <div className="permission-profile-menu" role="dialog" aria-label="当前会话权限模式" aria-busy={permissionSaving}>
+                  <div role="group" aria-label="选择会话权限档位">
+                  {[
+                    { value: 'read_only', label: '只读', description: '仅允许只读操作；写入请求会被拒绝。' },
+                    { value: 'workspace_autonomous', label: '工作区自动', description: '工作区内文件写入可自动执行；Shell、外部和高风险操作仍需确认。' },
+                    ...(currentPermissionProfile === 'ask_on_sensitive' ? [{ value: 'ask_on_sensitive', label: '写入前询问', description: '此会话的兼容权限模式；工作区写入、外部和高风险操作需逐次批准。' }] : []),
+                    { value: 'fully_autonomous', label: '完全自动', description: '所有已分类操作自动执行，不逐项询问；未知操作会阻止执行，系统沙箱仍生效。' },
+                  ].map((option) => {
+                    const profile = option.value as ConversationPermissionProfile;
+                    const selected = currentPermissionProfile === profile;
+                    return (
+                      <button
+                        type="button"
+                        key={option.value}
+                        className={`permission-profile-option ${selected ? 'selected' : ''}`}
+                        aria-pressed={selected}
+                        disabled={permissionSaving}
+                        onClick={async () => {
+                          if (selected) {
+                            setPermissionMenuConversationId('');
+                            return;
+                          }
+                          setPermissionSaving(true);
+                          try {
+                            if (await onPermissionProfileChange(profile)) setPermissionMenuConversationId('');
+                          } finally {
+                            setPermissionSaving(false);
+                          }
+                        }}
+                      >
+                        <span className="permission-profile-option-copy">
+                          <strong>{option.label}</strong>
+                          <small>{option.description}</small>
+                        </span>
+                        {selected && <Check size={14} strokeWidth={2.2} aria-hidden="true" />}
+                      </button>
+                    );
+                  })}
+                  </div>
+                  <small className="permission-profile-footnote">
+                    {active ? '更改仅用于之后启动的任务' : '选择后立即保存；首条消息将使用所选权限'}
+                  </small>
+                </div>
+              )}
+            </div>
           </div>
           <div className="composer-actions-right">
-            {active && (
-              <label className="permission-profile-control" title="权限只影响之后启动的任务">
-                <span>权限</span>
-                <select aria-label="当前会话权限等级" value={active.permissionProfile || 'workspace_autonomous'} onChange={(event) => onPermissionProfileChange(event.target.value as ConversationPermissionProfile)}>
-                  <option value="read_only">只读</option>
-                  <option value="workspace_autonomous">工作区自主</option>
-                  <option value="ask_on_sensitive">敏感操作询问</option>
-                </select>
-              </label>
-            )}
             {isModelSelectorEnabled && (
               <div className="model-selector-anchor" ref={modelMenuRef}>
               <button
@@ -2064,11 +2187,11 @@ function Chat({
               type="button"
               className="composer-icon-button send-btn"
               onClick={() => void submit()}
-              disabled={(!draft.trim() && attachments.length === 0) || !providers.length || submitting}
-              title={sending ? '加入当前会话队列' : '发送'}
-              aria-label={sending ? '加入消息队列' : '发送'}
+              disabled={(!draft.trim() && attachments.length === 0) || !providers.length || submitting || permissionSaving}
+              title={active?.executionPaused && !sending ? '会话已暂停；发送新消息后继续' : sending ? '加入当前会话队列' : '发送'}
+              aria-label={active?.executionPaused && !sending ? '发送消息并继续已暂停的会话' : sending ? '加入消息队列' : '发送'}
             >
-              <ArrowUp size={15} strokeWidth={2.4} />
+              {active?.executionPaused && !sending ? <Pause size={14} strokeWidth={2.2} /> : <ArrowUp size={15} strokeWidth={2.4} />}
             </button>
             {sending && (
               <button type="button" className="composer-icon-button stop-btn" onClick={onCancel} title="停止会话并清空排队消息" aria-label="停止会话">
@@ -2092,31 +2215,12 @@ function ActivityTrace({
   turn?: AgentTurn;
   running?: boolean;
 }) {
-  const [now, setNow] = useState(() => Date.now());
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [approvalError, setApprovalError] = useState('');
-  useEffect(() => {
-    if (!running) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [running]);
 
   const events = trace;
   const startedAt = turn?.startedAt || events[0]?.createdAt;
-  const completedAt = turn?.completedAt || (!running ? events[events.length - 1]?.createdAt : undefined);
-  const elapsed = startedAt ? Math.max(0, (completedAt ? Date.parse(completedAt) : now) - Date.parse(startedAt)) : 0;
-  const steps = events.reduce((max, event) => {
-    const step = typeof event.details?.step === 'number' ? event.details.step : 0;
-    return Math.max(max, step);
-  }, 0);
   const terminal = [...events].reverse().find((event) => event.kind.startsWith('turn.') && event.kind !== 'turn.started' && event.kind !== 'turn.cancel_requested');
-  const metrics = asRecord(terminal?.details?.metrics);
-  const liveTokenCount = events.reduce((sum, event) => {
-    if (event.kind !== 'model.completed') return sum;
-    const usage = asRecord(event.details?.usage);
-    return sum + (typeof usage.totalTokens === 'number' ? usage.totalTokens : 0);
-  }, 0);
-  const tokenCount = typeof metrics.totalTokens === 'number' ? metrics.totalTokens : liveTokenCount;
   const hasTerminalTurnEvent = events.some((event) => ['turn.completed', 'turn.incomplete', 'turn.failed', 'turn.cancelled', 'turn.needs_reconciliation', 'turn.interrupted'].includes(event.kind));
   const approvalRequest = hasTerminalTurnEvent ? undefined : [...events].reverse().find((event) => {
     if (event.kind !== 'approval.requested') return false;
@@ -2140,12 +2244,16 @@ function ActivityTrace({
     }
   }
 
+  function prettyApprovalDetail(key: string) {
+    const raw = textDetail(approvalRequest?.details ?? {}, key);
+    try { return JSON.stringify(JSON.parse(raw), null, 2); } catch { return raw; }
+  }
+
   return (
-    <details className={`activity-trace ${running ? 'is-running' : ''}`}>
+    <details className={`activity-trace ${running ? 'is-running' : ''}`} open={Boolean(approvalRequest)}>
       <summary>
         <span className="run-summary-text">
-          {running && <span className="run-live-label">{status} · </span>}
-          用时 {formatDuration(elapsed)} · 消耗 {tokenCount > 0 ? formatCompactNumber(tokenCount) : '0'} tokens · {steps || 0} 步
+          {approvalRequest ? '等待权限批准' : running ? `${status} · 查看运行详情` : '运行详情'}
         </span>
         <ChevronDown size={14} strokeWidth={1.8} className="run-chevron" aria-hidden="true" />
       </summary>
@@ -2156,14 +2264,29 @@ function ActivityTrace({
         </div>
         {approvalRequest && (
           <section className="approval-request-card" aria-label="工具调用授权请求">
-            <div className="approval-request-heading"><b>Agent 正在等待你的授权</b><span>{textDetail(approvalRequest.details, 'source')} · {textDetail(approvalRequest.details, 'effect')} · {textDetail(approvalRequest.details, 'permissionProfile')}{textDetail(approvalRequest.details, 'releaseId') ? ` · ${textDetail(approvalRequest.details, 'releaseId')}` : ''} · 截止 {formatClock(textDetail(approvalRequest.details, 'expiresAt'))}</span></div>
-            <p><strong>{textDetail(approvalRequest.details, 'toolName')}</strong>{textDetail(approvalRequest.details, 'pluginId') ? ` · ${textDetail(approvalRequest.details, 'pluginId')}` : ''}{textDetail(approvalRequest.details, 'resource') ? ` · ${textDetail(approvalRequest.details, 'resource')}` : ''}</p>
-            <p>{textDetail(approvalRequest.details, 'reason')}</p>
-            {textDetail(approvalRequest.details, 'impact') && <pre>{(() => { const raw = textDetail(approvalRequest.details, 'impact'); try { return JSON.stringify(JSON.parse(raw), null, 2); } catch { return raw; } })()}</pre>}
-            <pre>{(() => { const raw = textDetail(approvalRequest.details, 'arguments'); try { return JSON.stringify(JSON.parse(raw), null, 2); } catch { return raw; } })()}</pre>
+            <div className="approval-request-heading">
+              <span className="approval-request-icon"><Shield size={15} strokeWidth={1.8} aria-hidden="true" /></span>
+              <div className="approval-request-title">
+                <b>需要批准一次工具调用</b>
+                <span>{textDetail(approvalRequest.details, 'toolName') || '工具调用'} · {textDetail(approvalRequest.details, 'effect') || '影响未知'}</span>
+              </div>
+              <span className="approval-request-expiry">截止 {formatClock(textDetail(approvalRequest.details, 'expiresAt'))}</span>
+            </div>
+            {(textDetail(approvalRequest.details, 'pluginId') || textDetail(approvalRequest.details, 'resource')) && (
+              <div className="approval-request-target">
+                {textDetail(approvalRequest.details, 'pluginId') && <span>{textDetail(approvalRequest.details, 'pluginId')}</span>}
+                {textDetail(approvalRequest.details, 'resource') && <span>{textDetail(approvalRequest.details, 'resource')}</span>}
+              </div>
+            )}
+            <p className="approval-request-reason">{textDetail(approvalRequest.details, 'reason')}</p>
+            {textDetail(approvalRequest.details, 'impact') && <pre className="approval-request-impact">{prettyApprovalDetail('impact')}</pre>}
+            <details className="approval-request-payload">
+              <summary>查看本次调用参数</summary>
+              <pre>{prettyApprovalDetail('arguments')}</pre>
+            </details>
             {approvalError && <p className="approval-request-error">{approvalError}</p>}
             <div className="approval-request-actions">
-              <button type="button" disabled={approvalBusy} onClick={() => void decideApproval('deny')}>拒绝</button>
+              <button type="button" className="deny" disabled={approvalBusy} onClick={() => void decideApproval('deny')}>拒绝</button>
               <button type="button" className="approve" disabled={approvalBusy} onClick={() => void decideApproval('approve')}>{approvalBusy ? '提交中…' : '仅此次允许'}</button>
             </div>
           </section>
@@ -2300,25 +2423,32 @@ function turnStatusLabel(status: string) {
 	completed: '已完成',
 	incomplete: '未完成',
     failed: '运行失败',
-    cancelled: '已停止',
-	    interrupted: '进程中断，可从原输入重跑',
+    cancelled: '已暂停',
+	    interrupted: '已暂停',
 	    needs_reconciliation: '需人工核对',
 	'turn.completed': '已完成',
 	'turn.incomplete': '未完成',
     'turn.failed': '运行失败',
-    'turn.cancelled': '已停止',
-	    'turn.interrupted': '进程中断，可从原输入重跑',
+	    'turn.cancelled': '已暂停',
+	    'turn.interrupted': '已暂停',
 	    'turn.needs_reconciliation': '需人工核对',
   };
   return labels[status] || '已结束';
+}
+
+function permissionProfileLabel(profile: ConversationPermissionProfile) {
+  if (profile === 'read_only') return '只读';
+  if (profile === 'ask_on_sensitive') return '写入前询问';
+  if (profile === 'fully_autonomous') return '完全自动';
+  return '工作区自动';
 }
 
 function inboxTurnStatusLabel(status: string) {
   const labels: Record<string, string> = {
     completed: '消息已处理完成。',
     failed: '消息已开始处理，但运行失败。',
-    cancelled: '消息已开始处理后被停止。',
-    interrupted: '消息对应的 Turn 已中断，可从原始输入重跑。',
+    cancelled: '消息已暂停。',
+    interrupted: '消息已暂停，可从原始输入继续。',
     needs_reconciliation: '消息对应的 Turn 需要先人工核对外部影响。',
   };
   return labels[status] || `消息状态：${status}`;
@@ -2351,8 +2481,8 @@ function eventLabel(value: string) {
 	'turn.completed': '任务完成',
 	'turn.incomplete': '达到步数上限',
     'turn.failed': '任务失败',
-    'turn.cancelled': '任务已取消',
-	    'turn.interrupted': '进程中断，可从原输入重跑',
+	    'turn.cancelled': '会话已暂停',
+	    'turn.interrupted': '会话已暂停',
     'turn.cancel_requested': '正在停止任务',
 	    'turn.needs_reconciliation': '需人工核对',
     'model.requested': '正在请求模型',

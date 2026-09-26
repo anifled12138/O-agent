@@ -82,6 +82,7 @@ func NewManager(workspaceRoot string) *Manager {
 	coreEnabled["conversation_title"] = true
 	coreEnabled["project_workspace"] = true
 	coreEnabled["run_inspector"] = true
+	coreEnabled["conversation_fork"] = true
 
 	manager := &Manager{
 		workspaceRoot:  workspaceRoot,
@@ -131,6 +132,12 @@ func (m *Manager) IsRunInspectorEnabled() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.coreEnabled["run_inspector"]
+}
+
+func (m *Manager) IsConversationForkEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.coreEnabled["conversation_fork"]
 }
 
 func (m *Manager) IsModelEnabled(providerID string) bool {
@@ -224,12 +231,12 @@ func (m *Manager) Catalog() []UnifiedPlugin {
 	}
 	list = append(list, UnifiedPlugin{
 		ID:          "core:run_inspector",
-		Name:        "运行详情与统计 (Run Inspector)",
+		Name:        "运行详情 (Run Inspector)",
 		Type:        TypeCore,
-		Description: "在每条回答顶部显示用时、Token 与运行步数，并持久化可折叠的命令、工作目录、标准输出、错误输出、退出码及工具反馈。",
+		Description: "持久化可折叠的命令、工作目录、标准输出、错误输出、退出码及工具反馈；用量统计由回答本身展示。",
 		Status:      runInspectorStatus,
 		Capabilities: []string{
-			"run_metrics", "tool_command_trace", "tool_output_trace", "answer_header_surface",
+			"tool_command_trace", "tool_output_trace", "run_details_disclosure",
 		},
 	})
 
@@ -272,6 +279,19 @@ func (m *Manager) Catalog() []UnifiedPlugin {
 		Capabilities: []string{"project_folders", "shared_context", "project_workspace"},
 	})
 
+	forkStatus := StatusEnabled
+	if !m.coreEnabled["conversation_fork"] {
+		forkStatus = StatusDisabled
+	}
+	list = append(list, UnifiedPlugin{
+		ID:           "core:conversation_fork",
+		Name:         "对话分支 (Conversation Fork)",
+		Type:         TypeCore,
+		Description:  "在已完成的回答下创建一条包含该回答上下文的独立会话；创建分支不会自动提交新消息或启动模型。",
+		Status:       forkStatus,
+		Capabilities: []string{"assistant_message_action", "conversation_fork"},
+	})
+
 	return list
 }
 
@@ -287,7 +307,7 @@ func (m *Manager) SetEnabled(pluginID string, enabled bool) error {
 	case "core":
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if name == "model_selector" || name == "conversation_title" || name == "context_compactor" || name == "project_workspace" || name == "run_inspector" {
+		if name == "model_selector" || name == "conversation_title" || name == "context_compactor" || name == "project_workspace" || name == "run_inspector" || name == "conversation_fork" {
 			previous := m.coreEnabled[name]
 			m.coreEnabled[name] = enabled
 			if err := m.persistStateLocked(); err != nil {

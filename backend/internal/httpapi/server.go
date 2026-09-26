@@ -133,6 +133,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/retry", s.turnRetry)
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/reconcile", s.turnReconcile)
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/branch", s.turnBranch)
+	mux.HandleFunc("POST /api/v2/agent/turns/{id}/fork", s.turnFork)
 	mux.HandleFunc("GET /api/v2/agent/turns/{id}/events", s.turnEvents)
 	return s.recoverer(s.cors(s.logging(mux)))
 }
@@ -529,14 +530,15 @@ func (s *Server) projectDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) conversationCreate(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Title      string `json:"title"`
-		ProviderID string `json:"providerId"`
-		ProjectID  string `json:"projectId"`
+		Title             string                   `json:"title"`
+		ProviderID        string                   `json:"providerId"`
+		ProjectID         string                   `json:"projectId"`
+		PermissionProfile domain.PermissionProfile `json:"permissionProfile"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	c, err := s.agent.CreateWithProject(r.Context(), s.workspaceID, in.Title, in.ProviderID, in.ProjectID)
+	c, err := s.agent.CreateWithProjectAndPermissionProfile(r.Context(), s.workspaceID, in.Title, in.ProviderID, in.ProjectID, in.PermissionProfile)
 	if err != nil {
 		fail(w, err)
 		return
@@ -798,6 +800,15 @@ func (s *Server) turnBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusAccepted, receipt)
+}
+
+func (s *Server) turnFork(w http.ResponseWriter, r *http.Request) {
+	conversation, err := s.agent.ForkConversation(r.Context(), s.workspaceID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusCreated, conversation)
 }
 
 func (s *Server) inboxQueue(w http.ResponseWriter, r *http.Request) {

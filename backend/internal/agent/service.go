@@ -479,6 +479,88 @@ func (s *Service) BranchRetry(ctx context.Context, userID, turnID string, conten
 	return s.submitRun(userID, previousTurn.ConversationID, messageContent, input.ID, turnID, "", nil, id("run"))
 }
 
+// ForkConversation creates a durable copy of the conversation through a
+// completed assistant response. It deliberately creates no turn and never
+// invokes the provider; the user supplies the next prompt in the new chat.
+func (s *Service) ForkConversation(ctx context.Context, userID, turnID string) (domain.ConversationDetail, error) {
+	if s.plugins == nil || !s.plugins.IsConversationForkEnabled() {
+		return domain.ConversationDetail{}, fmt.Errorf("%w: conversation fork plugin is disabled", domain.ErrConflict)
+	}
+	turn, err := s.store.AgentTurn(ctx, userID, turnID)
+	if err != nil {
+		return domain.ConversationDetail{}, err
+	}
+	if turn.Status != "completed" || turn.ResultMessageID == "" {
+		return domain.ConversationDetail{}, fmt.Errorf("%w: only a completed assistant answer can be forked", domain.ErrConflict)
+	}
+	source, err := s.store.Conversation(ctx, userID, turn.ConversationID)
+	if err != nil {
+		return domain.ConversationDetail{}, err
+	}
+	var answer *domain.Message
+	messageCount := 0
+	for i := range source.Messages {
+		messageCount++
+		if source.Messages[i].ID == turn.ResultMessageID && source.Messages[i].Role == "assistant" {
+			answer = &source.Messages[i]
+			break
+		}
+	}
+	if answer == nil {
+		return domain.ConversationDetail{}, fmt.Errorf("%w: completed turn answer is missing", domain.ErrConflict)
+	}
+	now := time.Now().UTC()
+	title := strings.TrimSpace("分支 · " + source.Title)
+	branch := domain.Conversation{
+		ID:                    id("conv"),
+		UserID:                userID,
+		Title:                 title,
+		ProviderID:            source.ProviderID,
+		AgentGenerationID:     source.AgentGenerationID,
+		AgentDefinitionDigest: source.AgentDefinitionDigest,
+		ProjectID:             source.ProjectID,
+		PermissionProfile:     source.PermissionProfile,
+		ParentConversationID:  source.ID,
+		BranchFromMessageID:   answer.ID,
+		CreatedAt:             now,
+		UpdatedAt:             now,
+	}
+	if err := s.store.ForkCompletedConversation(ctx, userID, turn.ID, branch); err != nil {
+		return domain.ConversationDetail{}, err
+	}
+	readback, err := s.store.Conversation(ctx, userID, branch.ID)
+	if err != nil {
+		return domain.ConversationDetail{}, fmt.Errorf("fork %q was committed, but its conversation could not be read back: %w", branch.ID, err)
+	}
+	valid := readback.ID == branch.ID &&
+		readback.ParentConversationID == source.ID &&
+		readback.BranchFromMessageID == answer.ID &&
+		readback.ProviderID == source.ProviderID &&
+		readback.ProjectID == source.ProjectID &&
+		readback.PermissionProfile == source.PermissionProfile &&
+		readback.AgentGenerationID == source.AgentGenerationID &&
+		readback.AgentDefinitionDigest == source.AgentDefinitionDigest &&
+		len(readback.Messages) == messageCount &&
+		len(readback.Messages) > 0
+	if valid {
+		for i := 0; i < messageCount; i++ {
+			original, forked := source.Messages[i], readback.Messages[i]
+			if forked.ConversationID != branch.ID || forked.ID == original.ID || forked.Role != original.Role || forked.Content != original.Content {
+				valid = false
+				break
+			}
+		}
+	}
+	if valid {
+		last := readback.Messages[len(readback.Messages)-1]
+		valid = last.Role == "assistant" && last.Content == answer.Content
+	}
+	if !valid {
+		return domain.ConversationDetail{}, fmt.Errorf("fork %q was committed, but read-back did not match its source conversation prefix", branch.ID)
+	}
+	return readback, nil
+}
+
 func (s *Service) QueueInput(ctx context.Context, userID, conversationID, content string) (domain.InboxInput, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -760,11 +842,21 @@ func (s *Service) Create(ctx context.Context, userID, title, providerID string) 
 }
 
 func (s *Service) CreateWithProject(ctx context.Context, userID, title, providerID, projectID string) (domain.Conversation, error) {
+	return s.CreateWithProjectAndPermissionProfile(ctx, userID, title, providerID, projectID, domain.DefaultPermissionProfile())
+}
+
+func (s *Service) CreateWithProjectAndPermissionProfile(ctx context.Context, userID, title, providerID, projectID string, profile domain.PermissionProfile) (domain.Conversation, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		title = "新对话"
 	}
 	if providerID == "" {
+		return domain.Conversation{}, domain.ErrInvalid
+	}
+	if profile == "" {
+		profile = domain.DefaultPermissionProfile()
+	}
+	if !profile.Valid() {
 		return domain.Conversation{}, domain.ErrInvalid
 	}
 	if projectID != "" {
@@ -773,7 +865,7 @@ func (s *Service) CreateWithProject(ctx context.Context, userID, title, provider
 		}
 	}
 	now := time.Now().UTC()
-	c := domain.Conversation{ID: id("run"), UserID: userID, Title: title, ProviderID: providerID, ProjectID: projectID, PermissionProfile: domain.DefaultPermissionProfile(), CreatedAt: now, UpdatedAt: now}
+	c := domain.Conversation{ID: id("run"), UserID: userID, Title: title, ProviderID: providerID, ProjectID: projectID, PermissionProfile: profile, CreatedAt: now, UpdatedAt: now}
 	generation, err := s.evolution.Stable(ctx, userID)
 	if err != nil {
 		return domain.Conversation{}, err
@@ -781,9 +873,14 @@ func (s *Service) CreateWithProject(ctx context.Context, userID, title, provider
 	if err := s.store.CreateConversationWithGeneration(ctx, c, generation); err != nil {
 		return domain.Conversation{}, err
 	}
-	c.AgentGenerationID = generation.ID
-	c.AgentDefinitionDigest = generation.DefinitionDigest
-	return c, nil
+	persisted, err := s.store.Conversation(ctx, userID, c.ID)
+	if err != nil {
+		return domain.Conversation{}, fmt.Errorf("read created conversation back: %w", err)
+	}
+	if persisted.PermissionProfile != profile || persisted.AgentGenerationID != generation.ID || persisted.AgentDefinitionDigest != generation.DefinitionDigest {
+		return domain.Conversation{}, fmt.Errorf("created conversation read-back mismatch: %w", domain.ErrConflict)
+	}
+	return persisted.Conversation, nil
 }
 
 func (s *Service) UpdateProject(ctx context.Context, userID, id, projectID string) (domain.ConversationDetail, error) {
@@ -842,10 +939,18 @@ func profileTightened(prior, next domain.PermissionProfile) bool {
 	if !prior.Valid() {
 		return true
 	}
-	if next == domain.PermissionProfileReadOnly {
+	switch next {
+	case domain.PermissionProfileFullyAutonomous:
+		return false
+	case domain.PermissionProfileReadOnly:
 		return prior != domain.PermissionProfileReadOnly
+	case domain.PermissionProfileWorkspaceAutonomy:
+		return prior == domain.PermissionProfileFullyAutonomous
+	case domain.PermissionProfileAskOnSensitive:
+		return prior == domain.PermissionProfileWorkspaceAutonomy || prior == domain.PermissionProfileFullyAutonomous
+	default:
+		return true
 	}
-	return prior == domain.PermissionProfileWorkspaceAutonomy && next == domain.PermissionProfileAskOnSensitive
 }
 
 func (s *Service) UpdateTitle(ctx context.Context, userID, id, title string) (domain.ConversationDetail, error) {

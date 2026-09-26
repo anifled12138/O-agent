@@ -8,7 +8,7 @@ interface MarkdownViewProps {
   className?: string;
 }
 
-async function copyToClipboard(text: string): Promise<boolean> {
+export async function copyToClipboard(text: string): Promise<boolean> {
   if (typeof window !== 'undefined' && window.oDesktop?.copyText) {
     try {
       const res = await window.oDesktop.copyText(text);
@@ -123,54 +123,94 @@ export function MarkdownView({ content, className = '' }: MarkdownViewProps) {
 
   const renderTextWithFormatting = (raw: string, baseKey: number) => {
     const lines = raw.split('\n');
-    return (
-      <div key={`chunk-${baseKey}`} className="md-prose">
-        {lines.map((line, idx) => {
-          const trimmed = line.trim();
-          if (trimmed.startsWith('### ')) {
-            return <h4 key={idx} className="md-h3">{renderInline(trimmed.slice(4))}</h4>;
+    const rendered: React.ReactNode[] = [];
+    let idx = 0;
+
+    while (idx < lines.length) {
+      const line = lines[idx];
+      const trimmed = line.trim();
+
+      if (trimmed === '>' || trimmed.startsWith('> ')) {
+        const start = idx;
+        const quoteParagraphs: string[][] = [[]];
+        while (idx < lines.length) {
+          const quoteLine = lines[idx].trim();
+          if (quoteLine === '>') {
+            if (quoteParagraphs[quoteParagraphs.length - 1].length > 0) quoteParagraphs.push([]);
+            idx++;
+            continue;
           }
-          if (trimmed.startsWith('## ')) {
-            return <h3 key={idx} className="md-h2">{renderInline(trimmed.slice(3))}</h3>;
+          if (quoteLine.startsWith('> ')) {
+            quoteParagraphs[quoteParagraphs.length - 1].push(quoteLine.slice(2));
+            idx++;
+            continue;
           }
-          if (trimmed.startsWith('# ')) {
-            return <h2 key={idx} className="md-h1">{renderInline(trimmed.slice(2))}</h2>;
-          }
-          if (trimmed.startsWith('> ')) {
-            return <blockquote key={idx} className="md-quote">{renderInline(trimmed.slice(2))}</blockquote>;
-          }
-          const imgMatch = trimmed.match(/^!\[(.*?)\]\((.*?)\)$/);
-          if (imgMatch) {
-            return (
-              <div key={idx} className="md-image-wrap">
-                {/* Markdown may contain data URLs and arbitrary remote URLs. */}
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={imgMatch[2]} alt={imgMatch[1] || '图片'} className="md-image" />
-              </div>
-            );
-          }
-          if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
-            return (
-              <div key={idx} className="md-li">
-                <span className="md-bullet">•</span>
-                <span>{renderInline(trimmed.slice(2))}</span>
-              </div>
-            );
-          }
+          break;
+        }
+
+        const paragraphs = quoteParagraphs.filter((paragraph) => paragraph.length > 0);
+        if (paragraphs.length > 0) {
+          rendered.push(
+            <blockquote key={start} className="md-quote">
+              {paragraphs.map((paragraph, paragraphIdx) => (
+                <p key={`${start}-${paragraphIdx}`} className="md-p">
+                  {renderInline(paragraph.join(' '))}
+                </p>
+              ))}
+            </blockquote>,
+          );
+        } else {
+          rendered.push(<div key={start} className="md-spacer" aria-hidden="true" />);
+        }
+        continue;
+      }
+
+      if (trimmed.startsWith('### ')) {
+        rendered.push(<h4 key={idx} className="md-h3">{renderInline(trimmed.slice(4))}</h4>);
+      } else if (trimmed.startsWith('## ')) {
+        rendered.push(<h3 key={idx} className="md-h2">{renderInline(trimmed.slice(3))}</h3>);
+      } else if (trimmed.startsWith('# ')) {
+        rendered.push(<h2 key={idx} className="md-h1">{renderInline(trimmed.slice(2))}</h2>);
+      } else {
+        const imgMatch = trimmed.match(/^!\[(.*?)\]\((.*?)\)$/);
+        if (imgMatch) {
+          rendered.push(
+            <div key={idx} className="md-image-wrap">
+              {/* Markdown may contain data URLs and arbitrary remote URLs. */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={imgMatch[2]} alt={imgMatch[1] || '图片'} className="md-image" />
+            </div>,
+          );
+        } else if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+          rendered.push(
+            <div key={idx} className="md-li">
+              <span className="md-bullet">•</span>
+              <span>{renderInline(trimmed.slice(2))}</span>
+            </div>,
+          );
+        } else {
           const numMatch = trimmed.match(/^(\d+)\.\s+(.*)$/);
           if (numMatch) {
-            return (
+            rendered.push(
               <div key={idx} className="md-li">
                 <span className="md-num">{numMatch[1]}.</span>
                 <span>{renderInline(numMatch[2])}</span>
-              </div>
+              </div>,
             );
+          } else if (!trimmed) {
+            rendered.push(<div key={idx} className="md-spacer" />);
+          } else {
+            rendered.push(<p key={idx} className="md-p">{renderInline(line)}</p>);
           }
-          if (!trimmed) {
-            return <div key={idx} className="md-spacer" />;
-          }
-          return <p key={idx} className="md-p">{renderInline(line)}</p>;
-        })}
+        }
+      }
+
+      idx++;
+    }
+
+    return (
+      <div key={`chunk-${baseKey}`} className="md-prose">
+        {rendered}
       </div>
     );
   };
