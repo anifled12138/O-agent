@@ -17,12 +17,15 @@ app.commandLine.appendSwitch('disable-gpu');
 app.commandLine.appendSwitch('disable-software-rasterizer');
 app.commandLine.appendSwitch('in-process-gpu');
 
-// Ensure userData is in a guaranteed writable path (avoid Windows AppData permission / lock issues)
-const localUserData = path.join(repositoryRoot, 'data', 'electron-userdata');
-try {
-  fs.mkdirSync(localUserData, { recursive: true });
-  app.setPath('userData', localUserData);
-} catch {}
+// Keep development state alongside the repository. Packaged releases use Electron's
+// stable per-user profile so moving or extracting the portable app cannot change its data root.
+if (development) {
+  const localUserData = path.join(repositoryRoot, 'data', 'electron-userdata');
+  try {
+    fs.mkdirSync(localUserData, { recursive: true });
+    app.setPath('userData', localUserData);
+  } catch {}
+}
 
 let mainWindow;
 let appTray;
@@ -143,7 +146,7 @@ async function startBackend(frontendOrigin) {
     : path.join(app.getAppPath(), 'runtime', process.platform === 'win32' ? 'o-host.exe' : 'o-host');
   if (!fs.existsSync(executable)) throw new Error(`缺少本地 Go Host：${executable}`);
   const localRepository = packagedRepositoryRoot();
-  const dataDir = process.env.O_DATA_DIR || (localRepository ? path.join(localRepository, 'data') : path.join(app.getPath('userData'), 'data'));
+  const dataDir = process.env.O_DATA_DIR || path.join(app.getPath('appData'), app.name, 'data');
   const agentTempDir = process.env.O_AGENT_TEMP_DIR || path.join(app.getPath('temp'), 'Axiom', 'agent-runs');
   const workspaceRoot = process.env.O_WORKSPACE_ROOT || localRepository || app.getPath('documents');
   backendProcess = spawn(executable, [], {

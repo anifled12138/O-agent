@@ -82,7 +82,7 @@ runtime implementation is documented in
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `O_ADDR` | `127.0.0.1:9171` | Backend listen address |
-| `O_DATA_DIR` | `../data` | SQLite database and encryption key directory |
+| `O_DATA_DIR` | Backend default: `../data`; desktop default: platform user data under `O/data` | SQLite database and encryption key directory |
 | `O_AGENT_TEMP_DIR` | `%TEMP%/Axiom/agent-runs` (or the platform temp directory) | Private temporary scripts and artifacts scoped to Agent runs |
 | `O_AGENT_MAX_CONCURRENT_RUNS` | `3` | Maximum Agent and evaluation runs using the Host at once (1–32) |
 | `O_AGENT_MAX_TOKENS_PER_RUN` | `60000` | Host-side token usage ceiling per run when the provider reports usage (1000–2000000) |

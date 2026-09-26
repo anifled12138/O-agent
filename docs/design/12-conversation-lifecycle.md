@@ -7,6 +7,8 @@
 
 把用户输入、Agent Turn、取消、后续消息排队、进程重启恢复、重试和编辑变成一套由 SQLite 驱动的生命周期。UI 只展示后端读回的持久状态；浏览器关闭或 SSE 断线不改变 Host 中的 Turn。
 
+桌面开发版与发布版共用平台用户数据目录中的 `O/data`，包含 SQLite 数据库和加密主密钥；移动或解压发布包不会改变会话数据库位置。显式设置 `O_DATA_DIR` 时使用覆盖路径。
+
 “恢复”分成两种能力：重连 SSE 并按 durable sequence 补事件，以及在 Host 重启后恢复执行。Host 启动时会自动续跑绑定仍一致、检查点可读且没有不确定工具副作用的 Turn；未闭合的 `tool.started` 一律进入人工核对。Provider 已返回但响应尚未与检查点事务提交时，续跑会再次请求 Provider，因此不承诺 Provider 请求 exactly-once。
 
 ## 状态与不变量
