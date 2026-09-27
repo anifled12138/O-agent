@@ -15,18 +15,21 @@ import (
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/permissions"
 	"axiom.local/agent/internal/pluginforge"
+	"axiom.local/agent/internal/plugins"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/runfiles"
 )
 
 type capabilityCandidate struct {
-	ID         string   `json:"id"`
-	Kind       string   `json:"kind"`
-	Summary    string   `json:"summary"`
-	Tags       []string `json:"tags,omitempty"`
-	Visibility string   `json:"visibility"`
-	ReleaseID  string   `json:"releaseId,omitempty"`
-	Score      int      `json:"-"`
+	ID               string   `json:"id"`
+	Kind             string   `json:"kind"`
+	Summary          string   `json:"summary"`
+	Tags             []string `json:"tags,omitempty"`
+	Visibility       string   `json:"visibility"`
+	ReleaseID        string   `json:"releaseId,omitempty"`
+	FunctionName     string   `json:"functionName,omitempty"`
+	AlreadyAvailable bool     `json:"alreadyAvailable,omitempty"`
+	Score            int      `json:"-"`
 }
 
 type loadedTool struct {
@@ -263,8 +266,8 @@ func (s *turnScope) Close() error {
 
 func (s *turnScope) definitions() []provider.ToolDefinition {
 	result := []provider.ToolDefinition{
-		tool("axiom_capability_search", "Search the compact capability index for relevant installed Agent tools, lazy skills, or creator actions. Results contain summaries only; call axiom_capability_load before use.", `{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}`),
-		tool("axiom_capability_load", "Load one exact capability from search results. Agent tools become callable with their exact schema; skills return their instructions lazily.", `{"type":"object","required":["capabilityId"],"properties":{"capabilityId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_capability_search", "Search installed plugin tools, lazy skills, and active core tools. Core-tool results include functionName and are already callable; only lazy plugin tools and skills need axiom_capability_load.", `{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}`),
+		tool("axiom_capability_load", "Load one lazy plugin tool or skill from search results. Core-tool results are already callable by their functionName and need no load.", `{"type":"object","required":["capabilityId"],"properties":{"capabilityId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_tool_usage_metrics", "Read aggregated durable tool usage, failures, permission decisions, approvals, timing, and context compaction metrics over the recent time window. Use this to identify tools or context flows that may need investigation; metrics do not change tool code or permissions.", `{"type":"object","properties":{"days":{"type":"integer","minimum":1,"maximum":365,"default":30}},"additionalProperties":false}`),
 	}
 	if s.owner != nil && s.owner.plugins != nil && s.owner.plugins.IsContextCompactorEnabled() {
@@ -443,6 +446,28 @@ func (s *turnScope) search(query string, limit int) []capabilityCandidate {
 			result = append(result, candidate)
 		}
 	}
+	if s.owner != nil && s.owner.plugins != nil {
+		for _, item := range s.owner.plugins.Catalog() {
+			if item.Type != plugins.TypeCore || item.Status != plugins.StatusEnabled {
+				continue
+			}
+			functionName := ""
+			for _, capability := range item.Capabilities {
+				if name, ok := strings.CutPrefix(capability, "tool:"); ok {
+					functionName = name
+					break
+				}
+			}
+			if functionName == "" {
+				continue
+			}
+			candidate := capabilityCandidate{ID: item.ID, Kind: "core-tool", Summary: item.Description, Visibility: "direct", FunctionName: functionName, AlreadyAvailable: true}
+			candidate.Score = relevance(terms, item.ID+" "+item.Name+" "+functionName+" "+item.Description)
+			if candidate.Score > 0 || len(terms) == 0 {
+				result = append(result, candidate)
+			}
+		}
+	}
 	if s.owner != nil && s.owner.capsules != nil {
 		for _, item := range s.owner.capsules.List() {
 			candidate := capabilityCandidate{ID: item.ID, Kind: "capsule", Summary: item.Summary, Tags: item.Tags, Visibility: "workspace"}
@@ -472,6 +497,14 @@ func (s *turnScope) search(query string, limit int) []capabilityCandidate {
 }
 
 func (s *turnScope) load(id string) (any, error) {
+	if strings.HasPrefix(id, "core:") && s.owner != nil && s.owner.plugins != nil {
+		name := strings.TrimPrefix(id, "core:")
+		for _, definition := range s.owner.plugins.ActiveTools() {
+			if definition.Function.Name == name {
+				return map[string]any{"id": id, "kind": "core-tool", "functionName": name, "alreadyAvailable": true}, nil
+			}
+		}
+	}
 	if binding, ok := s.tools[id]; ok && binding.Visibility != "none" {
 		name := s.loadPluginTool(binding)
 		return map[string]any{"id": id, "kind": "tool", "functionName": name, "releaseId": binding.ReleaseID, "inputSchema": binding.InputSchema, "outputSchema": binding.OutputSchema, "risk": binding.Risk}, nil
