@@ -33,7 +33,10 @@ Instructions for HTTP Test Skill
 		t.Fatalf("failed to write SKILL.md: %v", err)
 	}
 
-	pm := plugins.NewManager(tempDir)
+	pm, err := plugins.NewManager(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ag := &agent.Service{}
 	ag.SetPlugins(pm)
 

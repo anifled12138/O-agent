@@ -675,9 +675,6 @@ export default function UnifiedPluginCenter({
                 <p style={{ margin: 0 }}>
                   当前 Search 起价为每 1,000 次请求 $7；内容选项可能另计。免费额度用完后是否继续付费取决于 Exa 账户套餐和付款设置。<a href="https://exa.ai/pricing" target="_blank" rel="noreferrer">查看当前价格</a>
                 </p>
-                <p style={{ margin: '8px 0 0' }}>
-                  启用插件后，Agent 才会获得搜索工具；会话权限仍单独生效。“工作区自动”会逐次询问外部搜索，“完全自动”才会直接搜索。这个确认不是 API Key 配置状态。
-                </p>
               </div>
 
               {webSearchSettings?.configured && (

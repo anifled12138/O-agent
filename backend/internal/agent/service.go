@@ -148,7 +148,11 @@ func New(hostCtx context.Context, store *storage.Store, providers *provider.Serv
 	if err != nil {
 		return nil, err
 	}
-	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, fragments: capability.NewRegistry(scripts), capsules: capsules, promotions: promotions, running: map[string]context.CancelCauseFunc{}, events: newEventBroker(), approvals: map[string]chan bool{}, workspaceRoot: workspaceRoot, runfiles: runfileManager, runLimits: limits, runSlots: make(chan struct{}, limits.MaxConcurrentRuns), plugins: plugins.NewManager(workspaceRoot)}, nil
+	pluginManager, err := plugins.NewManager(workspaceRoot)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, fragments: capability.NewRegistry(scripts), capsules: capsules, promotions: promotions, running: map[string]context.CancelCauseFunc{}, events: newEventBroker(), approvals: map[string]chan bool{}, workspaceRoot: workspaceRoot, runfiles: runfileManager, runLimits: limits, runSlots: make(chan struct{}, limits.MaxConcurrentRuns), plugins: pluginManager}, nil
 }
 
 func (s *Service) Plugins() *plugins.Manager { return s.plugins }
@@ -304,6 +308,9 @@ func (s *Service) requestToolApproval(ctx context.Context, userID, conversationI
 }
 
 func (s *Service) approvalImpact(ctx context.Context, userID, toolName string, arguments json.RawMessage) (string, error) {
+	if toolName == "web_search" {
+		return "本次搜索词会发送给 Exa。", nil
+	}
 	if toolName == "axiom_plugin_build" {
 		var input struct {
 			ProjectID string `json:"projectId"`

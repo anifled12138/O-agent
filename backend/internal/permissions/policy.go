@@ -76,8 +76,11 @@ func Evaluate(profile domain.PermissionProfile, request Request) Decision {
 	if request.Effect == EffectShell {
 		return Decision{Outcome: OutcomeAsk, Reason: "Shell 命令的实际影响无法仅凭工作目录限制，需要用户确认"}
 	}
-	if request.Effect == EffectExternalRead || request.Effect == EffectExternalWrite {
-		return Decision{Outcome: OutcomeAsk, Reason: "该工具会访问外部服务，需要用户确认"}
+	if request.Effect == EffectExternalRead {
+		return Decision{Outcome: OutcomeAsk, Reason: "该调用会向外部服务发送数据，需要确认"}
+	}
+	if request.Effect == EffectExternalWrite {
+		return Decision{Outcome: OutcomeAsk, Reason: "该调用会修改外部服务中的数据，需要确认"}
 	}
 	if request.Effect == EffectDestructive {
 		return Decision{Outcome: OutcomeAsk, Reason: "该工具可能删除或覆盖数据，需要用户确认"}

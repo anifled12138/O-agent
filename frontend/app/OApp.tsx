@@ -592,7 +592,7 @@ export default function OApp() {
       setNotice(`核对记录已保存；但无法读取后续 Turn 状态：${error instanceof Error ? error.message : '请刷新会话'}`, 'error');
       return true;
     }
-    setNotice('核对记录已保存；后续新 Turn 与排队输入现在可以按 FIFO 继续。');
+    setNotice('已记录核对，可编辑后重试。');
     return true;
   }
 
@@ -1857,7 +1857,8 @@ function Chat({
             );
             const retryable = !!messageTurn && latestMessage && message.role === 'user' && retryableStatus && safeToRepeat;
             const reconciliationRequired = !!messageTurn && !safeToRepeat &&
-              ['unknown_external_effect', 'not_replayable'].includes(messageTurn.recoveryClass || '');
+              messageTurn.recoveryClass === 'unknown_external_effect' &&
+              ['failed', 'cancelled', 'interrupted', 'incomplete', 'needs_reconciliation'].includes(messageTurn.status);
             const reconciled = messageTurn?.recoveryClass === 'manually_reconciled';
             const isEditingMessage = editingMessageId === message.id && retryable;
             return (
@@ -1892,10 +1893,10 @@ function Chat({
                       )}
                       {reconciliationRequired && (
                         <div className="message-reconciliation">
-                          <p>任务中断时有工具调用尚未返回结果，系统无法确认调用是否已生效。请先核对对应结果，再记录说明后重试；这条提示不代表插件未配置或未启用。</p>
+                          <p>操作结果不确定，核对后再继续。</p>
                           {reconcileTurnId === messageTurn.id ? (
                             <>
-                              <textarea value={reconcileNote} onChange={(event) => setReconcileNote(event.target.value)} maxLength={2000} aria-label="人工核对说明" placeholder="写明核对了哪些影响，以及为什么可以再次执行。" />
+                              <textarea value={reconcileNote} onChange={(event) => setReconcileNote(event.target.value)} maxLength={2000} aria-label="核对结果" placeholder="核对结果" />
                               <div className="message-edit-actions">
                                 <button type="button" onClick={() => { setReconcileTurnId(''); setReconcileNote(''); }}>取消</button>
                                 <button type="button" disabled={!reconcileNote.trim() || messageActionBusy} onClick={async () => {
@@ -1908,12 +1909,11 @@ function Chat({
                                   } finally {
                                     setMessageActionBusy(false);
                                   }
-                                }}>记录核对并允许重跑</button>
+                                }}>记录核对</button>
                               </div>
-                              <small>此操作会授权后续再次执行，可能重复尚未确认的外部操作。</small>
                             </>
                           ) : (
-                            <button type="button" disabled={messageActionBusy} onClick={() => setReconcileTurnId(messageTurn.id)}>填写核对说明</button>
+                            <button type="button" disabled={messageActionBusy} onClick={() => setReconcileTurnId(messageTurn.id)}>填写核对结果</button>
                           )}
                         </div>
                       )}
@@ -2306,7 +2306,7 @@ function ActivityTrace({
               <span className="approval-request-icon"><Shield size={15} strokeWidth={1.8} aria-hidden="true" /></span>
               <div className="approval-request-title">
                 <b>需要批准一次工具调用</b>
-                <span>{textDetail(approvalRequest.details, 'toolName') || '工具调用'} · {textDetail(approvalRequest.details, 'effect') || '影响未知'}</span>
+                <span>{textDetail(approvalRequest.details, 'toolName') || '工具调用'} · {permissionEffectLabel(textDetail(approvalRequest.details, 'effect'))}</span>
               </div>
               <span className="approval-request-expiry">截止 {formatClock(textDetail(approvalRequest.details, 'expiresAt'))}</span>
             </div>
@@ -2457,6 +2457,19 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function textDetail(details: Record<string, unknown>, key: string) {
   return typeof details?.[key] === 'string' ? (details[key] as string) : '';
+}
+
+function permissionEffectLabel(effect: string) {
+  const labels: Record<string, string> = {
+    read: '只读',
+    workspace_write: '工作区写入',
+    shell: 'Shell 命令',
+    external_read: '访问外部服务',
+    external_write: '修改外部服务',
+    destructive: '删除或覆盖',
+    sensitive: '修改持久设置',
+  };
+  return labels[effect] || '影响未知';
 }
 
 function turnStatusLabel(status: string) {

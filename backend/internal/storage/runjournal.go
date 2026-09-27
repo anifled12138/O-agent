@@ -59,9 +59,9 @@ WHERE t.id=? AND t.conversation_id=? AND t.user_id=?`, sourceTurnID, sourceConve
 	var unreviewedToolEffects int
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1 FROM agent_turns affected
-JOIN agent_trace_events e ON e.turn_id=affected.id AND e.kind='tool.started'
 WHERE affected.conversation_id=? AND affected.user_id=?
 AND affected.status IN ('failed','cancelled','interrupted','incomplete','needs_reconciliation')
+AND affected.recovery_class='unknown_external_effect'
 AND NOT EXISTS (SELECT 1 FROM agent_turn_reconciliations r WHERE r.turn_id=affected.id AND r.user_id=?)
 )`, sourceConversationID, userID, userID).Scan(&unreviewedToolEffects); err != nil {
 		return err
@@ -252,9 +252,9 @@ func (s *Store) RecordAgentTurnReconciliation(ctx context.Context, userID, turnI
 		return domain.AgentTurnReconciliation{}, err
 	}
 	defer tx.Rollback()
-	var status, inputMessageID string
+	var status, recoveryClass, inputMessageID string
 	var sequence int
-	if err := tx.QueryRowContext(ctx, `SELECT conversation_id,status,input_message_id,last_sequence FROM agent_turns WHERE id=? AND user_id=?`, turnID, userID).Scan(&result.ConversationID, &status, &inputMessageID, &sequence); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT conversation_id,status,recovery_class,input_message_id,last_sequence FROM agent_turns WHERE id=? AND user_id=?`, turnID, userID).Scan(&result.ConversationID, &status, &recoveryClass, &inputMessageID, &sequence); errors.Is(err, sql.ErrNoRows) {
 		return domain.AgentTurnReconciliation{}, domain.ErrNotFound
 	} else if err != nil {
 		return domain.AgentTurnReconciliation{}, err
@@ -262,11 +262,7 @@ func (s *Store) RecordAgentTurnReconciliation(ctx context.Context, userID, turnI
 	if status != "needs_reconciliation" && status != "completed" && status != "failed" && status != "cancelled" && status != "interrupted" && status != "incomplete" {
 		return domain.AgentTurnReconciliation{}, domain.ErrConflict
 	}
-	var hasToolEffect int
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM agent_trace_events WHERE turn_id=? AND kind='tool.started')`, turnID).Scan(&hasToolEffect); err != nil {
-		return domain.AgentTurnReconciliation{}, err
-	}
-	if hasToolEffect == 0 {
+	if recoveryClass != "unknown_external_effect" {
 		return domain.AgentTurnReconciliation{}, fmt.Errorf("%w: turn has no tool effect to reconcile", domain.ErrConflict)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_turn_reconciliations(id,turn_id,user_id,conversation_id,decision,note,created_at) VALUES(?,?,?,?,?,?,?)`, result.ID, turnID, userID, result.ConversationID, result.Decision, result.Note, at); err != nil {
@@ -337,9 +333,9 @@ func (s *Store) startAgentTurn(ctx context.Context, userID string, turn domain.A
 	var unresolvedToolEffects int
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1 FROM agent_turns affected
-JOIN agent_trace_events e ON e.turn_id=affected.id AND e.kind='tool.started'
 WHERE affected.conversation_id=? AND affected.user_id=?
 AND affected.status IN ('failed','cancelled','interrupted','incomplete','needs_reconciliation')
+AND affected.recovery_class='unknown_external_effect'
 AND NOT EXISTS (SELECT 1 FROM agent_turn_reconciliations r WHERE r.turn_id=affected.id AND r.user_id=?)
 )`, turn.ConversationID, userID, userID).Scan(&unresolvedToolEffects); err != nil {
 		return err
@@ -376,8 +372,7 @@ AND NOT EXISTS (SELECT 1 FROM agent_turn_reconciliations r WHERE r.turn_id=affec
 		var unreviewedToolEffects int
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1 FROM agent_turns affected
-JOIN agent_trace_events e ON e.turn_id=affected.id AND e.kind='tool.started'
-WHERE affected.input_message_id=? AND affected.user_id=?
+WHERE affected.input_message_id=? AND affected.user_id=? AND affected.recovery_class='unknown_external_effect'
 AND NOT EXISTS (SELECT 1 FROM agent_turn_reconciliations r WHERE r.turn_id=affected.id AND r.user_id=?)
 )`, input.ID, userID, userID).Scan(&unreviewedToolEffects); err != nil {
 			return err
@@ -726,6 +721,20 @@ func (s *Store) FinishAgentTurn(ctx context.Context, userID, turnID, status, sto
 			return err
 		}
 	}
+	terminalRecoveryClass := ""
+	if status == "completed" {
+		terminalRecoveryClass = "not_replayable"
+	} else if status == "failed" || status == "cancelled" || status == "incomplete" {
+		_, _, malformedToolJournal, unsafeToolEffect, _, inspectErr := inspectToolJournal(ctx, tx, turnID)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if malformedToolJournal || unsafeToolEffect {
+			terminalRecoveryClass = "unknown_external_effect"
+		} else {
+			terminalRecoveryClass = "safe_to_retry"
+		}
+	}
 	sequence++
 	kind := "turn." + status
 	if _, err = tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turnID, sequence), conversationID, turnID, sequence, kind, []byte(details), now); err != nil {
@@ -742,12 +751,8 @@ func (s *Store) FinishAgentTurn(ctx context.Context, userID, turnID, status, sto
 		return err
 	}
 	updatedTurn, err := tx.ExecContext(ctx, `UPDATE agent_turns SET status=?,stop_reason=?,result_message_id=NULLIF(?,''),
-recovery_class=CASE WHEN ? IN ('failed','cancelled','incomplete','completed') THEN
- CASE WHEN EXISTS (SELECT 1 FROM agent_trace_events e WHERE e.turn_id=? AND e.kind='tool.started') THEN
-  CASE WHEN ?='completed' THEN 'not_replayable' ELSE 'unknown_external_effect' END
- ELSE 'safe_to_retry' END
- ELSE recovery_class END,
-	last_sequence=?,updated_at=?,completed_at=? WHERE id=? AND user_id=? AND status IN ('running','cancelling','awaiting_approval')`, status, stopReason, resultMessageID, status, turnID, status, sequence, now, now, turnID, userID)
+recovery_class=CASE WHEN ?<>'' THEN ? ELSE recovery_class END,
+	last_sequence=?,updated_at=?,completed_at=? WHERE id=? AND user_id=? AND status IN ('running','cancelling','awaiting_approval')`, status, stopReason, resultMessageID, terminalRecoveryClass, terminalRecoveryClass, sequence, now, now, turnID, userID)
 	if err != nil {
 		return err
 	}
@@ -1196,13 +1201,13 @@ FROM agent_turns t WHERE t.status IN ('running','cancelling','awaiting_approval'
 	for _, item := range items {
 		status, recoveryClass, kind := "interrupted", "safe_to_retry", "turn.interrupted"
 		checkpointValid := item.checkpointVersion == 1 && item.checkpointResume && item.checkpointStored
-		hasTool, unresolvedTool, malformedToolJournal, lastToolCompleted, err := inspectToolJournal(ctx, tx, item.id)
+		_, unresolvedTool, malformedToolJournal, unsafeToolEffect, lastToolCompleted, err := inspectToolJournal(ctx, tx, item.id)
 		if err != nil {
 			return 0, err
 		}
 		if checkpointValid && !unresolvedTool && !malformedToolJournal && lastToolCompleted <= item.checkpointSequence {
 			recoveryClass = "checkpoint_resumable"
-		} else if hasTool || unresolvedTool || malformedToolJournal {
+		} else if malformedToolJournal || unsafeToolEffect {
 			status, recoveryClass, kind = "needs_reconciliation", "unknown_external_effect", "turn.needs_reconciliation"
 		}
 		details, _ := json.Marshal(map[string]string{"stopReason": "host_restarted", "recoveryClass": recoveryClass})
@@ -1261,30 +1266,42 @@ FROM agent_turns t WHERE t.status IN ('running','cancelling','awaiting_approval'
 	return int64(len(items)), nil
 }
 
-// inspectToolJournal returns whether tools were started, whether any started
-// call lacks a durable completion, and the latest completion sequence. Invalid
-// event details are treated as an unsafe journal so recovery fails closed.
-func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, bool, bool, int, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT sequence,kind,details_json FROM agent_trace_events WHERE turn_id=? AND kind IN ('tool.started','tool.completed') ORDER BY sequence`, turnID)
+// inspectToolJournal returns tool presence, unresolved calls, journal integrity,
+// whether any started call may have changed state, and the latest completion.
+// Read and external-read tools can be retried; unknown and mutating effects fail closed.
+func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, bool, bool, bool, int, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT sequence,kind,details_json FROM agent_trace_events WHERE turn_id=? AND kind IN ('permission.checked','tool.started','tool.completed') ORDER BY sequence`, turnID)
 	if err != nil {
-		return false, false, false, 0, err
+		return false, false, false, false, 0, err
 	}
 	defer rows.Close()
 	started := map[string]bool{}
 	completed := map[string]bool{}
-	hasTool, malformed, latestCompleted := false, false, 0
+	effects := map[string]string{}
+	hasTool, malformed, unsafeEffect, latestCompleted := false, false, false, 0
 	for rows.Next() {
 		var sequence int
 		var kind string
 		var raw []byte
 		if err := rows.Scan(&sequence, &kind, &raw); err != nil {
-			return false, false, false, 0, err
+			return false, false, false, false, 0, err
 		}
 		var details struct {
 			ToolCallID string `json:"toolCallId"`
+			Effect     string `json:"effect"`
 		}
 		if !json.Valid(raw) || json.Unmarshal(raw, &details) != nil || details.ToolCallID == "" {
 			malformed = true
+			continue
+		}
+		if kind == "permission.checked" {
+			if details.Effect == "" {
+				continue
+			}
+			if previous, exists := effects[details.ToolCallID]; exists && previous != details.Effect {
+				malformed = true
+			}
+			effects[details.ToolCallID] = details.Effect
 			continue
 		}
 		hasTool = true
@@ -1293,6 +1310,12 @@ func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, b
 				malformed = true
 			}
 			started[details.ToolCallID] = true
+			if details.Effect != "" {
+				if previous, exists := effects[details.ToolCallID]; exists && previous != details.Effect {
+					malformed = true
+				}
+				effects[details.ToolCallID] = details.Effect
+			}
 		} else {
 			if !started[details.ToolCallID] {
 				malformed = true
@@ -1304,16 +1327,96 @@ func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, b
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return false, false, false, 0, err
+		return false, false, false, false, 0, err
 	}
 	unresolved := false
 	for callID := range started {
 		if !completed[callID] {
 			unresolved = true
-			break
+		}
+		switch effects[callID] {
+		case "read", "external_read":
+		case "":
+			malformed = true
+			unsafeEffect = true
+		default:
+			unsafeEffect = true
 		}
 	}
-	return hasTool, unresolved, malformed, latestCompleted, nil
+	return hasTool, unresolved, malformed, unsafeEffect, latestCompleted, nil
+}
+
+func (s *Store) reclassifyLegacyReadOnlyTurns(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id,status,last_sequence FROM agent_turns WHERE recovery_class='unknown_external_effect' ORDER BY started_at`)
+	if err != nil {
+		return err
+	}
+	type candidate struct {
+		id, status string
+		sequence   int
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.id, &item.status, &item.sequence); err != nil {
+			rows.Close()
+			return err
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range candidates {
+		hasTool, _, malformed, unsafeEffect, _, err := inspectToolJournal(ctx, tx, item.id)
+		if err != nil {
+			return err
+		}
+		if !hasTool || malformed || unsafeEffect {
+			continue
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE agent_turns SET recovery_class='safe_to_retry',status=CASE WHEN status='needs_reconciliation' THEN 'interrupted' ELSE status END WHERE id=? AND recovery_class='unknown_external_effect'`, item.id)
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count != 1 {
+			return fmt.Errorf("legacy recovery classification for turn %s changed during migration", item.id)
+		}
+		if item.status == "needs_reconciliation" {
+			details, err := json.Marshal(map[string]string{"stopReason": "host_restarted", "recoveryClass": "safe_to_retry"})
+			if err != nil {
+				return err
+			}
+			updated, err := tx.ExecContext(ctx, `UPDATE agent_trace_events SET kind='turn.interrupted',details_json=? WHERE turn_id=? AND sequence=? AND kind='turn.needs_reconciliation'`, details, item.id, item.sequence)
+			if err != nil {
+				return err
+			}
+			updatedCount, err := updated.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if updatedCount != 1 {
+				return fmt.Errorf("legacy reconciliation event for turn %s is missing", item.id)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func eventID(turnID string, sequence int) string {

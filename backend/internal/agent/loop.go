@@ -325,7 +325,7 @@ func executeLoop(ctx context.Context, models modelRuntime, request loopRequest) 
 				return loopResult{Metrics: metrics}, context.Cause(ctx)
 			}
 			toolStarted := time.Now()
-			startedDetails := map[string]any{"step": step + 1, "toolCallId": call.ID, "name": call.Function.Name, "source": authRequest.Source, "pluginId": authRequest.PluginID, "releaseId": authRequest.ReleaseID, "argumentBytes": len(call.Function.Arguments)}
+			startedDetails := map[string]any{"step": step + 1, "toolCallId": call.ID, "name": call.Function.Name, "source": authRequest.Source, "pluginId": authRequest.PluginID, "releaseId": authRequest.ReleaseID, "effect": authRequest.Effect, "argumentBytes": len(call.Function.Arguments)}
 			if request.DetailedTrace {
 				startedDetails["arguments"] = traceJSONPreview([]byte(call.Function.Arguments), 16*1024)
 			}

@@ -47,19 +47,18 @@ type UnifiedPlugin struct {
 }
 
 type Manager struct {
-	mu               sync.RWMutex
-	workspaceRoot    string
-	skillsRegistry   *skills.Registry
-	mcpManager       *mcp.Manager
-	coreTools        map[string]coretools.Tool
-	coreEnabled      map[string]bool
-	savedCoreEnabled map[string]bool
-	corePluginName   map[string]string
-	corePluginInfo   map[string]func() map[string]string
-	contextPlugin    *ContextManagerPlugin
-	providerLister   func(ctx context.Context) ([]domain.Provider, error)
-	disabledModels   map[string]bool
-	statePath        string
+	mu             sync.RWMutex
+	workspaceRoot  string
+	skillsRegistry *skills.Registry
+	mcpManager     *mcp.Manager
+	coreTools      map[string]coretools.Tool
+	coreEnabled    map[string]bool
+	corePluginName map[string]string
+	corePluginInfo map[string]func() map[string]string
+	contextPlugin  *ContextManagerPlugin
+	providerLister func(ctx context.Context) ([]domain.Provider, error)
+	disabledModels map[string]bool
+	statePath      string
 }
 
 type persistedState struct {
@@ -67,7 +66,38 @@ type persistedState struct {
 	DisabledModels map[string]bool `json:"disabledModels,omitempty"`
 }
 
-func NewManager(workspaceRoot string) *Manager {
+type CorePluginRegistration struct {
+	Name        string
+	DisplayName string
+	Tool        coretools.Tool
+	Enabled     bool
+	Metadata    func() map[string]string
+}
+
+func NewManager(workspaceRoot string) (*Manager, error) {
+	manager := newManager(workspaceRoot)
+	if err := manager.loadState(); err != nil {
+		return nil, err
+	}
+	return manager, nil
+}
+
+// NewManagerWithCorePlugins builds the complete core registry before loading
+// persisted settings, so settings are applied to the registry as one unit.
+func NewManagerWithCorePlugins(workspaceRoot string, registrations ...CorePluginRegistration) (*Manager, error) {
+	manager := newManager(workspaceRoot)
+	for _, registration := range registrations {
+		if err := manager.registerCorePlugin(registration); err != nil {
+			return nil, err
+		}
+	}
+	if err := manager.loadState(); err != nil {
+		return nil, err
+	}
+	return manager, nil
+}
+
+func newManager(workspaceRoot string) *Manager {
 	skillsReg := skills.NewRegistry(workspaceRoot)
 	mcpMgr := mcp.NewManagerWithWorkspace(workspaceRoot)
 	contextPlugin := NewDefaultContextManagerPlugin()
@@ -88,57 +118,33 @@ func NewManager(workspaceRoot string) *Manager {
 	coreEnabled["conversation_fork"] = true
 
 	manager := &Manager{
-		workspaceRoot:    workspaceRoot,
-		skillsRegistry:   skillsReg,
-		mcpManager:       mcpMgr,
-		coreTools:        coreMap,
-		coreEnabled:      coreEnabled,
-		savedCoreEnabled: make(map[string]bool),
-		corePluginName:   make(map[string]string),
-		corePluginInfo:   make(map[string]func() map[string]string),
-		contextPlugin:    contextPlugin,
-		disabledModels:   make(map[string]bool),
-		statePath:        filepath.Join(workspaceRoot, ".axiom", "plugin-state.json"),
+		workspaceRoot:  workspaceRoot,
+		skillsRegistry: skillsReg,
+		mcpManager:     mcpMgr,
+		coreTools:      coreMap,
+		coreEnabled:    coreEnabled,
+		corePluginName: make(map[string]string),
+		corePluginInfo: make(map[string]func() map[string]string),
+		contextPlugin:  contextPlugin,
+		disabledModels: make(map[string]bool),
+		statePath:      filepath.Join(workspaceRoot, ".axiom", "plugin-state.json"),
 	}
-	manager.loadState()
 	return manager
 }
 
-func (m *Manager) RegisterCorePlugin(name, displayName string, tool coretools.Tool, enabled bool, metadata func() map[string]string) error {
-	if name == "" || displayName == "" || tool.Definition.Function.Name != name || tool.Handler == nil {
+func (m *Manager) registerCorePlugin(registration CorePluginRegistration) error {
+	if registration.Name == "" || registration.DisplayName == "" || registration.Tool.Definition.Function.Name != registration.Name || registration.Tool.Handler == nil {
 		return fmt.Errorf("invalid core plugin registration")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, exists := m.coreTools[name]; exists {
-		return fmt.Errorf("core plugin %q is already registered", name)
+	if _, exists := m.coreTools[registration.Name]; exists {
+		return fmt.Errorf("core plugin %q is already registered", registration.Name)
 	}
-	previousEnabled, hadEnabled := m.coreEnabled[name]
-	registeredEnabled := enabled
-	if savedEnabled, ok := m.savedCoreEnabled[name]; ok {
-		registeredEnabled = savedEnabled
+	m.coreTools[registration.Name] = registration.Tool
+	m.corePluginName[registration.Name] = registration.DisplayName
+	m.coreEnabled[registration.Name] = registration.Enabled
+	if registration.Metadata != nil {
+		m.corePluginInfo[registration.Name] = registration.Metadata
 	}
-	m.coreTools[name] = tool
-	m.corePluginName[name] = displayName
-	if metadata != nil {
-		m.corePluginInfo[name] = metadata
-	}
-	m.coreEnabled[name] = registeredEnabled
-	if err := m.persistStateLocked(); err != nil {
-		delete(m.coreTools, name)
-		delete(m.corePluginName, name)
-		delete(m.corePluginInfo, name)
-		if hadEnabled {
-			m.coreEnabled[name] = previousEnabled
-		} else {
-			delete(m.coreEnabled, name)
-		}
-		return fmt.Errorf("persist core plugin %q registration: %w", name, err)
-	}
-	if _, exists := m.coreTools[name]; !exists {
-		return fmt.Errorf("core plugin %q registration read-back failed", name)
-	}
-	delete(m.savedCoreEnabled, name)
 	return nil
 }
 
@@ -408,22 +414,21 @@ func (m *Manager) SetEnabled(pluginID string, enabled bool) error {
 	}
 }
 
-func (m *Manager) loadState() {
+func (m *Manager) loadState() error {
 	raw, err := os.ReadFile(m.statePath)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read plugin state: %w", err)
 	}
 	var state persistedState
-	if json.Unmarshal(raw, &state) != nil {
-		return
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return fmt.Errorf("decode plugin state: %w", err)
 	}
 	for name, enabled := range state.CoreEnabled {
 		if _, known := m.coreEnabled[name]; known {
 			m.coreEnabled[name] = enabled
-		} else {
-			// Some host-owned tools are registered after the manager loads its
-			// state. Keep their saved setting until RegisterCorePlugin can apply it.
-			m.savedCoreEnabled[name] = enabled
 		}
 	}
 	for providerID, disabled := range state.DisabledModels {
@@ -431,6 +436,7 @@ func (m *Manager) loadState() {
 			m.disabledModels[providerID] = true
 		}
 	}
+	return nil
 }
 
 func (m *Manager) persistStateLocked() error {

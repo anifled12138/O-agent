@@ -25,7 +25,10 @@ Instructions for mock skill`
 		t.Fatalf("failed to write skill file: %v", err)
 	}
 
-	mgr := NewManager(tempDir)
+	mgr, err := NewManager(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	catalog := mgr.Catalog()
 	if len(catalog) < 6 {
 		t.Errorf("expected at least 6 plugins (6 core tools + 1 skill), got %d", len(catalog))
@@ -66,21 +69,30 @@ Instructions for mock skill`
 
 func TestRunInspectorPluginPersistsAcrossRestart(t *testing.T) {
 	tempDir := t.TempDir()
-	mgr := NewManager(tempDir)
+	mgr, err := NewManager(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !mgr.IsRunInspectorEnabled() {
 		t.Fatal("run inspector must be enabled by default")
 	}
 	if err := mgr.SetEnabled("core:run_inspector", false); err != nil {
 		t.Fatal(err)
 	}
-	restarted := NewManager(tempDir)
+	restarted, err := NewManager(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if restarted.IsRunInspectorEnabled() {
 		t.Fatal("persisted run inspector state was not restored")
 	}
 }
 
 func TestRunInspectorToggleRollsBackWhenPersistenceFails(t *testing.T) {
-	mgr := NewManager(t.TempDir())
+	mgr, err := NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	mgr.statePath = t.TempDir()
 	if err := mgr.SetEnabled("core:run_inspector", false); err == nil {
 		t.Fatal("expected persistence failure")

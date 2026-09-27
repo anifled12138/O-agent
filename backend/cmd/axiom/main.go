@@ -211,11 +211,14 @@ func run() error {
 	evalHarnessService, _ := core.Service[*evalharness.Service](host, "eval-harness")
 	bootstrapService, _ := core.Service[*bootstrap.Service](host, "bootstrap")
 	forgeService, _ := core.Service[*pluginforge.Service](host, "plugin-forge")
-	unifiedPlugins := pluginsInternal.NewManager(cfg.WorkspaceRoot)
-	if err := unifiedPlugins.RegisterCorePlugin("web_search", "联网搜索", searchService.Tool(), false, func() map[string]string {
-		settings := searchService.Settings()
-		return map[string]string{"provider": settings.Provider, "configured": strconv.FormatBool(settings.Configured), "keyHint": settings.KeyHint}
-	}); err != nil {
+	unifiedPlugins, err := pluginsInternal.NewManagerWithCorePlugins(cfg.WorkspaceRoot, pluginsInternal.CorePluginRegistration{
+		Name: "web_search", DisplayName: "联网搜索", Tool: searchService.Tool(), Enabled: false,
+		Metadata: func() map[string]string {
+			settings := searchService.Settings()
+			return map[string]string{"provider": settings.Provider, "configured": strconv.FormatBool(settings.Configured), "keyHint": settings.KeyHint}
+		},
+	})
+	if err != nil {
 		return err
 	}
 	if providerService != nil {

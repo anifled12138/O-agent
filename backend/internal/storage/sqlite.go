@@ -299,6 +299,9 @@ CREATE UNIQUE INDEX idx_agent_turns_one_active ON agent_turns(conversation_id) W
 WHERE recovery_class='' AND status IN ('completed','failed','cancelled','interrupted','incomplete','needs_reconciliation')`); err != nil {
 		return err
 	}
+	if err := s.reclassifyLegacyReadOnlyTurns(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
