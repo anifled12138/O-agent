@@ -33,6 +33,74 @@ func Open(dataDir string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+func (s *Store) RuntimeSetting(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", domain.ErrNotFound
+	}
+	return value, err
+}
+
+func (s *Store) SetRuntimeSetting(ctx context.Context, key, value string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO runtime_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+		return err
+	}
+	var persisted string
+	if err = tx.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, key).Scan(&persisted); err != nil {
+		return err
+	}
+	if persisted != value {
+		return fmt.Errorf("runtime setting read-back mismatch for %q", key)
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	readBack, err := s.RuntimeSetting(ctx, key)
+	if err != nil {
+		return err
+	}
+	if readBack != value {
+		return fmt.Errorf("runtime setting read-back mismatch for %q after commit", key)
+	}
+	return nil
+}
+
+func (s *Store) DeleteRuntimeSetting(ctx context.Context, key string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `DELETE FROM runtime_settings WHERE key=?`, key); err != nil {
+		return err
+	}
+	var persisted string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, key).Scan(&persisted)
+	if !errors.Is(err, sql.ErrNoRows) {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("runtime setting %q still exists after deletion", key)
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	_, err = s.RuntimeSetting(ctx, key)
+	if errors.Is(err, domain.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("runtime setting %q still exists after commit", key)
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS users (

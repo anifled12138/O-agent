@@ -12,10 +12,8 @@ protocol.registerSchemesAsPrivileged([
 const development = !app.isPackaged;
 const repositoryRoot = path.resolve(__dirname, '..');
 app.name = 'O';
-app.disableHardwareAcceleration();
-app.commandLine.appendSwitch('disable-gpu');
-app.commandLine.appendSwitch('disable-software-rasterizer');
-app.commandLine.appendSwitch('in-process-gpu');
+// Keep Chromium's native mouse-wheel scrolling animated in the app's scroll areas.
+app.commandLine.appendSwitch('enable-smooth-scrolling');
 
 // Keep development state alongside the repository. Packaged releases use Electron's
 // stable per-user profile so moving or extracting the portable app cannot change its data root.

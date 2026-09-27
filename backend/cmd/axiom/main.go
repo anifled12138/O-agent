@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"axiom.local/agent/internal/scriptruntime"
 	"axiom.local/agent/internal/secure"
 	"axiom.local/agent/internal/storage"
+	"axiom.local/agent/internal/websearch"
 )
 
 func main() {
@@ -196,12 +198,26 @@ func run() error {
 		}
 	}()
 	providerService, _ := core.Service[*provider.Service](host, "providers")
+	vaultService, err := core.Service[*secure.Vault](host, "vault")
+	if err != nil {
+		return err
+	}
+	searchService, err := websearch.New(ctx, store, vaultService)
+	if err != nil {
+		return err
+	}
 	agentService, _ = core.Service[*agent.Service](host, "agent")
 	evolutionService, _ := core.Service[*evolution.Service](host, "evolution")
 	evalHarnessService, _ := core.Service[*evalharness.Service](host, "eval-harness")
 	bootstrapService, _ := core.Service[*bootstrap.Service](host, "bootstrap")
 	forgeService, _ := core.Service[*pluginforge.Service](host, "plugin-forge")
 	unifiedPlugins := pluginsInternal.NewManager(cfg.WorkspaceRoot)
+	if err := unifiedPlugins.RegisterCorePlugin("web_search", "联网搜索", searchService.Tool(), false, func() map[string]string {
+		settings := searchService.Settings()
+		return map[string]string{"provider": settings.Provider, "configured": strconv.FormatBool(settings.Configured), "keyHint": settings.KeyHint}
+	}); err != nil {
+		return err
+	}
 	if providerService != nil {
 		unifiedPlugins.SetProviderLister(func(ctx context.Context) ([]domain.Provider, error) {
 			return providerService.List(ctx, workspaceID)
@@ -213,7 +229,7 @@ func run() error {
 	if err := evalHarnessService.Recover(ctx, workspaceID); err != nil {
 		return err
 	}
-	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(workspaceID, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(workspaceID, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin, searchService).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErrors := make(chan error, 1)
 	go func() {
 		slog.Info("O ready", "address", "http://"+cfg.Addr, "data", absoluteData)

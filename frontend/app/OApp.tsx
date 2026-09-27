@@ -1892,7 +1892,7 @@ function Chat({
                       )}
                       {reconciliationRequired && (
                         <div className="message-reconciliation">
-                          <p>工具可能已经产生外部影响。先人工核对，再记录说明；确认后系统才允许你显式重跑。</p>
+                          <p>任务中断时有工具调用尚未返回结果，系统无法确认调用是否已生效。请先核对对应结果，再记录说明后重试；这条提示不代表插件未配置或未启用。</p>
                           {reconcileTurnId === messageTurn.id ? (
                             <>
                               <textarea value={reconcileNote} onChange={(event) => setReconcileNote(event.target.value)} maxLength={2000} aria-label="人工核对说明" placeholder="写明核对了哪些影响，以及为什么可以再次执行。" />
@@ -2183,19 +2183,20 @@ function Chat({
             </div>
             )}
 
-            <button
-              type="button"
-              className="composer-icon-button send-btn"
-              onClick={() => void submit()}
-              disabled={(!draft.trim() && attachments.length === 0) || !providers.length || submitting || permissionSaving}
-              title={active?.executionPaused && !sending ? '会话已暂停；发送新消息后继续' : sending ? '加入当前会话队列' : '发送'}
-              aria-label={active?.executionPaused && !sending ? '发送消息并继续已暂停的会话' : sending ? '加入消息队列' : '发送'}
-            >
-              {active?.executionPaused && !sending ? <Pause size={14} strokeWidth={2.2} /> : <ArrowUp size={15} strokeWidth={2.4} />}
-            </button>
-            {sending && (
+            {sending ? (
               <button type="button" className="composer-icon-button stop-btn" onClick={onCancel} title="停止会话并清空排队消息" aria-label="停止会话">
                 <Square size={12} fill="currentColor" strokeWidth={0} />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="composer-icon-button send-btn"
+                onClick={() => void submit()}
+                disabled={(!draft.trim() && attachments.length === 0) || !providers.length || submitting || permissionSaving}
+                title={active?.executionPaused ? '会话已暂停；发送新消息后继续' : '发送'}
+                aria-label={active?.executionPaused ? '发送消息并继续已暂停的会话' : '发送'}
+              >
+                {active?.executionPaused ? <Pause size={14} strokeWidth={2.2} /> : <ArrowUp size={15} strokeWidth={2.4} />}
               </button>
             )}
           </div>
@@ -2217,6 +2218,13 @@ function ActivityTrace({
 }) {
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [approvalError, setApprovalError] = useState('');
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [running]);
 
   const events = trace;
   const startedAt = turn?.startedAt || events[0]?.createdAt;
@@ -2229,6 +2237,30 @@ function ActivityTrace({
   });
   const approvalId = approvalRequest ? textDetail(approvalRequest.details, 'id') : '';
   const status = approvalRequest ? '等待授权' : running ? (turn?.status === 'cancelling' ? '正在停止' : '运行中') : turnStatusLabel(turn?.status || terminal?.kind || 'completed');
+  const metrics = asRecord(terminal?.details.metrics);
+  let eventTokenCount = 0;
+  let hasEventTokenCount = false;
+  for (const event of events) {
+    if (event.kind !== 'model.completed') continue;
+    const usage = asRecord(event.details.usage);
+    const total = typeof usage.totalTokens === 'number'
+      ? usage.totalTokens
+      : (typeof usage.promptTokens === 'number' ? usage.promptTokens : 0) + (typeof usage.completionTokens === 'number' ? usage.completionTokens : 0);
+    if (typeof usage.totalTokens === 'number' || typeof usage.promptTokens === 'number' || typeof usage.completionTokens === 'number') {
+      eventTokenCount += total;
+      hasEventTokenCount = true;
+    }
+  }
+  const hasTokenCount = typeof metrics.totalTokens === 'number' || hasEventTokenCount;
+  const tokenCount = typeof metrics.totalTokens === 'number' ? metrics.totalTokens : eventTokenCount;
+  const steps = events.reduce((max, event) => Math.max(max, typeof event.details.step === 'number' ? event.details.step : 0), 0);
+  const endTime = turn?.completedAt || terminal?.createdAt || events[events.length - 1]?.createdAt;
+  const endedAtMillis = endTime ? Date.parse(endTime) : Number.NaN;
+  const startedAtMillis = startedAt ? Date.parse(startedAt) : Number.NaN;
+  const elapsed = Number.isFinite(startedAtMillis)
+    ? Math.max(0, (running || !Number.isFinite(endedAtMillis) ? now : endedAtMillis) - startedAtMillis)
+    : 0;
+  const activity = activityHeadline(events, running, turn?.status || terminal?.kind || '', approvalRequest);
   const toolRuns = buildToolRuns(events);
 
   async function decideApproval(choice: 'approve' | 'deny') {
@@ -2252,15 +2284,21 @@ function ActivityTrace({
   return (
     <details className={`activity-trace ${running ? 'is-running' : ''}`} open={Boolean(approvalRequest)}>
       <summary>
-        <span className="run-summary-text">
-          {approvalRequest ? '等待权限批准' : running ? `${status} · 查看运行详情` : '运行详情'}
+        <span className="activity-summary-main">
+          {running && <span className="activity-live-dot" aria-hidden="true" />}
+          <span className="run-summary-text">{activity}</span>
+        </span>
+        <span className="activity-summary-stats">
+          <span>用时 {formatDuration(elapsed)}</span>
+          <span>{hasTokenCount ? `消耗 ${formatExactNumber(tokenCount)} tokens` : running ? 'Token 统计中' : 'Token 用量不可用'}</span>
+          <span>{steps} 步</span>
         </span>
         <ChevronDown size={14} strokeWidth={1.8} className="run-chevron" aria-hidden="true" />
       </summary>
       <div className="activity-trace-body">
         <div className="activity-trace-meta">
           <span>{startedAt ? `${formatClock(startedAt)} 开始` : '等待运行时事件'}</span>
-          <span>{status} · 运行详情保存在本地会话中</span>
+          <span>{status}</span>
         </div>
         {approvalRequest && (
           <section className="approval-request-card" aria-label="工具调用授权请求">
@@ -2367,28 +2405,31 @@ function ToolRunDetail({ run }: { run: ToolRun }) {
   const exitCode = typeof resultRecord.exitCode === 'number' ? resultRecord.exitCode : undefined;
 
   return (
-    <section className="tool-run">
-      <div className="tool-run-heading">
-        <span>{isShell ? 'Shell' : run.name}</span>
-        <small>第 {run.step || '—'} 步 · {run.ok === false ? '失败' : run.resultValue === undefined ? '运行中' : '完成'}{run.durationMillis !== undefined ? ` · ${formatDuration(run.durationMillis)}` : ''}</small>
+    <details className={`tool-run ${run.ok === false ? 'is-failed' : ''}`}>
+      <summary className="tool-run-summary">
+        <span className="tool-run-name">{isShell ? 'Shell' : run.name}</span>
+        <span className="tool-run-meta">第 {run.step || '—'} 步 · {run.ok === false ? '失败' : run.resultValue === undefined ? '运行中' : '完成'}{run.durationMillis !== undefined ? ` · ${formatDuration(run.durationMillis)}` : ''}</span>
+        <ChevronDown size={13} strokeWidth={1.8} className="tool-run-chevron" aria-hidden="true" />
+      </summary>
+      <div className="tool-run-body">
+        {isShell ? (
+          <>
+            {workdir && <div className="tool-workdir">工作目录 {workdir}</div>}
+            {command && <pre className="tool-command"><span aria-hidden="true">$ </span>{command}</pre>}
+            {stdout && <OutputBlock label="输出" value={stdout} />}
+            {stderr && <OutputBlock label="错误输出" value={stderr} tone="error" />}
+            {exitCode !== undefined && <div className={`tool-exit ${exitCode === 0 ? '' : 'error'}`}>退出码 {exitCode}{resultRecord.outTruncated === true ? ' · 输出已截断' : ''}</div>}
+            {!command && run.argumentsValue !== undefined && <OutputBlock label="参数" value={formatTraceValue(run.argumentsValue)} />}
+            {!stdout && !stderr && run.resultValue !== undefined && exitCode === undefined && <OutputBlock label="反馈" value={formatTraceValue(result)} />}
+          </>
+        ) : (
+          <>
+            {run.argumentsValue !== undefined && <OutputBlock label="参数" value={formatTraceValue(run.argumentsValue)} />}
+            {run.resultValue !== undefined && <OutputBlock label="反馈" value={formatTraceValue(result)} tone={run.ok === false ? 'error' : undefined} />}
+          </>
+        )}
       </div>
-      {isShell ? (
-        <>
-          {workdir && <div className="tool-workdir">工作目录 {workdir}</div>}
-          {command && <pre className="tool-command"><span aria-hidden="true">$ </span>{command}</pre>}
-          {stdout && <OutputBlock label="输出" value={stdout} />}
-          {stderr && <OutputBlock label="错误输出" value={stderr} tone="error" />}
-          {exitCode !== undefined && <div className={`tool-exit ${exitCode === 0 ? '' : 'error'}`}>退出码 {exitCode}{resultRecord.outTruncated === true ? ' · 输出已截断' : ''}</div>}
-          {!command && run.argumentsValue !== undefined && <OutputBlock label="参数" value={formatTraceValue(run.argumentsValue)} />}
-          {!stdout && !stderr && run.resultValue !== undefined && exitCode === undefined && <OutputBlock label="反馈" value={formatTraceValue(result)} />}
-        </>
-      ) : (
-        <>
-          {run.argumentsValue !== undefined && <OutputBlock label="参数" value={formatTraceValue(run.argumentsValue)} />}
-          {run.resultValue !== undefined && <OutputBlock label="反馈" value={formatTraceValue(result)} tone={run.ok === false ? 'error' : undefined} />}
-        </>
-      )}
-    </section>
+    </details>
   );
 }
 
@@ -2436,6 +2477,54 @@ function turnStatusLabel(status: string) {
   return labels[status] || '已结束';
 }
 
+function activityHeadline(events: TraceEvent[], running: boolean, turnStatus: string, approvalRequest?: TraceEvent) {
+  if (approvalRequest) {
+    const toolName = textDetail(approvalRequest.details, 'toolName');
+    return toolName ? `等待批准 · ${toolName}` : '等待权限批准';
+  }
+
+  const terminal = [...events].reverse().find((event) => event.kind.startsWith('turn.') && event.kind !== 'turn.started' && event.kind !== 'turn.cancel_requested');
+  if (terminal) {
+    if (terminal.kind === 'turn.completed') return '已完成';
+    if (terminal.kind === 'turn.cancelled' || terminal.kind === 'turn.interrupted') return '已暂停';
+    if (terminal.kind === 'turn.failed') return '运行失败';
+    if (terminal.kind === 'turn.incomplete') return '本轮结束，任务未完成';
+    if (terminal.kind === 'turn.needs_reconciliation') return '需要核对工具影响';
+  }
+  if (!running) {
+    if (turnStatus === 'completed') return '已完成';
+    if (turnStatus === 'failed') return '运行失败';
+    if (turnStatus === 'cancelled' || turnStatus === 'interrupted') return '已暂停';
+    return '运行详情';
+  }
+
+  const latest = events[events.length - 1];
+  if (!latest) return '正在启动 Agent';
+  switch (latest.kind) {
+    case 'turn.started': return '正在准备任务';
+    case 'planner.requested': return '正在生成执行计划';
+    case 'planner.completed': return '执行计划已就绪';
+    case 'model.requested':
+    case 'model.started': return '正在请求模型';
+    case 'model.completed':
+      return (typeof latest.details.toolCallCount === 'number' && latest.details.toolCallCount > 0)
+        ? '模型已生成工具调用，正在执行'
+        : '模型已返回，正在整理回复';
+    case 'tools.dispatched': {
+      const toolCount = typeof latest.details.toolCallCount === 'number' ? latest.details.toolCallCount : 0;
+      return toolCount > 0 ? `正在执行 ${toolCount} 个工具` : '正在执行工具';
+    }
+    case 'tool.started': return `正在调用 ${textDetail(latest.details, 'name') || '工具'}`;
+    case 'tool.completed': return `${textDetail(latest.details, 'name') || '工具'} 已完成，模型正在继续`;
+    case 'tools.completed': return '工具已完成，正在整理结果';
+    case 'context.compacted': return '正在整理对话上下文';
+    case 'model.failed':
+    case 'planner.failed': return '模型调用失败';
+    case 'tool.authorization_denied': return '工具调用被权限规则拦截';
+    default: return '模型正在处理请求';
+  }
+}
+
 function permissionProfileLabel(profile: ConversationPermissionProfile) {
   if (profile === 'read_only') return '只读';
   if (profile === 'ask_on_sensitive') return '写入前询问';
@@ -2465,6 +2554,10 @@ function formatDuration(milliseconds: number) {
 
 function formatCompactNumber(value: number) {
   return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
+
+function formatExactNumber(value: number) {
+  return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(value)));
 }
 
 function formatClock(value: string) {

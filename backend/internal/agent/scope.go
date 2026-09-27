@@ -185,6 +185,14 @@ func (s *turnScope) authorizeTool(name string, arguments json.RawMessage) (permi
 		request.Source, request.Effect = "plugin_lifecycle", permissions.EffectSensitive
 	case "axiom_compact_context":
 		request.Source, request.Effect = "host", permissions.EffectSensitive
+	case "web_search":
+		request.Source = "plugin"
+		request.PluginID = "core:web_search"
+		request.ReleaseID = "builtin.web-search.v1"
+		request.Resource = "Exa Search API"
+		request.Effect = permissions.EffectExternalRead
+		request.Reason = "联网搜索会把查询词发送到 Exa Search API，并由该服务处理后返回网页结果。"
+		request.Impact = "查询词会离开本机；请勿搜索密码、API Key 或私人内容。"
 	default:
 		if _, ok := s.coreTools[name]; ok {
 			// Only explicit core read tools are allow-listed above. Any new core tool

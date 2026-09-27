@@ -421,8 +421,8 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 		{
 			Definition: toolDef(
 				"grep_search",
-				"Search workspace files using a regular expression. Large result sets are stored as run-scoped temporary artifacts and can be paged with fs_read; artifacts retain at most the first 10000 matches.",
-				`{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Regex search pattern; maximum 4 KiB"},"path":{"type":"string","description":"Relative directory or specific file path to search"},"maxMatches":{"type":"integer","description":"Maximum snippets to return directly in context (default 30, max 100)"},"includeIgnored":{"type":"boolean","description":"Whether to include .git and node_modules (default false)"}},"additionalProperties":false}`,
+				"Search workspace files using a regular expression. Skips .git, node_modules, .pnpm-store, and symbolic links by default; explicitly targeted paths can include ignored directories but symbolic links are never followed. Large result sets are stored as run-scoped temporary artifacts and can be paged with fs_read; artifacts retain at most the first 10000 matches.",
+				`{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Regex search pattern; maximum 4 KiB"},"path":{"type":"string","description":"Relative directory or specific file path to search"},"maxMatches":{"type":"integer","description":"Maximum snippets to return directly in context (default 30, max 100)"},"includeIgnored":{"type":"boolean","description":"Whether to include .git, node_modules, and .pnpm-store (default false)"}},"additionalProperties":false}`,
 			),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var p struct {
@@ -471,10 +471,16 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 					if err != nil {
 						return err
 					}
+					// filepath.Walk uses Lstat and does not follow symlinks. On Windows,
+					// reading a symlink to a directory as a file fails with ERROR_INVALID_FUNCTION.
+					// Skip all symlinks to avoid that error and prevent escaping the workspace.
+					if info.Mode()&os.ModeSymlink != 0 {
+						return nil
+					}
 					if info.IsDir() {
 						name := info.Name()
 						if !p.IncludeIgnored && !isExplicitTarget {
-							if name == ".git" || name == "node_modules" {
+							if name == ".git" || name == "node_modules" || name == ".pnpm-store" {
 								return filepath.SkipDir
 							}
 						}

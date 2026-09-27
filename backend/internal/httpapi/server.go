@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -29,6 +30,7 @@ import (
 	"axiom.local/agent/internal/plugins"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/storage"
+	"axiom.local/agent/internal/websearch"
 )
 
 type Server struct {
@@ -41,11 +43,16 @@ type Server struct {
 	forge          *pluginforge.Service
 	store          *storage.Store
 	plugins        *core.Manager
+	webSearch      *websearch.Service
 	frontendOrigin string
 }
 
-func New(workspaceID string, providerService *provider.Service, agentService *agent.Service, evolutionService *evolution.Service, evalService *evalharness.Service, bootstrapService *bootstrap.Service, forgeService *pluginforge.Service, store *storage.Store, plugins *core.Manager, origin string) *Server {
-	return &Server{workspaceID: workspaceID, providers: providerService, agent: agentService, evolution: evolutionService, evals: evalService, bootstrap: bootstrapService, forge: forgeService, store: store, plugins: plugins, frontendOrigin: strings.TrimRight(origin, "/")}
+func New(workspaceID string, providerService *provider.Service, agentService *agent.Service, evolutionService *evolution.Service, evalService *evalharness.Service, bootstrapService *bootstrap.Service, forgeService *pluginforge.Service, store *storage.Store, plugins *core.Manager, origin string, searchServices ...*websearch.Service) *Server {
+	var searchService *websearch.Service
+	if len(searchServices) > 0 {
+		searchService = searchServices[0]
+	}
+	return &Server{workspaceID: workspaceID, providers: providerService, agent: agentService, evolution: evolutionService, evals: evalService, bootstrap: bootstrapService, forge: forgeService, store: store, plugins: plugins, webSearch: searchService, frontendOrigin: strings.TrimRight(origin, "/")}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -55,6 +62,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/plugins", s.unifiedPluginList)
 	mux.HandleFunc("POST /api/v1/plugins/{id}/toggle", s.unifiedPluginToggle)
 	mux.HandleFunc("POST /api/v1/plugins/reload", s.unifiedPluginReload)
+	mux.HandleFunc("GET /api/v1/plugins/web-search/settings", s.webSearchSettings)
+	mux.HandleFunc("PUT /api/v1/plugins/web-search/settings", s.webSearchSaveSettings)
+	mux.HandleFunc("DELETE /api/v1/plugins/web-search/settings", s.webSearchClearSettings)
+	mux.HandleFunc("POST /api/v1/plugins/web-search/test", s.webSearchTest)
 	mux.HandleFunc("POST /api/v1/plugins/mcp", s.unifiedPluginAddMCP)
 	mux.HandleFunc("DELETE /api/v1/plugins/mcp/{id}", s.unifiedPluginRemoveMCP)
 	mux.HandleFunc("GET /api/v1/provider-kinds", s.providerKinds)
@@ -1310,6 +1321,10 @@ func (s *Server) unifiedPluginToggle(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusBadRequest, map[string]string{"error": "explicitly confirm starting this MCP server"})
 		return
 	}
+	if id == "core:web_search" && req.Enabled && (s.webSearch == nil || !s.webSearch.Configured()) {
+		write(w, http.StatusConflict, map[string]string{"error": "请先在联网搜索插件设置中保存 Exa API Key"})
+		return
+	}
 	if err := s.agent.Plugins().Toggle(id, req.Enabled); err != nil {
 		fail(w, err)
 		return
@@ -1342,6 +1357,72 @@ func (s *Server) unifiedPluginReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusOK, s.agent.Plugins().List())
+}
+
+func (s *Server) webSearchSettings(w http.ResponseWriter, _ *http.Request) {
+	if s.webSearch == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "联网搜索插件尚未初始化"})
+		return
+	}
+	write(w, http.StatusOK, s.webSearch.Settings())
+}
+
+func (s *Server) webSearchSaveSettings(w http.ResponseWriter, r *http.Request) {
+	if s.webSearch == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "联网搜索插件尚未初始化"})
+		return
+	}
+	var req struct {
+		APIKey string `json:"apiKey"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if err := s.webSearch.SaveAPIKey(r.Context(), req.APIKey); err != nil {
+		if errors.Is(err, domain.ErrInvalid) {
+			write(w, http.StatusBadRequest, map[string]string{"error": "API Key 无效，请粘贴完整密钥（8 到 4096 个字符）"})
+			return
+		}
+		fail(w, err)
+		return
+	}
+	settings := s.webSearch.Settings()
+	if !settings.Configured {
+		write(w, http.StatusConflict, map[string]string{"error": "API Key 已提交，但配置读回未确认"})
+		return
+	}
+	write(w, http.StatusOK, settings)
+}
+
+func (s *Server) webSearchClearSettings(w http.ResponseWriter, r *http.Request) {
+	if s.webSearch == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "联网搜索插件尚未初始化"})
+		return
+	}
+	if s.agent != nil && s.agent.Plugins() != nil && s.agent.Plugins().IsCoreToolEnabled("web_search") {
+		write(w, http.StatusConflict, map[string]string{"error": "请先停用联网搜索插件，再移除密钥"})
+		return
+	}
+	if err := s.webSearch.ClearAPIKey(r.Context()); err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, s.webSearch.Settings())
+}
+
+func (s *Server) webSearchTest(w http.ResponseWriter, r *http.Request) {
+	if s.webSearch == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "联网搜索插件尚未初始化"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	count, err := s.webSearch.Test(ctx)
+	if err != nil {
+		write(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"passed": true, "resultCount": count, "settings": s.webSearch.Settings()})
 }
 
 func (s *Server) unifiedPluginAddMCP(w http.ResponseWriter, r *http.Request) {

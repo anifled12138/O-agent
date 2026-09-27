@@ -58,6 +58,31 @@ export interface McpServerConfig {
   enabled?: boolean;
 }
 
+export interface WebSearchPluginSettings {
+  provider: string;
+  configured: boolean;
+  keyHint?: string;
+}
+
+export async function getWebSearchPluginSettings(): Promise<WebSearchPluginSettings> {
+  return request<WebSearchPluginSettings>('/plugins/web-search/settings');
+}
+
+export async function saveWebSearchPluginSettings(apiKey: string): Promise<WebSearchPluginSettings> {
+  return request<WebSearchPluginSettings>('/plugins/web-search/settings', {
+    method: 'PUT',
+    body: JSON.stringify({ apiKey }),
+  });
+}
+
+export async function clearWebSearchPluginSettings(): Promise<WebSearchPluginSettings> {
+  return request<WebSearchPluginSettings>('/plugins/web-search/settings', { method: 'DELETE' });
+}
+
+export async function testWebSearchPlugin(): Promise<{ passed: boolean; resultCount: number; settings: WebSearchPluginSettings }> {
+  return request('/plugins/web-search/test', { method: 'POST', body: '{}' });
+}
+
 export async function getUnifiedPlugins(): Promise<UnifiedPlugin[]> {
   return request<UnifiedPlugin[]>('/plugins');
 }

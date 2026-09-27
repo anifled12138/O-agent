@@ -1,14 +1,19 @@
 'use client';
 
 import { FormEvent, useCallback, useEffect, useState } from 'react';
-import { X, Plus } from 'lucide-react';
+import { X, Plus, KeyRound, Check, Trash2 } from 'lucide-react';
 import {
   UnifiedPlugin,
   McpServerConfig,
+  WebSearchPluginSettings,
   getUnifiedPlugins,
   toggleUnifiedPlugin,
   addMcpServerConfig,
   removeMcpServerConfig,
+  getWebSearchPluginSettings,
+  saveWebSearchPluginSettings,
+  clearWebSearchPluginSettings,
+  testWebSearchPlugin,
 } from './api';
 import { useDialogA11y } from './useDialogA11y';
 
@@ -38,6 +43,13 @@ export default function UnifiedPluginCenter({
   const [enableConfirmationMcp, setEnableConfirmationMcp] = useState('');
   const [enableMcpConsent, setEnableMcpConsent] = useState(false);
   const [mcpLaunchConsent, setMcpLaunchConsent] = useState(false);
+  const [showWebSearchSettings, setShowWebSearchSettings] = useState(false);
+  const [webSearchSettings, setWebSearchSettings] = useState<WebSearchPluginSettings | null>(null);
+  const [webSearchApiKey, setWebSearchApiKey] = useState('');
+  const [webSearchBusy, setWebSearchBusy] = useState('');
+  const [webSearchError, setWebSearchError] = useState('');
+  const [webSearchMessage, setWebSearchMessage] = useState('');
+  const [confirmWebSearchClear, setConfirmWebSearchClear] = useState(false);
 
   // Form states for adding MCP
   const [mcpId, setMcpId] = useState('');
@@ -49,6 +61,12 @@ export default function UnifiedPluginCenter({
   const closeAddMcp = useCallback(() => {
     setShowAddMcp(false);
     setMcpLaunchConsent(false);
+  }, []);
+
+  const closeWebSearchSettings = useCallback(() => {
+    setShowWebSearchSettings(false);
+    setWebSearchApiKey('');
+    setConfirmWebSearchClear(false);
   }, []);
 
   const loadPlugins = useCallback(async () => {
@@ -80,16 +98,17 @@ export default function UnifiedPluginCenter({
   // Handle Escape key specifically for the sub-modal to avoid closing parent
   useEffect(() => {
     function handleSubModalKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape' && showAddMcp) {
+      if (e.key === 'Escape' && (showAddMcp || showWebSearchSettings)) {
         e.stopPropagation();
-        closeAddMcp();
+        if (showAddMcp) closeAddMcp();
+        else closeWebSearchSettings();
       }
     }
-    if (showAddMcp) {
+    if (showAddMcp || showWebSearchSettings) {
       window.addEventListener('keydown', handleSubModalKeyDown, true);
       return () => window.removeEventListener('keydown', handleSubModalKeyDown, true);
     }
-  }, [showAddMcp, closeAddMcp]);
+  }, [showAddMcp, showWebSearchSettings, closeAddMcp, closeWebSearchSettings]);
 
   async function handleToggle(p: UnifiedPlugin) {
     const nextState = p.status !== 'enabled';
@@ -179,6 +198,102 @@ export default function UnifiedPluginCenter({
       setError(err instanceof Error ? err.message : '删除 MCP 服务失败');
     } finally {
       setBusy('');
+    }
+  }
+
+  async function openWebSearchSettings() {
+    setWebSearchError('');
+    setWebSearchMessage('');
+    setWebSearchApiKey('');
+    setConfirmWebSearchClear(false);
+    setWebSearchBusy('load');
+    try {
+      setWebSearchSettings(await getWebSearchPluginSettings());
+      setShowWebSearchSettings(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '读取联网搜索配置失败');
+    } finally {
+      setWebSearchBusy('');
+    }
+  }
+
+  async function handleSaveWebSearchSettings(event: FormEvent) {
+    event.preventDefault();
+    if (!webSearchApiKey.trim()) {
+      setWebSearchError('请填写 Exa API Key。');
+      return;
+    }
+    setWebSearchBusy('save');
+    setWebSearchError('');
+    setWebSearchMessage('');
+    try {
+      const saved = await saveWebSearchPluginSettings(webSearchApiKey.trim());
+      if (!saved.configured) throw new Error('服务端未确认 API Key 已保存');
+      setWebSearchSettings(saved);
+      setWebSearchApiKey('');
+      setWebSearchMessage(`密钥已在本机加密保存${saved.keyHint ? `（${saved.keyHint}）` : ''}。`);
+      let data: UnifiedPlugin[];
+      try {
+        data = await loadPlugins();
+      } catch (refreshError) {
+        setWebSearchError(`密钥已保存，但插件目录读取失败：${refreshError instanceof Error ? refreshError.message : '请关闭后重新打开插件中心'}`);
+        return;
+      }
+      if (data.find((item) => item.id === 'core:web_search')?.metadata?.configured !== 'true') {
+        setWebSearchError('密钥已保存，但插件目录没有读回配置状态；请关闭后重新打开插件中心。');
+      }
+    } catch (err) {
+      setWebSearchError(err instanceof Error ? err.message : '保存联网搜索配置失败');
+    } finally {
+      setWebSearchBusy('');
+    }
+  }
+
+  async function handleTestWebSearch() {
+    setWebSearchBusy('test');
+    setWebSearchError('');
+    setWebSearchMessage('');
+    try {
+      const result = await testWebSearchPlugin();
+      if (!result.passed || !result.settings.configured) throw new Error('Exa Search 尚未确认可用');
+      setWebSearchSettings(result.settings);
+      setWebSearchMessage(`连接正常，返回 ${result.resultCount} 条测试结果。此次测试消耗了一次搜索请求和相应的内容额度。`);
+    } catch (err) {
+      setWebSearchError(err instanceof Error ? err.message : '联网搜索连接测试失败');
+    } finally {
+      setWebSearchBusy('');
+    }
+  }
+
+  async function handleClearWebSearchKey() {
+    const pluginEnabled = plugins.find((item) => item.id === 'core:web_search')?.status === 'enabled';
+    if (pluginEnabled) {
+      setWebSearchError('请先停用联网搜索插件，再移除密钥。');
+      return;
+    }
+    if (!confirmWebSearchClear) {
+      setConfirmWebSearchClear(true);
+      setWebSearchMessage('再次点击“确认移除密钥”以删除本机保存的密钥。');
+      return;
+    }
+    setWebSearchBusy('clear');
+    setWebSearchError('');
+    setWebSearchMessage('');
+    try {
+      const cleared = await clearWebSearchPluginSettings();
+      if (cleared.configured) throw new Error('服务端仍报告密钥已配置');
+      setWebSearchSettings(cleared);
+      setConfirmWebSearchClear(false);
+      setWebSearchMessage('本机保存的 API Key 已移除。');
+      try {
+        await loadPlugins();
+      } catch (refreshError) {
+        setWebSearchError(`密钥已移除，但插件目录读取失败：${refreshError instanceof Error ? refreshError.message : '请关闭后重新打开插件中心'}`);
+      }
+    } catch (err) {
+      setWebSearchError(err instanceof Error ? err.message : '移除联网搜索密钥失败');
+    } finally {
+      setWebSearchBusy('');
     }
   }
 
@@ -316,7 +431,9 @@ export default function UnifiedPluginCenter({
             <div className="upc-grid">
               {filteredPlugins.map((p) => {
                 const isEnabled = p.status === 'enabled';
-                const statusLabel = p.status === 'error' ? '运行异常' : isEnabled ? '已启用' : '已停用';
+                const isWebSearch = p.id === 'core:web_search';
+                const webSearchConfigured = p.metadata?.configured === 'true';
+                const statusLabel = isWebSearch && !webSearchConfigured ? '待配置' : p.status === 'error' ? '运行异常' : isEnabled ? '已启用' : '已停用';
                 const typeLabel =
                   p.type === 'core'
                     ? 'Core 工具'
@@ -337,7 +454,7 @@ export default function UnifiedPluginCenter({
                         aria-label={`${p.name}，当前状态：${statusLabel}`}
                         aria-busy={busy === ('toggle:' + p.id)}
                         onClick={() => handleToggle(p)}
-                        disabled={busy === ('toggle:' + p.id)}
+                        disabled={busy === ('toggle:' + p.id) || (isWebSearch && !webSearchConfigured)}
                         className={'upc-toggle ' + (isEnabled ? 'enabled' : '')}
                       >
                         {busy === ('toggle:' + p.id) ? '…' : statusLabel}
@@ -352,6 +469,18 @@ export default function UnifiedPluginCenter({
                     </div>
 
                     <p className="upc-card-desc">{p.description || '暂无详细描述'}</p>
+
+                    {isWebSearch && (
+                      <div className="upc-card-footer">
+                        <span style={{ fontSize: 11, color: '#9ca3af' }}>
+                          {webSearchConfigured ? `API Key 已配置${p.metadata?.keyHint ? ` · ${p.metadata.keyHint}` : ''}` : '需要 Exa API Key'}
+                        </span>
+                        <button type="button" className="upc-btn-secondary" onClick={() => void openWebSearchSettings()} disabled={webSearchBusy === 'load'}>
+                          <KeyRound size={13} aria-hidden="true" />
+                          {webSearchConfigured ? '设置' : '配置'}
+                        </button>
+                      </div>
+                    )}
 
                     {p.status === 'error' && (
                       <div className="upc-notice error" role="status">
@@ -508,6 +637,94 @@ export default function UnifiedPluginCenter({
                   <button type="submit" disabled={busy === 'add-mcp' || !mcpLaunchConsent} className="upc-btn-primary">
                     {busy === 'add-mcp' ? '正在连接…' : '添加并连接'}
                   </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+        {showWebSearchSettings && (
+          <div
+            className="upc-backdrop"
+            style={{ zIndex: 110 }}
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) closeWebSearchSettings();
+            }}
+          >
+            <div
+              className="upc-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="web-search-settings-title"
+              tabIndex={-1}
+              style={{ width: 'min(500px, 95vw)', height: 'auto', maxHeight: '88vh', padding: 24, gap: 16 }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+                <div>
+                  <div className="eyebrow">WEB SEARCH PLUGIN</div>
+                  <h3 id="web-search-settings-title" className="upc-title" style={{ margin: 0 }}>联网搜索 · Exa</h3>
+                </div>
+                <button type="button" onClick={closeWebSearchSettings} className="upc-btn-close" aria-label="关闭联网搜索设置">
+                  <X size={18} strokeWidth={2} aria-hidden="true" />
+                </button>
+              </div>
+
+              <div style={{ color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.6 }}>
+                <p style={{ margin: '0 0 8px' }}>
+                  Exa Starter 目前提供注册赠送 $20 和每月 $10 免费额度，官方标注无需绑定付款方式。联网搜索时，查询词会发送给 Exa；搜索结果作为外部内容交给 Agent。
+                </p>
+                <p style={{ margin: 0 }}>
+                  当前 Search 起价为每 1,000 次请求 $7；内容选项可能另计。免费额度用完后是否继续付费取决于 Exa 账户套餐和付款设置。<a href="https://exa.ai/pricing" target="_blank" rel="noreferrer">查看当前价格</a>
+                </p>
+                <p style={{ margin: '8px 0 0' }}>
+                  启用插件后，Agent 才会获得搜索工具；会话权限仍单独生效。“工作区自动”会逐次询问外部搜索，“完全自动”才会直接搜索。这个确认不是 API Key 配置状态。
+                </p>
+              </div>
+
+              {webSearchSettings?.configured && (
+                <div className="upc-notice" style={{ background: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0', margin: 0 }}>
+                  <span>已在本机加密保存 {webSearchSettings.keyHint || 'API Key'}。</span>
+                  <Check size={14} aria-hidden="true" />
+                </div>
+              )}
+
+              <form onSubmit={handleSaveWebSearchSettings} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12 }}>
+                  Exa API Key
+                  <input
+                    type="password"
+                    value={webSearchApiKey}
+                    onChange={(event) => setWebSearchApiKey(event.target.value)}
+                    placeholder={webSearchSettings?.configured ? '输入新 Key 以替换当前 Key' : '粘贴 Exa API Key'}
+                    autoComplete="new-password"
+                    required
+                    className="upc-input"
+                  />
+                  <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
+                    从 <a href="https://dashboard.exa.ai" target="_blank" rel="noreferrer">Exa 控制台</a>创建。Key 会加密存储在本机，不会返回到页面。
+                  </span>
+                </label>
+
+                {webSearchError && <div className="upc-notice error" role="alert" style={{ margin: 0 }}>{webSearchError}</div>}
+                {webSearchMessage && <div className="upc-notice" role="status" style={{ background: '#f5f5f4', color: 'var(--text-muted)', margin: 0 }}>{webSearchMessage}</div>}
+                <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>测试连接会发起一次真实搜索并扣除搜索和内容额度；免费额度耗尽后是否收费取决于 Exa 账户设置。</span>
+
+                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginTop: 4 }}>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    {webSearchSettings?.configured && (
+                      <button type="button" onClick={() => void handleClearWebSearchKey()} disabled={webSearchBusy !== ''} className="upc-btn-secondary" style={{ color: '#b91c1c' }}>
+                        {confirmWebSearchClear ? '确认移除密钥' : <><Trash2 size={13} aria-hidden="true" />移除密钥</>}
+                      </button>
+                    )}
+                    <button type="button" onClick={() => void handleTestWebSearch()} disabled={!webSearchSettings?.configured || webSearchBusy !== ''} className="upc-btn-secondary">
+                      {webSearchBusy === 'test' ? '正在测试…' : '测试连接'}
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button type="button" onClick={closeWebSearchSettings} className="upc-btn-secondary">关闭</button>
+                    <button type="submit" disabled={webSearchBusy === 'save' || !webSearchApiKey.trim()} className="upc-btn-primary">
+                      {webSearchBusy === 'save' ? '正在保存…' : '保存密钥'}
+                    </button>
+                  </div>
                 </div>
               </form>
             </div>
