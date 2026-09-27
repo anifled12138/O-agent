@@ -423,8 +423,8 @@ func applyAccessGrants(paths []accessPath, sid *windows.SID) ([]accessGrant, err
 
 func newCleanupJournal(profile *appContainerProfile, paths []accessPath) (cleanupJournal, error) {
 	sid := profile.sid.String()
-	var created windows.Filetime
-	if err := windows.GetProcessTimes(windows.CurrentProcess(), &created, nil, nil, nil); err != nil {
+	created, err := processCreationTime(windows.CurrentProcess())
+	if err != nil {
 		return cleanupJournal{}, fmt.Errorf("read host process creation time: %w", err)
 	}
 	processStart := uint64(created.HighDateTime)<<32 | uint64(created.LowDateTime)
@@ -640,14 +640,21 @@ func journalOwnerAlive(pid int, expectedStart uint64) (bool, error) {
 		}
 		return false, err
 	}
-	var created windows.Filetime
-	timeErr := windows.GetProcessTimes(process, &created, nil, nil, nil)
+	created, timeErr := processCreationTime(process)
 	closeErr := windows.CloseHandle(process)
 	if timeErr != nil || closeErr != nil {
 		return false, errors.Join(timeErr, closeErr)
 	}
 	actualStart := uint64(created.HighDateTime)<<32 | uint64(created.LowDateTime)
 	return actualStart == expectedStart, nil
+}
+
+func processCreationTime(process windows.Handle) (windows.Filetime, error) {
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(process, &created, &exited, &kernel, &user); err != nil {
+		return windows.Filetime{}, err
+	}
+	return created, nil
 }
 
 func deleteAppContainerProfile(name string) error {
