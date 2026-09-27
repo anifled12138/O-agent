@@ -15,7 +15,6 @@ import (
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/permissions"
 	"axiom.local/agent/internal/pluginforge"
-	"axiom.local/agent/internal/plugins"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/runfiles"
 )
@@ -28,13 +27,25 @@ type capabilityCandidate struct {
 	Visibility       string   `json:"visibility"`
 	ReleaseID        string   `json:"releaseId,omitempty"`
 	FunctionName     string   `json:"functionName,omitempty"`
-	AlreadyAvailable bool     `json:"alreadyAvailable,omitempty"`
+	AlreadyAvailable *bool    `json:"alreadyAvailable,omitempty"`
 	Score            int      `json:"-"`
 }
 
 type loadedTool struct {
 	Capability pluginforge.CapabilityBinding
 	Definition provider.ToolDefinition
+}
+
+type turnTool struct {
+	ID               string
+	FunctionName     string
+	Summary          string
+	Tags             []string
+	Visibility       string
+	ReleaseID        string
+	AlreadyAvailable bool
+	Definition       provider.ToolDefinition
+	Binding          *pluginforge.CapabilityBinding
 }
 
 type turnScope struct {
@@ -46,6 +57,7 @@ type turnScope struct {
 	lease             pluginforge.TurnLease
 	runFiles          *runfiles.Scope
 	coreTools         map[string]coretools.Tool
+	activeTools       map[string]provider.ToolDefinition
 	forceCompact      bool
 	tools             map[string]pluginforge.CapabilityBinding
 	skills            map[string]pluginforge.SkillBinding
@@ -79,7 +91,7 @@ func newScopedTurn(owner *Service, userID, conversationID, turnID string, evalua
 	if evaluation {
 		creator = map[string]provider.ToolDefinition{}
 	}
-	scope := &turnScope{owner: owner, userID: userID, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, runFiles: runFiles, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}, coreTools: map[string]coretools.Tool{}}
+	scope := &turnScope{owner: owner, userID: userID, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, runFiles: runFiles, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}, coreTools: map[string]coretools.Tool{}, activeTools: map[string]provider.ToolDefinition{}}
 	if evaluation {
 		scope.permissionProfile = domain.PermissionProfileReadOnly
 	} else {
@@ -88,6 +100,13 @@ func newScopedTurn(owner *Service, userID, conversationID, turnID string, evalua
 	if owner != nil {
 		for _, ct := range coretools.GetCoreTools(owner.workspaceRoot, runFiles) {
 			scope.coreTools[ct.Definition.Function.Name] = ct
+		}
+		if owner.plugins != nil {
+			for _, definition := range owner.plugins.ActiveTools() {
+				if name := strings.TrimSpace(definition.Function.Name); name != "" {
+					scope.activeTools[name] = definition
+				}
+			}
 		}
 	}
 	for _, binding := range lease.Capabilities() {
@@ -266,8 +285,8 @@ func (s *turnScope) Close() error {
 
 func (s *turnScope) definitions() []provider.ToolDefinition {
 	result := []provider.ToolDefinition{
-		tool("axiom_capability_search", "Search installed plugin tools, lazy skills, and active core tools. Core-tool results include functionName and are already callable; only lazy plugin tools and skills need axiom_capability_load.", `{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}`),
-		tool("axiom_capability_load", "Load one lazy plugin tool or skill from search results. Core-tool results are already callable by their functionName and need no load.", `{"type":"object","required":["capabilityId"],"properties":{"capabilityId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_capability_search", "Search tools and skills available to this turn. Tool results use kind=tool and include alreadyAvailable. Call functionName directly when alreadyAvailable is true; otherwise load the result with axiom_capability_load first.", `{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"additionalProperties":false}`),
+		tool("axiom_capability_load", "Load a lazy tool or skill from capability search results. If a tool result has alreadyAvailable=true, call its functionName directly without loading. A loaded tool result includes its functionName and input schema for this turn.", `{"type":"object","required":["capabilityId"],"properties":{"capabilityId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_tool_usage_metrics", "Read aggregated durable tool usage, failures, permission decisions, approvals, timing, and context compaction metrics over the recent time window. Use this to identify tools or context flows that may need investigation; metrics do not change tool code or permissions.", `{"type":"object","properties":{"days":{"type":"integer","minimum":1,"maximum":365,"default":30}},"additionalProperties":false}`),
 	}
 	if s.owner != nil && s.owner.plugins != nil && s.owner.plugins.IsContextCompactorEnabled() {
@@ -276,15 +295,12 @@ func (s *turnScope) definitions() []provider.ToolDefinition {
 	if !s.evaluation {
 		result = append(result, fragmentTools()...)
 	}
-	for _, item := range s.loaded {
-		result = append(result, item.Definition)
-	}
 	for _, item := range s.loadedCreate {
 		result = append(result, item)
 	}
-	if s.owner != nil && s.owner.plugins != nil {
-		for _, at := range s.owner.plugins.ActiveTools() {
-			result = append(result, at)
+	for _, item := range s.toolCatalog() {
+		if item.AlreadyAvailable {
+			result = append(result, item.Definition)
 		}
 	}
 	for name, manifest := range s.loadedCapsules {
@@ -295,6 +311,38 @@ func (s *turnScope) definitions() []provider.ToolDefinition {
 		result = append(result, definition)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Function.Name < result[j].Function.Name })
+	return result
+}
+
+// toolCatalog is the turn-scoped, source-neutral view used by discovery,
+// loading, and model-visible function definitions. Provider-specific details
+// stay behind the binding and dispatcher fields.
+func (s *turnScope) toolCatalog() []turnTool {
+	result := make([]turnTool, 0, len(s.activeTools)+len(s.tools))
+	for functionName, definition := range s.activeTools {
+		result = append(result, turnTool{
+			ID: "tool:" + functionName, FunctionName: functionName,
+			Summary: definition.Function.Description, Visibility: "direct",
+			AlreadyAvailable: true, Definition: definition,
+		})
+	}
+	for id, binding := range s.tools {
+		if binding.Visibility == "none" {
+			continue
+		}
+		item := turnTool{
+			ID: id, Summary: binding.Summary, Tags: binding.Tags,
+			Visibility: binding.Visibility, ReleaseID: binding.ReleaseID,
+			Binding: &binding,
+		}
+		if functionName := s.loadedByID[id]; functionName != "" {
+			item.FunctionName = functionName
+			item.AlreadyAvailable = true
+			item.Definition = s.loaded[functionName].Definition
+		}
+		result = append(result, item)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 	return result
 }
 
@@ -426,12 +474,14 @@ func (s *turnScope) search(query string, limit int) []capabilityCandidate {
 	}
 	terms := searchTerms(query)
 	result := make([]capabilityCandidate, 0)
-	for _, item := range s.tools {
-		if item.Visibility == "none" {
-			continue
+	for _, item := range s.toolCatalog() {
+		candidate := capabilityCandidate{
+			ID: item.ID, Kind: "tool", Summary: item.Summary, Tags: item.Tags,
+			Visibility: item.Visibility, ReleaseID: item.ReleaseID, FunctionName: item.FunctionName,
 		}
-		candidate := capabilityCandidate{ID: item.ID, Kind: "tool", Summary: item.Summary, Tags: item.Tags, Visibility: item.Visibility, ReleaseID: item.ReleaseID}
-		candidate.Score = relevance(terms, item.ID+" "+item.Summary+" "+strings.Join(item.Tags, " "))
+		available := item.AlreadyAvailable
+		candidate.AlreadyAvailable = &available
+		candidate.Score = relevance(terms, item.ID+" "+item.FunctionName+" "+item.Summary+" "+strings.Join(item.Tags, " "))
 		if candidate.Score > 0 || len(terms) == 0 {
 			result = append(result, candidate)
 		}
@@ -444,28 +494,6 @@ func (s *turnScope) search(query string, limit int) []capabilityCandidate {
 		candidate.Score = relevance(terms, item.Skill.ID+" "+item.Skill.Summary)
 		if candidate.Score > 0 || len(terms) == 0 {
 			result = append(result, candidate)
-		}
-	}
-	if s.owner != nil && s.owner.plugins != nil {
-		for _, item := range s.owner.plugins.Catalog() {
-			if item.Type != plugins.TypeCore || item.Status != plugins.StatusEnabled {
-				continue
-			}
-			functionName := ""
-			for _, capability := range item.Capabilities {
-				if name, ok := strings.CutPrefix(capability, "tool:"); ok {
-					functionName = name
-					break
-				}
-			}
-			if functionName == "" {
-				continue
-			}
-			candidate := capabilityCandidate{ID: item.ID, Kind: "core-tool", Summary: item.Description, Visibility: "direct", FunctionName: functionName, AlreadyAvailable: true}
-			candidate.Score = relevance(terms, item.ID+" "+item.Name+" "+functionName+" "+item.Description)
-			if candidate.Score > 0 || len(terms) == 0 {
-				result = append(result, candidate)
-			}
 		}
 	}
 	if s.owner != nil && s.owner.capsules != nil {
@@ -497,17 +525,26 @@ func (s *turnScope) search(query string, limit int) []capabilityCandidate {
 }
 
 func (s *turnScope) load(id string) (any, error) {
-	if strings.HasPrefix(id, "core:") && s.owner != nil && s.owner.plugins != nil {
-		name := strings.TrimPrefix(id, "core:")
-		for _, definition := range s.owner.plugins.ActiveTools() {
-			if definition.Function.Name == name {
-				return map[string]any{"id": id, "kind": "core-tool", "functionName": name, "alreadyAvailable": true}, nil
-			}
+	for _, item := range s.toolCatalog() {
+		if item.ID != id {
+			continue
 		}
-	}
-	if binding, ok := s.tools[id]; ok && binding.Visibility != "none" {
+		if item.Binding == nil {
+			return map[string]any{
+				"id": item.ID, "kind": "tool", "functionName": item.FunctionName,
+				"alreadyAvailable": true, "inputSchema": item.Definition.Function.Parameters,
+			}, nil
+		}
+		binding := *item.Binding
 		name := s.loadPluginTool(binding)
-		return map[string]any{"id": id, "kind": "tool", "functionName": name, "releaseId": binding.ReleaseID, "inputSchema": binding.InputSchema, "outputSchema": binding.OutputSchema, "risk": binding.Risk}, nil
+		return map[string]any{"id": item.ID, "kind": "tool", "functionName": name, "alreadyAvailable": true, "releaseId": binding.ReleaseID, "inputSchema": binding.InputSchema, "outputSchema": binding.OutputSchema, "risk": binding.Risk}, nil
+	}
+	// Accept references emitted by older capability-search prompts while keeping
+	// the current Agent-facing catalogue source-neutral.
+	if name, ok := strings.CutPrefix(id, "core:"); ok {
+		if definition, available := s.activeTools[name]; available {
+			return map[string]any{"id": "tool:" + name, "kind": "tool", "functionName": name, "alreadyAvailable": true, "inputSchema": definition.Function.Parameters}, nil
+		}
 	}
 	if binding, ok := s.skills[id]; ok && binding.Skill.Visibility != "none" {
 		content, err := s.owner.forge.LoadPinnedSkill(binding)
