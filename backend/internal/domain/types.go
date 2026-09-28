@@ -112,7 +112,7 @@ type AgentTurn struct {
 	Status                string            `json:"status"`
 	StopReason            string            `json:"stopReason,omitempty"`
 	RecoveryClass         string            `json:"recoveryClass,omitempty"`
-	ReconciliationNote    string            `json:"reconciliationNote,omitempty"`
+	ReconciliationNote    string            `json:"-"`
 	CancelRequested       bool              `json:"cancelRequested"`
 	LastSequence          int               `json:"lastSequence"`
 	StartedAt             time.Time         `json:"startedAt"`

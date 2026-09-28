@@ -47,13 +47,12 @@ Step budget reached maximum limit (12 steps)...
 
 ### 2.2 根本原因深度分析
 * **硬限制默认值过小**：原先代码写死默认值为 `12` 步，而真实软件工程任务（搜索、读文件、改代码、测试）通常需要几十步交互。
-* **SQLite 历史种子持久化锁死**：系统首次启动时，会将初始种子规范 `Axiom Seed`（包含 `maxSteps: 12`）持久化写入 SQLite 数据库（`data/axiom.db` 中的 `agent_definitions` 表）。代码运行时优先读取数据库中绑定的定义，而旧代码仅在 `maxSteps < 1` 时才应用默认值，导致数据库内的历史值 12 一直生效。
-* **后端参数校验硬编码截断**：`evolution/service.go` 中校验规则硬编码了 `spec.MaxSteps > 64` 则拒绝保存，导致上层无法调大步数。
+* **SQLite 历史种子保留旧预算**：种子 Agent 的 `maxSteps` 存在 SQLite 的 Agent Definition / Generation 中；更新程序默认值不会改写已保存的定义，因此旧的 12 步预算仍可能继续生效。
+* **后端步数校验曾有硬上限**：旧版本限制 `maxSteps`，导致无法配置更大的步数预算。
 
 ### 2.3 解决方案
-1. **自动平滑升级旧数据**：在 `backend/internal/agent/loop.go` 中添加兼容升级逻辑，当检测到 `maxSteps < 1 || maxSteps == 12 || maxSteps == 80` 时，自动升级至最新标准步数。
-2. **放宽校验区间**：将 `evolution/service.go` 的合法性校验上限从 `64` 扩充放宽至 `500`。
-3. **数据库订正**：直接同步更新 SQLite 数据库内已持久化的 `agent_definitions` 记录。
+1. 新建的种子 Agent 使用 `DefaultMaxSteps`（当前为 500）；已保存的 Agent Definition 保留它自己的 `maxSteps`，不会被启动时偷偷改写。
+2. `maxSteps` 必须为正数，不再有宿主代码设置的最高值；单轮 Agent 仍会在该定义自己的步数预算用尽时结束并生成阶段总结。
 
 ---
 
@@ -101,7 +100,7 @@ summaryMessages := append(messages, provider.ChatMessage{
 * **Claude Code**：长任务不设置机械硬限制，而是采取步数提醒与用户中断确认，保持任务上下文持续推进。
 
 ### 4.3 解决方案
-1. **步数预算提升**：默认步数正式扩充到 **`150 步`**，上限放宽到 **`500 步`**，以应对复杂架构改造。
+1. **步数预算调整**：新建种子的默认值为 **`500 步`**；每个 Agent Generation 保存自己的预算，正整数可配置，宿主不再限制最高值。
 2. **系统提示词注入终止准则**：在 `DefaultSystemPrompt` 中严格要求模型：*“一旦收集到足够信息或达成阶段目标，立即停止调用工具，直接给出清晰结构化的答复；禁止做多余的验证性探查”*。
 3. **保留现场支持无缝接力**：步数用尽时自动输出详尽进度与后续待办，用户回复“继续”即可在同一个会话中继续推进，不再丢失进度。
 

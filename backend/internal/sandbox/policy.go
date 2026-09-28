@@ -7,6 +7,12 @@ import "errors"
 
 var ErrUnavailable = errors.New("operating system process sandbox is unavailable")
 
+type RecoveryReport struct {
+	UnresolvedGrants int
+	PermissionDenied int
+	OtherFailures    int
+}
+
 // Policy describes the filesystem locations a child process may access.
 // Network access is deliberately absent from this first policy version: child
 // processes receive no AppContainer network capabilities.

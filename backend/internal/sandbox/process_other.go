@@ -13,4 +13,4 @@ func Run(context.Context, *exec.Cmd, []byte, Policy) (error, error) {
 	return ErrUnavailable, nil
 }
 
-func RecoverRunfiles(string) error { return nil }
+func RecoverRunfiles(string) (RecoveryReport, error) { return RecoveryReport{}, nil }

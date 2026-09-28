@@ -198,9 +198,7 @@ func (s *Service) run(ctx context.Context, userID, experimentID string) {
 					return
 				default:
 				}
-				trialCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-				response, metrics, runErr := s.runner.RunEvaluation(trialCtx, userID, experiment.ProviderID, side.generation, evalCase.Prompt)
-				cancel()
+				response, metrics, runErr := s.runner.RunEvaluation(ctx, userID, experiment.ProviderID, side.generation, evalCase.Prompt)
 				if ctx.Err() != nil {
 					s.pause(ctx, userID, experiment)
 					return

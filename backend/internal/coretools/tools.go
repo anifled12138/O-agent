@@ -797,6 +797,31 @@ func safeResolve(root, p string) (string, error) {
 	return target, nil
 }
 
+// ExistingWorkspaceFile reports whether a workspace write would replace an
+// existing regular file. It uses the same traversal and symlink checks as the
+// write handlers so permission classification cannot mistake an outside path
+// for a harmless new file.
+func ExistingWorkspaceFile(root, p string) (bool, error) {
+	target, err := safeResolve(root, p)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(target)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.IsDir() {
+		return false, nil
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("cannot classify write target %q", p)
+	}
+	return true, nil
+}
+
 func pathWithin(root, target string) bool {
 	rel, err := filepath.Rel(root, target)
 	if err != nil {

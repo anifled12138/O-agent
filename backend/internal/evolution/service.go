@@ -19,6 +19,7 @@ const (
 	APIVersion        = "axiom.agent/v1"
 	StrategyReact     = "react.v1"
 	StrategyPlanReact = "plan-react.v1"
+	DefaultMaxSteps   = 500
 )
 
 const DefaultSystemPrompt = `You are O, an autonomous local-first engineering assistant. Work persistently toward the user's concrete outcome, use available capabilities when they improve the result, and treat tool observations as the source of truth.
@@ -63,7 +64,7 @@ func (s *Service) EnsureSeed(ctx context.Context, userID string) (domain.AgentGe
 		return generation, err
 	}
 	now := time.Now().UTC()
-	spec := domain.AgentSpec{Strategy: StrategyReact, SystemPrompt: DefaultSystemPrompt, MaxSteps: 500}
+	spec := domain.AgentSpec{Strategy: StrategyReact, SystemPrompt: DefaultSystemPrompt, MaxSteps: DefaultMaxSteps}
 	definition := domain.AgentDefinition{UserID: userID, APIVersion: APIVersion, Name: "O Seed", Description: "Stable seed ReAct agent definition", Spec: spec, CreatedAt: now}
 	definition.Digest = definitionDigest(definition)
 	generation = domain.AgentGeneration{ID: newID("gen"), UserID: userID, Number: 1, Scope: "general", Status: "stable", DefinitionDigest: definition.Digest, Definition: definition, Evidence: json.RawMessage(`{"kind":"seed"}`), CreatedAt: now, UpdatedAt: now}
@@ -242,9 +243,9 @@ func normalizeSpec(spec domain.AgentSpec) (domain.AgentSpec, error) {
 		return domain.AgentSpec{}, domain.ErrInvalid
 	}
 	if spec.MaxSteps == 0 {
-		spec.MaxSteps = 500
+		spec.MaxSteps = DefaultMaxSteps
 	}
-	if spec.MaxSteps < 1 || spec.MaxSteps > 1000 {
+	if spec.MaxSteps < 1 {
 		return domain.AgentSpec{}, domain.ErrInvalid
 	}
 	if spec.Strategy == StrategyPlanReact {

@@ -39,7 +39,6 @@ type loopRequest struct {
 	Emit               func(string, any) error
 	PersistCheckpoint  func(string, any, loopCheckpoint) error
 	DetailedTrace      bool
-	TokenBudget        int
 	ModelCallBudget    int
 }
 
@@ -127,14 +126,6 @@ func executeLoop(ctx context.Context, models modelRuntime, request loopRequest) 
 			_ = emit("planner.failed", map[string]any{"attempts": modelAttemptCount(completion, err), "error": err.Error()})
 			return loopResult{Metrics: metrics}, err
 		}
-		if request.TokenBudget > 0 && metrics.TotalTokens >= request.TokenBudget {
-			metrics.ReachedTokenLimit = true
-			metrics.DurationMillis = time.Since(started).Milliseconds()
-			if err := emit("loop.token_limit_reached", map[string]any{"budget": request.TokenBudget, "used": metrics.TotalTokens, "stage": "planner"}); err != nil {
-				return loopResult{Metrics: metrics}, err
-			}
-			return loopResult{Reply: "本次运行达到模型 Token 预算上限，任务尚未进入执行阶段。", Metrics: metrics}, nil
-		}
 		if modelCallBudgetReached(request, metrics) {
 			return modelCallLimitResult(emit, request, metrics, started, "planner")
 		}
@@ -157,7 +148,7 @@ func executeLoop(ctx context.Context, models modelRuntime, request loopRequest) 
 
 	maxSteps := spec.MaxSteps
 	if maxSteps < 1 {
-		maxSteps = 12
+		maxSteps = evolution.DefaultMaxSteps
 	}
 	for step := checkpoint.NextStep; step < maxSteps; step++ {
 		var calls []provider.ToolCall
@@ -217,22 +208,6 @@ func executeLoop(ctx context.Context, models modelRuntime, request loopRequest) 
 			}
 			toolCalls := completion.ToolCalls
 			reply := strings.TrimSpace(completion.Content)
-			if request.TokenBudget > 0 && metrics.TotalTokens >= request.TokenBudget {
-				metrics.ReachedTokenLimit = true
-				if err := emit("loop.token_limit_reached", map[string]any{"budget": request.TokenBudget, "used": metrics.TotalTokens, "stage": "agent", "step": step + 1}); err != nil {
-					return loopResult{Metrics: metrics}, err
-				}
-				if len(toolCalls) > 0 || reply == "" {
-					reply = "本次运行达到模型 Token 预算上限，工具调用未执行，任务尚未确认完成。"
-				}
-				checkpoint.Stage, checkpoint.FinalReply = "final", reply
-				checkpoint.Messages, checkpoint.Metrics = append([]provider.ChatMessage(nil), messages...), metrics
-				if err := persistLoopCheckpoint(request, emit, "model.completed", map[string]any{"step": step + 1, "attempts": modelAttemptCount(completion, nil), "toolCallCount": len(toolCalls), "contentBytes": len(completion.Content), "model": completion.Model, "usage": completion.Usage, "durationMillis": time.Since(modelStarted).Milliseconds()}, checkpoint); err != nil {
-					return loopResult{Metrics: metrics}, err
-				}
-				metrics.DurationMillis = time.Since(started).Milliseconds()
-				return loopResult{Reply: reply, Metrics: metrics}, nil
-			}
 			if len(toolCalls) > 0 && modelCallBudgetReached(request, metrics) {
 				checkpoint.Stage, checkpoint.PendingStep = "dispatch", step+1
 				checkpoint.PendingCalls, checkpoint.PendingIndex = append([]provider.ToolCall(nil), toolCalls...), 0
@@ -388,12 +363,6 @@ func executeLoop(ctx context.Context, models modelRuntime, request loopRequest) 
 	metrics.ModelCalls += modelAttemptCount(finalSummaryComp, err)
 	checkpoint.InFlightModelCall = false
 	addUsage(&metrics, finalSummaryComp.Usage)
-	if request.TokenBudget > 0 && metrics.TotalTokens >= request.TokenBudget {
-		metrics.ReachedTokenLimit = true
-		if err := emit("loop.token_limit_reached", map[string]any{"budget": request.TokenBudget, "used": metrics.TotalTokens, "stage": "step_limit_summary"}); err != nil {
-			return loopResult{Metrics: metrics}, err
-		}
-	}
 	finalSummary := finalSummaryComp.Content
 	metrics.DurationMillis = time.Since(started).Milliseconds()
 	if err != nil {

@@ -142,7 +142,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v2/agent/conversations/{id}/inbox", s.inboxList)
 	mux.HandleFunc("POST /api/v2/agent/conversations/{id}/inbox", s.inboxQueue)
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/retry", s.turnRetry)
-	mux.HandleFunc("POST /api/v2/agent/turns/{id}/reconcile", s.turnReconcile)
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/branch", s.turnBranch)
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/fork", s.turnFork)
 	mux.HandleFunc("GET /api/v2/agent/turns/{id}/events", s.turnEvents)
@@ -166,10 +165,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 				"activeRuns":             runtimeStatus.ActiveRuns,
 				"queuedInputs":           runtimeStatus.QueuedInputs,
 				"outstandingEvaluations": runtimeStatus.OutstandingEvaluations,
-				"maxConcurrentRuns":      runtimeStatus.MaxConcurrent,
-				"maxTokensPerRun":        runtimeStatus.MaxTokensPerRun,
 				"maxModelCalls":          runtimeStatus.MaxModelCalls,
-				"maxRunDurationSeconds":  runtimeStatus.MaxRunDuration.Seconds(),
 			}
 		}
 	}
@@ -781,21 +777,6 @@ func (s *Server) turnRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusAccepted, receipt)
-}
-
-func (s *Server) turnReconcile(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Note string `json:"note"`
-	}
-	if !decode(w, r, &in) {
-		return
-	}
-	reconciliation, err := s.agent.Reconcile(r.Context(), s.workspaceID, r.PathValue("id"), in.Note)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	write(w, http.StatusOK, reconciliation)
 }
 
 func (s *Server) turnBranch(w http.ResponseWriter, r *http.Request) {

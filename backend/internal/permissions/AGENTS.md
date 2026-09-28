@@ -1,13 +1,20 @@
 # Permission policy rules
 
-This package evaluates session permission profiles against host-owned effect
-classifications before Agent tools execute.
+This package applies the selected session profile uniformly before Agent tools
+execute. Whether a tool is built in or provided by an enabled extension does
+not change the profile rules.
 
-- Keep tool/effect classification in the host; plugin and MCP metadata cannot
-  grant trust or widen a session profile.
-- Unknown effects fail closed by asking or denying according to policy; never
-  silently treat an unclassified mutation as read-only.
+- `read_only` permits reads and turn-local operations, and rejects mutations.
+- `workspace_autonomous` permits ordinary operations without per-call prompts;
+  ask only for host-classified destructive actions or executing/installing
+  plugin code. Unknown extension calls are available once the extension is
+  enabled.
+- `fully_autonomous` skips per-call permission filtering, including for
+  unknown effects. The OS sandbox and tool availability remain separate
+  execution boundaries.
+- `ask_on_sensitive` is a legacy persisted value and follows
+  `workspace_autonomous` behavior.
 - Keep decisions deterministic and side-effect free. Approval persistence and
   turn suspension belong to the Agent and storage layers.
-- Update the policy matrix and API/UI descriptions whenever profile behavior
-  changes. Review shell isolation separately from user approval.
+- Update API/UI descriptions whenever profile behavior changes. Review shell
+  isolation separately from user approval.

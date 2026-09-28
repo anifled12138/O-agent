@@ -1,6 +1,7 @@
-// Package permissions evaluates the host's session permission profile against
-// trusted operation metadata. Plugin and MCP declarations are inputs to the
-// host's classification, never permission grants by themselves.
+// Package permissions applies one session policy to every tool call. The
+// caller classifies effects where the host can verify them; an enabled tool is
+// otherwise available without a per-call approval in workspace-autonomous
+// mode.
 package permissions
 
 import "axiom.local/agent/internal/domain"
@@ -17,6 +18,7 @@ type Effect string
 
 const (
 	EffectRead           Effect = "read"
+	EffectEphemeral      Effect = "ephemeral"
 	EffectWorkspaceWrite Effect = "workspace_write"
 	EffectShell          Effect = "shell"
 	EffectExternalRead   Effect = "external_read"
@@ -43,57 +45,38 @@ type Decision struct {
 	Reason  string  `json:"reason"`
 }
 
-// Evaluate intentionally fails closed for invalid profiles and unknown
-// effects. Fully autonomous sessions skip approval only for host-classified
-// effects; the execution sandbox remains an independent enforcement boundary.
+// Evaluate applies the session's permission policy independently of whether a
+// tool is built in or provided by an enabled extension. Unknown effects are
+// not an implicit approval prompt: workspace-autonomous mode only asks for
+// high-impact actions the host has positively classified as destructive or
+// sensitive. The process sandbox remains an independent enforcement boundary.
 func Evaluate(profile domain.PermissionProfile, request Request) Decision {
 	request.Profile = profile
 	if !profile.Valid() {
 		return Decision{Outcome: OutcomeDeny, Reason: "会话权限等级无效，已阻止工具调用"}
 	}
 
-	if request.Effect == EffectRead {
-		return Decision{Outcome: OutcomeAllow, Reason: "只读操作符合当前会话权限"}
+	if profile == domain.PermissionProfileFullyAutonomous {
+		return Decision{Outcome: OutcomeAllow, Reason: "完全自动模式不进行逐项权限拦截"}
+	}
+
+	if request.Effect == EffectRead || request.Effect == EffectEphemeral {
+		return Decision{Outcome: OutcomeAllow, Reason: "只读或临时操作允许执行"}
 	}
 
 	if profile == domain.PermissionProfileReadOnly {
-		return Decision{Outcome: OutcomeDeny, Reason: "当前会话为只读权限；请切换会话权限后重试"}
+		return Decision{Outcome: OutcomeDeny, Reason: "只读模式不允许写入或产生外部影响"}
 	}
 
-	if profile == domain.PermissionProfileFullyAutonomous {
-		switch request.Effect {
-		case EffectWorkspaceWrite, EffectShell, EffectExternalRead, EffectExternalWrite, EffectDestructive, EffectSensitive:
-			return Decision{Outcome: OutcomeAllow, Reason: "当前会话为完全自动权限；操作仍受工具范围与系统沙箱限制"}
-		default:
-			return Decision{Outcome: OutcomeDeny, Reason: "完全自动模式仍会阻止未分类的工具操作"}
-		}
-	}
-
-	if profile == domain.PermissionProfileWorkspaceAutonomy && request.Effect == EffectWorkspaceWrite {
-		return Decision{Outcome: OutcomeAllow, Reason: "工作区内写入符合当前会话权限"}
-	}
-
-	if request.Effect == EffectShell {
-		return Decision{Outcome: OutcomeAsk, Reason: "Shell 命令的实际影响无法仅凭工作目录限制，需要用户确认"}
-	}
-	if request.Effect == EffectExternalRead {
-		return Decision{Outcome: OutcomeAsk, Reason: "该调用会向外部服务发送数据，需要确认"}
-	}
-	if request.Effect == EffectExternalWrite {
-		return Decision{Outcome: OutcomeAsk, Reason: "该调用会修改外部服务中的数据，需要确认"}
-	}
 	if request.Effect == EffectDestructive {
-		return Decision{Outcome: OutcomeAsk, Reason: "该工具可能删除或覆盖数据，需要用户确认"}
+		return Decision{Outcome: OutcomeAsk, Reason: "操作会删除或覆盖已有数据"}
 	}
 	if request.Effect == EffectSensitive {
-		return Decision{Outcome: OutcomeAsk, Reason: "该操作会改变 Agent 或插件的持久状态，需要用户确认"}
-	}
-	if request.Effect == EffectUnknown {
-		return Decision{Outcome: OutcomeAsk, Reason: "工具没有可信的宿主风险分类，默认需要用户确认"}
+		return Decision{Outcome: OutcomeAsk, Reason: "操作会执行或启用新的插件代码"}
 	}
 
-	if profile == domain.PermissionProfileAskOnSensitive {
-		return Decision{Outcome: OutcomeAsk, Reason: "当前会话要求在任何写入前询问"}
-	}
-	return Decision{Outcome: OutcomeDeny, Reason: "该操作不属于当前会话允许的工作区操作"}
+	// workspace_autonomous is the default, including the legacy
+	// ask_on_sensitive profile. Ordinary writes, network reads/writes, shell
+	// operations and enabled extension tools run without per-call prompts.
+	return Decision{Outcome: OutcomeAllow, Reason: "工作区自动模式允许常规操作"}
 }

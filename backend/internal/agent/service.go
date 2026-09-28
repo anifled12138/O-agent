@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"axiom.local/agent/internal/capability"
@@ -43,10 +44,10 @@ type Service struct {
 	workspaceRoot string
 	runfiles      *runfiles.Manager
 	runLimits     RunLimits
-	runSlots      chan struct{}
 	plugins       *plugins.Manager
 	runningMu     sync.Mutex
 	running       map[string]context.CancelCauseFunc
+	activeRuns    atomic.Int64
 	queueResumeMu sync.Mutex
 	events        *eventBroker
 	approvalMu    sync.Mutex
@@ -136,8 +137,12 @@ func New(hostCtx context.Context, store *storage.Store, providers *provider.Serv
 	if err != nil {
 		return nil, err
 	}
-	if err := sandbox.RecoverRunfiles(runfileManager.Root()); err != nil {
+	recoveryReport, err := sandbox.RecoverRunfiles(runfileManager.Root())
+	if err != nil {
 		return nil, fmt.Errorf("recover interrupted Windows sandbox permissions: %w", err)
+	}
+	if recoveryReport.UnresolvedGrants > 0 {
+		slog.Warn("removed stale Windows AppContainer profiles; some filesystem ACL grants could not be removed", "unresolved_grants", recoveryReport.UnresolvedGrants, "permission_denied", recoveryReport.PermissionDenied, "other_failures", recoveryReport.OtherFailures)
 	}
 	scripts := scriptruntime.New()
 	capsules, err := capsule.Open(workspaceRoot, scripts)
@@ -152,7 +157,7 @@ func New(hostCtx context.Context, store *storage.Store, providers *provider.Serv
 	if err != nil {
 		return nil, err
 	}
-	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, fragments: capability.NewRegistry(scripts), capsules: capsules, promotions: promotions, running: map[string]context.CancelCauseFunc{}, events: newEventBroker(), approvals: map[string]chan bool{}, workspaceRoot: workspaceRoot, runfiles: runfileManager, runLimits: limits, runSlots: make(chan struct{}, limits.MaxConcurrentRuns), plugins: pluginManager}, nil
+	return &Service{hostCtx: hostCtx, store: store, providers: providers, forge: forge, evolution: evolutionService, fragments: capability.NewRegistry(scripts), capsules: capsules, promotions: promotions, running: map[string]context.CancelCauseFunc{}, events: newEventBroker(), approvals: map[string]chan bool{}, workspaceRoot: workspaceRoot, runfiles: runfileManager, runLimits: limits, plugins: pluginManager}, nil
 }
 
 func (s *Service) Plugins() *plugins.Manager { return s.plugins }
@@ -461,16 +466,6 @@ func (s *Service) Retry(ctx context.Context, userID, turnID string, content *str
 	return s.submitRun(userID, previousTurn.ConversationID, messageContent, input.ID, turnID, "", content, "")
 }
 
-func (s *Service) Reconcile(ctx context.Context, userID, turnID, note string) (domain.AgentTurnReconciliation, error) {
-	reconciliation, err := s.store.RecordAgentTurnReconciliation(ctx, userID, turnID, note, time.Now().UTC())
-	if err != nil {
-		return domain.AgentTurnReconciliation{}, err
-	}
-	s.events.notify(turnID)
-	s.startNextInbox(userID, reconciliation.ConversationID)
-	return reconciliation, nil
-}
-
 func (s *Service) BranchRetry(ctx context.Context, userID, turnID string, content *string) (domain.TurnReceipt, error) {
 	previousTurn, input, err := s.store.AgentTurnSeedForBranch(ctx, userID, turnID)
 	if err != nil {
@@ -617,13 +612,9 @@ func (s *Service) ResumeInterruptedTurns(userID string) {
 }
 
 func (s *Service) resumeActiveTurn(userID, turnID string) {
-	select {
-	case s.runSlots <- struct{}{}:
-	case <-s.hostCtx.Done():
-		return
-	}
+	s.activeRuns.Add(1)
 	defer func() {
-		<-s.runSlots
+		s.activeRuns.Add(-1)
 		go s.ResumeQueuedInputs(userID)
 	}()
 
@@ -713,9 +704,7 @@ func (s *Service) resumeActiveTurn(userID, turnID string) {
 		_ = s.finishFailedTurn(s.hostCtx, userID, turnID, turn.ConversationID, "failed", "runtime_binding_changed", errors.Join(err, cleanupErr), checkpoint.Metrics)
 		return
 	}
-	remaining := s.runLimits.MaxRunDuration - time.Since(turn.StartedAt)
-	budgetCtx, budgetCancel := context.WithTimeout(s.hostCtx, remaining)
-	runCtx, runCancel := context.WithCancelCause(budgetCtx)
+	runCtx, runCancel := context.WithCancelCause(s.hostCtx)
 	s.runningMu.Lock()
 	s.running[turnID] = runCancel
 	s.runningMu.Unlock()
@@ -724,7 +713,6 @@ func (s *Service) resumeActiveTurn(userID, turnID string) {
 		delete(s.running, turnID)
 		s.runningMu.Unlock()
 		runCancel(nil)
-		budgetCancel()
 	}()
 	trace := newTraceRecorder(runCtx, s.store, userID, turnID, s.events.notify, s.providers.SealRunCheckpoint)
 	checkpointWriter := func(kind string, details any, state loopCheckpoint) error {
@@ -735,14 +723,14 @@ func (s *Service) resumeActiveTurn(userID, turnID string) {
 		return trace.checkpoint(kind, details, state)
 	}
 	detailedTrace := s.plugins == nil || s.plugins.IsRunInspectorEnabled()
-	result, runErr := executeLoop(runCtx, s.providers, loopRequest{UserID: userID, ProviderID: turn.ProviderID, Generation: generation, Checkpoint: checkpointRaw, RuntimeFingerprint: runtimeFingerprint, Scope: scope, Emit: trace.emit, PersistCheckpoint: checkpointWriter, DetailedTrace: detailedTrace, TokenBudget: s.runLimits.MaxTokensPerRun, ModelCallBudget: s.runLimits.MaxModelCalls})
+	result, runErr := executeLoop(runCtx, s.providers, loopRequest{UserID: userID, ProviderID: turn.ProviderID, Generation: generation, Checkpoint: checkpointRaw, RuntimeFingerprint: runtimeFingerprint, Scope: scope, Emit: trace.emit, PersistCheckpoint: checkpointWriter, DetailedTrace: detailedTrace, ModelCallBudget: s.runLimits.MaxModelCalls})
 	result.Metrics.DurationMillis = time.Since(turn.StartedAt).Milliseconds()
 	if runErr != nil {
 		status, reason := "failed", "runtime_error"
 		if errors.Is(runCtx.Err(), context.Canceled) {
 			status, reason = "cancelled", "cancelled"
 		} else if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			status, reason = "incomplete", "time_limit"
+			status, reason = "incomplete", "context_deadline"
 		}
 		if cleanupErr := scope.Close(); cleanupErr != nil {
 			status, reason = "failed", "artifact_cleanup_failed"
@@ -761,8 +749,6 @@ func (s *Service) resumeActiveTurn(userID, turnID string) {
 	status, stopReason := "completed", "assistant_response"
 	if result.Metrics.ReachedModelCallLimit {
 		status, stopReason = "incomplete", "model_call_limit"
-	} else if result.Metrics.ReachedTokenLimit {
-		status, stopReason = "incomplete", "token_limit"
 	} else if result.Metrics.ReachedStepLimit {
 		status, stopReason = "incomplete", "step_limit"
 	}
@@ -789,13 +775,10 @@ func (s *Service) RuntimeHealth(ctx context.Context, userID string) (RuntimeHeal
 		return RuntimeHealth{}, err
 	}
 	return RuntimeHealth{
-		ActiveRuns:             len(s.runSlots),
+		ActiveRuns:             int(s.activeRuns.Load()),
 		QueuedInputs:           queued,
 		OutstandingEvaluations: outstandingEvaluations,
-		MaxConcurrent:          s.runLimits.MaxConcurrentRuns,
-		MaxTokensPerRun:        s.runLimits.MaxTokensPerRun,
 		MaxModelCalls:          s.runLimits.MaxModelCalls,
-		MaxRunDuration:         s.runLimits.MaxRunDuration,
 	}, nil
 }
 
@@ -946,17 +929,19 @@ func profileTightened(prior, next domain.PermissionProfile) bool {
 	if !prior.Valid() {
 		return true
 	}
-	switch next {
-	case domain.PermissionProfileFullyAutonomous:
-		return false
+	return permissionProfileRank(next) < permissionProfileRank(prior)
+}
+
+func permissionProfileRank(profile domain.PermissionProfile) int {
+	switch profile {
 	case domain.PermissionProfileReadOnly:
-		return prior != domain.PermissionProfileReadOnly
-	case domain.PermissionProfileWorkspaceAutonomy:
-		return prior == domain.PermissionProfileFullyAutonomous
-	case domain.PermissionProfileAskOnSensitive:
-		return prior == domain.PermissionProfileWorkspaceAutonomy || prior == domain.PermissionProfileFullyAutonomous
+		return 0
+	case domain.PermissionProfileWorkspaceAutonomy, domain.PermissionProfileAskOnSensitive:
+		return 1
+	case domain.PermissionProfileFullyAutonomous:
+		return 2
 	default:
-		return true
+		return -1
 	}
 }
 
@@ -1209,20 +1194,11 @@ func (s *Service) runTurnWithOptions(ctx context.Context, userID, conversationID
 		signalStart(domain.TurnReceipt{}, domain.ErrInvalid)
 		return domain.Message{}, domain.ErrInvalid
 	}
-	select {
-	case s.runSlots <- struct{}{}:
-	default:
-		err := fmt.Errorf("%w: all %d Agent execution slots are in use; queued conversation inputs will start when a slot frees", domain.ErrBusy, s.runLimits.MaxConcurrentRuns)
-		signalStart(domain.TurnReceipt{}, err)
-		return domain.Message{}, err
-	}
+	s.activeRuns.Add(1)
 	defer func() {
-		<-s.runSlots
+		s.activeRuns.Add(-1)
 		go s.ResumeQueuedInputs(userID)
 	}()
-	budgetCtx, budgetCancel := context.WithTimeout(ctx, s.runLimits.MaxRunDuration)
-	defer budgetCancel()
-	ctx = budgetCtx
 	detail, err := s.store.Conversation(ctx, userID, conversationID)
 	if err != nil {
 		signalStart(domain.TurnReceipt{}, err)
@@ -1438,13 +1414,13 @@ func (s *Service) runTurnWithOptions(ctx context.Context, userID, conversationID
 		}
 		return trace.checkpoint(kind, details, state)
 	}
-	result, err := executeLoop(runCtx, s.providers, loopRequest{UserID: userID, ProviderID: detail.ProviderID, Generation: generation, Messages: messages, RuntimeFingerprint: runtimeFingerprint, Scope: scope, Emit: trace.emit, PersistCheckpoint: checkpointWriter, DetailedTrace: detailedTrace, TokenBudget: s.runLimits.MaxTokensPerRun, ModelCallBudget: s.runLimits.MaxModelCalls})
+	result, err := executeLoop(runCtx, s.providers, loopRequest{UserID: userID, ProviderID: detail.ProviderID, Generation: generation, Messages: messages, RuntimeFingerprint: runtimeFingerprint, Scope: scope, Emit: trace.emit, PersistCheckpoint: checkpointWriter, DetailedTrace: detailedTrace, ModelCallBudget: s.runLimits.MaxModelCalls})
 	if err != nil {
 		status, reason := "failed", "runtime_error"
 		if errors.Is(runCtx.Err(), context.Canceled) {
 			status, reason = "cancelled", "cancelled"
 		} else if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			status, reason = "incomplete", "time_limit"
+			status, reason = "incomplete", "context_deadline"
 		}
 		if cleanupErr := scope.Close(); cleanupErr != nil {
 			status, reason = "failed", "artifact_cleanup_failed"
@@ -1459,8 +1435,6 @@ func (s *Service) runTurnWithOptions(ctx context.Context, userID, conversationID
 	status, stopReason := "completed", "assistant_response"
 	if result.Metrics.ReachedModelCallLimit {
 		status, stopReason = "incomplete", "model_call_limit"
-	} else if result.Metrics.ReachedTokenLimit {
-		status, stopReason = "incomplete", "token_limit"
 	} else if result.Metrics.ReachedStepLimit {
 		status, stopReason = "incomplete", "step_limit"
 	}
@@ -1500,13 +1474,9 @@ func (s *Service) RunEvaluation(ctx context.Context, userID, providerID string, 
 	if prompt == "" {
 		return "", domain.RunMetrics{}, domain.ErrInvalid
 	}
-	select {
-	case s.runSlots <- struct{}{}:
-	case <-ctx.Done():
-		return "", domain.RunMetrics{}, ctx.Err()
-	}
+	s.activeRuns.Add(1)
 	defer func() {
-		<-s.runSlots
+		s.activeRuns.Add(-1)
 		go s.ResumeQueuedInputs(userID)
 	}()
 	scope, err := newEvaluationScope(s, userID)
@@ -1517,9 +1487,7 @@ func (s *Service) RunEvaluation(ctx context.Context, userID, providerID string, 
 		{Role: "system", Content: generation.Definition.Spec.SystemPrompt + "\n\nEvaluation mode: work only through the exposed read-only capabilities. Return the actual task result, not a description of this evaluation."},
 		{Role: "user", Content: prompt},
 	}
-	evaluationCtx, cancel := context.WithTimeout(ctx, s.runLimits.MaxRunDuration)
-	defer cancel()
-	result, err := executeLoop(evaluationCtx, s.providers, loopRequest{UserID: userID, ProviderID: providerID, Generation: generation, Messages: messages, Scope: scope, TokenBudget: s.runLimits.MaxTokensPerRun, ModelCallBudget: s.runLimits.MaxModelCalls})
+	result, err := executeLoop(ctx, s.providers, loopRequest{UserID: userID, ProviderID: providerID, Generation: generation, Messages: messages, Scope: scope, ModelCallBudget: s.runLimits.MaxModelCalls})
 	cleanupErr := scope.Close()
 	return result.Reply, result.Metrics, errors.Join(err, cleanupErr)
 }

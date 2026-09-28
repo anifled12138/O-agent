@@ -423,7 +423,7 @@ func applyAccessGrants(paths []accessPath, sid *windows.SID) ([]accessGrant, err
 
 func newCleanupJournal(profile *appContainerProfile, paths []accessPath) (cleanupJournal, error) {
 	sid := profile.sid.String()
-	created, err := processCreationTime(windows.CurrentProcess())
+	created, err := currentProcessCreationTime()
 	if err != nil {
 		return cleanupJournal{}, fmt.Errorf("read host process creation time: %w", err)
 	}
@@ -435,6 +435,19 @@ func newCleanupJournal(profile *appContainerProfile, paths []accessPath) (cleanu
 		})
 	}
 	return journal, nil
+}
+
+func currentProcessCreationTime() (windows.Filetime, error) {
+	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(os.Getpid()))
+	if err != nil {
+		return windows.Filetime{}, err
+	}
+	created, timeErr := processCreationTime(process)
+	closeErr := windows.CloseHandle(process)
+	if timeErr != nil || closeErr != nil {
+		return windows.Filetime{}, errors.Join(timeErr, closeErr)
+	}
+	return created, nil
 }
 
 func writeCleanupJournal(path string, journal cleanupJournal) (resultErr error) {
@@ -509,26 +522,26 @@ func removeCleanupJournal(path string) error {
 // RecoverRunfiles restores temporary ACL grants (and legacy integrity labels)
 // left by a host process that exited before command cleanup completed. It runs
 // before a new Agent service accepts turns.
-func RecoverRunfiles(root string) error {
+func RecoverRunfiles(root string) (RecoveryReport, error) {
 	resolvedRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return RecoveryReport{}, nil
 		}
-		return fmt.Errorf("resolve sandbox recovery root: %w", err)
+		return RecoveryReport{}, fmt.Errorf("resolve sandbox recovery root: %w", err)
 	}
 	info, err := os.Stat(resolvedRoot)
 	if err != nil {
-		return fmt.Errorf("inspect sandbox recovery root: %w", err)
+		return RecoveryReport{}, fmt.Errorf("inspect sandbox recovery root: %w", err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("sandbox recovery root %q is not a directory", resolvedRoot)
+		return RecoveryReport{}, fmt.Errorf("sandbox recovery root %q is not a directory", resolvedRoot)
 	}
 	entries, err := os.ReadDir(resolvedRoot)
 	if err != nil {
-		return fmt.Errorf("list sandbox recovery records: %w", err)
+		return RecoveryReport{}, fmt.Errorf("list sandbox recovery records: %w", err)
 	}
-	var joined error
+	var report RecoveryReport
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, ".axiom-sandbox-") || filepath.Ext(name) != ".json" || entry.IsDir() {
@@ -537,49 +550,52 @@ func RecoverRunfiles(root string) error {
 		path := filepath.Join(resolvedRoot, name)
 		info, err := os.Lstat(path)
 		if err != nil {
-			joined = errors.Join(joined, fmt.Errorf("inspect sandbox recovery record %s: %w", name, err))
-			continue
+			return report, fmt.Errorf("inspect sandbox recovery record %s: %w", name, err)
 		}
 		if !info.Mode().IsRegular() || info.Size() > 1<<20 {
-			joined = errors.Join(joined, fmt.Errorf("sandbox recovery record %s is not a regular file within the size limit", name))
-			continue
+			return report, fmt.Errorf("sandbox recovery record %s is not a regular file within the size limit", name)
 		}
-		if err := recoverCleanupJournal(path, resolvedRoot); err != nil {
-			joined = errors.Join(joined, fmt.Errorf("recover sandbox journal %s: %w", name, err))
+		journalReport, err := recoverCleanupJournal(path, resolvedRoot)
+		report.UnresolvedGrants += journalReport.UnresolvedGrants
+		report.PermissionDenied += journalReport.PermissionDenied
+		report.OtherFailures += journalReport.OtherFailures
+		if err != nil {
+			return report, fmt.Errorf("recover sandbox journal %s: %w", name, err)
 		}
 	}
-	return joined
+	return report, nil
 }
 
-func recoverCleanupJournal(path, root string) error {
+func recoverCleanupJournal(path, root string) (RecoveryReport, error) {
+	var report RecoveryReport
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return report, err
 	}
 	var journal cleanupJournal
 	if err := json.Unmarshal(data, &journal); err != nil {
-		return fmt.Errorf("decode journal: %w", err)
+		return report, fmt.Errorf("decode journal: %w", err)
 	}
 	if journal.Version != 1 || journal.PID <= 0 || journal.ProcessStart == 0 || !strings.HasPrefix(journal.ProfileName, "AxiomAgent-") {
-		return errors.New("journal fields are invalid")
+		return report, errors.New("journal fields are invalid")
 	}
 	if len(journal.Grants) > 512 {
-		return errors.New("journal has too many access grants")
+		return report, errors.New("journal has too many access grants")
 	}
 	journalPath, err := filepath.Abs(path)
 	if err != nil || !pathWithin(root, journalPath) {
-		return errors.New("journal is outside the recovery root")
+		return report, errors.New("journal is outside the recovery root")
 	}
 	alive, err := journalOwnerAlive(journal.PID, journal.ProcessStart)
 	if err != nil {
-		return fmt.Errorf("check journal owner process: %w", err)
+		return report, fmt.Errorf("check journal owner process: %w", err)
 	}
 	if alive {
-		return nil
+		return report, nil
 	}
 	sid, err := windows.StringToSid(journal.AppContainerSID)
 	if err != nil {
-		return fmt.Errorf("decode AppContainer SID: %w", err)
+		return report, fmt.Errorf("decode AppContainer SID: %w", err)
 	}
 	var joined error
 	for index := len(journal.Grants) - 1; index >= 0; index-- {
@@ -590,10 +606,14 @@ func recoverCleanupJournal(path, root string) error {
 				continue
 			}
 			joined = errors.Join(joined, fmt.Errorf("resolve granted path %s: %w", grant.Path, pathErr))
+			report.UnresolvedGrants++
+			report.OtherFailures++
 			continue
 		}
 		if !equalWindowsPath(canonical, grant.Path) {
 			joined = errors.Join(joined, fmt.Errorf("granted path %s now resolves to %s", grant.Path, canonical))
+			report.UnresolvedGrants++
+			report.OtherFailures++
 			continue
 		}
 		if grant.Write {
@@ -604,32 +624,47 @@ func recoverCleanupJournal(path, root string) error {
 				descriptor, descriptorErr = windows.SecurityDescriptorFromString(grant.OldIntegritySDDL)
 				if descriptorErr != nil {
 					joined = errors.Join(joined, fmt.Errorf("decode original integrity label for %s: %w", grant.Path, descriptorErr))
+					report.UnresolvedGrants++
+					report.OtherFailures++
 					continue
 				}
 				oldLabel, _, descriptorErr = descriptor.SACL()
 				if descriptorErr != nil {
-					joined = errors.Join(joined, fmt.Errorf("read original integrity label for %s: %w", grant.Path, descriptorErr), freeSecurityDescriptor(descriptor))
+					joined = errors.Join(joined, fmt.Errorf("read original integrity label for %s: %w", grant.Path, descriptorErr))
+					report.UnresolvedGrants++
+					report.OtherFailures++
 					continue
 				}
 			}
 			setErr := windows.SetNamedSecurityInfo(grant.Path, windows.SE_FILE_OBJECT, windows.LABEL_SECURITY_INFORMATION, nil, nil, nil, oldLabel)
-			freeErr := freeSecurityDescriptor(descriptor)
-			if setErr != nil || freeErr != nil {
-				joined = errors.Join(joined, fmt.Errorf("restore integrity label on %s: %w", grant.Path, errors.Join(setErr, freeErr)))
+			if setErr != nil {
+				joined = errors.Join(joined, fmt.Errorf("restore integrity label on %s: %w", grant.Path, setErr))
+				report.UnresolvedGrants++
+				if errors.Is(setErr, windows.ERROR_ACCESS_DENIED) {
+					report.PermissionDenied++
+				} else {
+					report.OtherFailures++
+				}
 				continue
 			}
 		}
 		if err := setAccess(grant.Path, sid, windows.REVOKE_ACCESS); err != nil {
 			joined = errors.Join(joined, fmt.Errorf("revoke access from %s: %w", grant.Path, err))
+			report.UnresolvedGrants++
+			if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+				report.PermissionDenied++
+			} else {
+				report.OtherFailures++
+			}
 		}
 	}
-	if joined != nil {
-		return joined
-	}
 	if err := deleteAppContainerProfile(journal.ProfileName); err != nil {
-		return fmt.Errorf("delete stale AppContainer profile: %w", err)
+		return report, errors.Join(joined, fmt.Errorf("delete stale AppContainer profile: %w", err))
 	}
-	return removeCleanupJournal(path)
+	if err := removeCleanupJournal(path); err != nil {
+		return report, errors.Join(joined, err)
+	}
+	return report, nil
 }
 
 func journalOwnerAlive(pid int, expectedStart uint64) (bool, error) {
@@ -683,21 +718,7 @@ func revokeAccessGrants(grants []accessGrant) error {
 	return joined
 }
 
-func freeSecurityDescriptor(descriptor *windows.SECURITY_DESCRIPTOR) error {
-	if descriptor == nil {
-		return nil
-	}
-	handle, err := windows.LocalFree(windows.Handle(uintptr(unsafe.Pointer(descriptor))))
-	if err != nil {
-		return err
-	}
-	if handle != 0 {
-		return errors.New("LocalFree did not release the security descriptor")
-	}
-	return nil
-}
-
-func setAccess(path string, sid *windows.SID, accessMode windows.ACCESS_MODE) (resultErr error) {
+func setAccess(path string, sid *windows.SID, accessMode windows.ACCESS_MODE) error {
 	aclMutationMu.Lock()
 	defer aclMutationMu.Unlock()
 
@@ -708,9 +729,6 @@ func setAccess(path string, sid *windows.SID, accessMode windows.ACCESS_MODE) (r
 	if current == nil {
 		return errors.New("filesystem object has no security descriptor")
 	}
-	defer func() {
-		resultErr = errors.Join(resultErr, freeSecurityDescriptor(current))
-	}()
 	entry := windows.EXPLICIT_ACCESS{
 		AccessPermissions: windows.ACCESS_MASK(windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE),
 		AccessMode:        accessMode,
@@ -725,9 +743,6 @@ func setAccess(path string, sid *windows.SID, accessMode windows.ACCESS_MODE) (r
 	if err != nil {
 		return err
 	}
-	defer func() {
-		resultErr = errors.Join(resultErr, freeSecurityDescriptor(updated))
-	}()
 	dacl, _, err := updated.DACL()
 	if err != nil {
 		return err

@@ -51,6 +51,7 @@ type turnTool struct {
 type turnScope struct {
 	owner             *Service
 	userID            string
+	workspaceRoot     string
 	conversationID    string
 	turnID            string
 	evaluation        bool
@@ -91,7 +92,7 @@ func newScopedTurn(owner *Service, userID, conversationID, turnID string, evalua
 	if evaluation {
 		creator = map[string]provider.ToolDefinition{}
 	}
-	scope := &turnScope{owner: owner, userID: userID, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, runFiles: runFiles, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}, coreTools: map[string]coretools.Tool{}, activeTools: map[string]provider.ToolDefinition{}}
+	scope := &turnScope{owner: owner, userID: userID, workspaceRoot: owner.workspaceRoot, conversationID: conversationID, turnID: turnID, evaluation: evaluation, lease: lease, runFiles: runFiles, tools: map[string]pluginforge.CapabilityBinding{}, skills: map[string]pluginforge.SkillBinding{}, creator: creator, loaded: map[string]loadedTool{}, loadedByID: map[string]string{}, loadedCreate: map[string]provider.ToolDefinition{}, loadedCapsules: map[string]capsule.Manifest{}, coreTools: map[string]coretools.Tool{}, activeTools: map[string]provider.ToolDefinition{}}
 	if evaluation {
 		scope.permissionProfile = domain.PermissionProfileReadOnly
 	} else {
@@ -126,6 +127,7 @@ func newScopedTurn(owner *Service, userID, conversationID, turnID string, evalua
 
 func (s *turnScope) setWorkspaceRoot(root string) {
 	if strings.TrimSpace(root) != "" {
+		s.workspaceRoot = root
 		for _, ct := range coretools.GetCoreTools(root, s.runFiles) {
 			s.coreTools[ct.Definition.Function.Name] = ct
 		}
@@ -186,10 +188,29 @@ func (s *turnScope) authorizeTool(name string, arguments json.RawMessage) (permi
 	switch name {
 	case "axiom_capability_search", "axiom_capability_load", "axiom_tool_usage_metrics", "fs_read", "fs_list", "grep_search":
 		request.Source, request.Effect = "host", permissions.EffectRead
-	case "fs_write", "file_edit":
+	case "fs_write":
+		request.Source = "host"
+		path, ok := input["path"].(string)
+		if !ok || strings.TrimSpace(path) == "" {
+			request.Effect = permissions.EffectUnknown
+			break
+		}
+		exists, err := coretools.ExistingWorkspaceFile(s.workspaceRoot, path)
+		if err != nil {
+			request.Effect = permissions.EffectUnknown
+		} else if exists {
+			request.Effect = permissions.EffectDestructive
+		} else {
+			request.Effect = permissions.EffectWorkspaceWrite
+		}
+	case "file_edit":
 		request.Source, request.Effect = "host", permissions.EffectWorkspaceWrite
 	case "exec_command", "exec_script":
-		request.Source, request.Effect = "host", permissions.EffectShell
+		// Both process tools run in the OS sandbox: workspace access is read-only,
+		// writes are confined to private per-invocation temp storage, and network
+		// access is disabled. Classify their actual bounded effect, not the fact
+		// that the interface happens to be a shell or script.
+		request.Source, request.Effect = "host", permissions.EffectRead
 	case "axiom_plugin_projects", "axiom_plugin_source_tree", "axiom_plugin_read_source", "axiom_plugin_source_diff":
 		request.Source, request.Effect = "plugin_creator", permissions.EffectRead
 	case "axiom_plugin_propose", "axiom_plugin_generate", "axiom_plugin_write_source", "axiom_plugin_apply_patch", "axiom_plugin_begin_revision":
@@ -198,27 +219,37 @@ func (s *turnScope) authorizeTool(name string, arguments json.RawMessage) (permi
 		// Building executes a compiler over Agent-authored source and may resolve
 		// dependencies, so workspace write permission alone is insufficient.
 		request.Source, request.Effect = "plugin_creator", permissions.EffectSensitive
-	case "axiom_plugin_install", "axiom_plugin_rollback", "axiom_plugin_mark_unusable":
+	case "axiom_plugin_install":
 		request.Source, request.Effect = "plugin_lifecycle", permissions.EffectSensitive
 		if releaseID, ok := input["releaseId"].(string); ok {
 			request.ReleaseID = releaseID
 		}
-	case "axiom_fragment_create", "axiom_fragment_invoke", "axiom_fragment_drop", "axiom_capsule_save":
-		request.Source, request.Effect = "plugin_lifecycle", permissions.EffectSensitive
-	case "axiom_compact_context":
-		request.Source, request.Effect = "host", permissions.EffectSensitive
+	case "axiom_plugin_rollback":
+		// These change plugin availability, but don't execute new code and can
+		// be reversed by the user through the plugin manager.
+		request.Source, request.Effect = "plugin_lifecycle", permissions.EffectWorkspaceWrite
+	case "axiom_plugin_mark_unusable":
+		// The bundle is deleted after this durable state change; treat it like an
+		// irreversible removal rather than an ordinary plugin toggle.
+		request.Source, request.Effect = "plugin_lifecycle", permissions.EffectDestructive
+	case "axiom_fragment_create", "axiom_fragment_invoke", "axiom_fragment_drop", "axiom_compact_context":
+		// These only affect temporary, in-memory computation/context.
+		request.Source, request.Effect = "host", permissions.EffectEphemeral
+	case "axiom_capsule_save":
+		request.Source, request.Effect = "plugin_lifecycle", permissions.EffectWorkspaceWrite
 	case "web_search":
 		request.Source = "plugin"
 		request.PluginID = "core:web_search"
 		request.ReleaseID = "builtin.web-search.v1"
 		request.Resource = "Exa Search API"
-		request.Effect = permissions.EffectExternalRead
-		request.Reason = "联网搜索会把查询词发送到 Exa Search API，并由该服务处理后返回网页结果。"
-		request.Impact = "查询词会离开本机；请勿搜索密码、API Key 或私人内容。"
+		// Search is a read-only capability and only reaches the configured,
+		// explicitly enabled search provider. It must not pause every turn for
+		// a user approval; writes to external services remain a separate effect.
+		request.Effect = permissions.EffectRead
 	default:
 		if _, ok := s.coreTools[name]; ok {
-			// Only explicit core read tools are allow-listed above. Any new core tool
-			// remains unknown until its host-owned effect is classified here.
+			// Unknown effects stay unknown; read-only rejects them, while the two
+			// autonomous profiles follow their own rules regardless of tool source.
 			request.Source = "host"
 		} else if item, ok := s.loaded[name]; ok {
 			request.Source, request.PluginID, request.ReleaseID = "plugin", item.Capability.PluginID, item.Capability.ReleaseID
@@ -791,8 +822,8 @@ func creatorTools() map[string]provider.ToolDefinition {
 		tool("axiom_plugin_write_source", "Create or replace one text source file against an inspected plugin revision. Prefer a patch for ordinary edits.", `{"type":"object","required":["projectId","path","content","expectedRevision"],"properties":{"projectId":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"},"expectedRevision":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_apply_patch", "Apply a revision-checked Git patch to allowed plugin text sources. Deletion, rename, binary, mode, and out-of-contract changes are rejected.", `{"type":"object","required":["projectId","expectedRevision","patch"],"properties":{"projectId":{"type":"string"},"expectedRevision":{"type":"string"},"patch":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_begin_revision", "Begin an update while the active release keeps serving pinned turns.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_build", "Build and verify declared plugin surfaces into an immutable release.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
-		tool("axiom_plugin_install", "Install one tested immutable plugin release by exact release ID. Approval-required profiles show its digest and declared permissions before granting it; fully autonomous sessions can grant and activate it without a prompt. Always verify the exact release is installed and active before claiming success.", `{"type":"object","required":["projectId","releaseId"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_build", "Build and verify declared plugin surfaces into an immutable release. Workspace-auto asks before running plugin code; fully-auto does not ask.", `{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}},"additionalProperties":false}`),
+		tool("axiom_plugin_install", "Install one tested immutable plugin release by exact release ID. Workspace-auto asks before activating it; fully-auto does not ask. Always verify the exact release is installed and active before claiming success.", `{"type":"object","required":["projectId","releaseId"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_rollback", "Atomically roll an active plugin back to a previously installed immutable release.", `{"type":"object","required":["projectId","releaseId"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"}},"additionalProperties":false}`),
 		tool("axiom_plugin_mark_unusable", "Propose marking a known-bad immutable release unusable. User approval is required; its bundle will be removed on the next startup while release metadata and audit records remain.", `{"type":"object","required":["projectId","releaseId","reason"],"properties":{"projectId":{"type":"string"},"releaseId":{"type":"string"},"reason":{"type":"string","minLength":3,"maxLength":500}},"additionalProperties":false}`),
 	}

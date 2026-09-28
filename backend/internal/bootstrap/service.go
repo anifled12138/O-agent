@@ -112,10 +112,10 @@ Gap hypotheses: %s
 Baseline immutable Agent Definition:
 %s
 
-Propose at most %d diverse, minimal candidates. Supported strategies are exactly "react.v1" and "plan-react.v1". Keep maxSteps between 1 and 64. A candidate may change prompts, loop strategy, and step budget, but must remain provider-neutral and must not weaken tool-result truthfulness or user authority.
+Propose at most %d diverse, minimal candidates. Supported strategies are exactly "react.v1" and "plan-react.v1". Set maxSteps to a positive value appropriate to the task; there is no host-enforced maximum. A candidate may change prompts, loop strategy, and step budget, but must remain provider-neutral and must not weaken tool-result truthfulness or user authority.
 
 Return this exact JSON shape:
-{"candidates":[{"name":"...","description":"what changed and why it may address the measured gap","strategy":"react.v1|plan-react.v1","systemPrompt":"...","plannerPrompt":"... or empty for react.v1","maxSteps":12}]}`,
+{"candidates":[{"name":"...","description":"what changed and why it may address the measured gap","strategy":"react.v1|plan-react.v1","systemPrompt":"...","plannerPrompt":"... or empty for react.v1","maxSteps":500}]}`,
 		challenge.Title, challenge.Objective, challenge.FailureEvidence, challenge.SuccessCriteria, string(challenge.GapHypotheses), string(baselineJSON), count)
 }
 

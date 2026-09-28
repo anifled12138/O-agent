@@ -1,48 +1,25 @@
 package agent
 
-import "time"
-
 type RuntimeHealth struct {
-	ActiveRuns             int           `json:"activeRuns"`
-	QueuedInputs           int           `json:"queuedInputs"`
-	OutstandingEvaluations int           `json:"outstandingEvaluations"`
-	MaxConcurrent          int           `json:"maxConcurrentRuns"`
-	MaxTokensPerRun        int           `json:"maxTokensPerRun"`
-	MaxModelCalls          int           `json:"maxModelCalls"`
-	MaxRunDuration         time.Duration `json:"-"`
+	ActiveRuns             int `json:"activeRuns"`
+	QueuedInputs           int `json:"queuedInputs"`
+	OutstandingEvaluations int `json:"outstandingEvaluations"`
+	MaxModelCalls          int `json:"maxModelCalls"`
 }
 
-// RunLimits are host-owned ceilings. Agent generations may request stricter
-// limits, but cannot widen these values.
+// RunLimits holds optional host-level run settings. A zero model-call budget
+// means unlimited; positive values are a configurable per-run budget.
 type RunLimits struct {
-	MaxConcurrentRuns int
-	MaxTokensPerRun   int
-	MaxModelCalls     int
-	MaxRunDuration    time.Duration
+	MaxModelCalls int
 }
 
 func DefaultRunLimits() RunLimits {
-	return RunLimits{
-		MaxConcurrentRuns: 3,
-		MaxTokensPerRun:   60000,
-		MaxModelCalls:     64,
-		MaxRunDuration:    30 * time.Minute,
-	}
+	return RunLimits{MaxModelCalls: 300}
 }
 
 func (limits RunLimits) normalized() RunLimits {
-	defaults := DefaultRunLimits()
-	if limits.MaxConcurrentRuns < 1 {
-		limits.MaxConcurrentRuns = defaults.MaxConcurrentRuns
-	}
-	if limits.MaxTokensPerRun < 1 {
-		limits.MaxTokensPerRun = defaults.MaxTokensPerRun
-	}
-	if limits.MaxModelCalls < 1 {
-		limits.MaxModelCalls = defaults.MaxModelCalls
-	}
-	if limits.MaxRunDuration <= 0 {
-		limits.MaxRunDuration = defaults.MaxRunDuration
+	if limits.MaxModelCalls < 0 {
+		limits.MaxModelCalls = DefaultRunLimits().MaxModelCalls
 	}
 	return limits
 }

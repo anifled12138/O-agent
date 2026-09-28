@@ -302,6 +302,46 @@ WHERE recovery_class='' AND status IN ('completed','failed','cancelled','interru
 	if err := s.reclassifyLegacyReadOnlyTurns(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateLegacyReconciliationStatuses(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) migrateLegacyReconciliationStatuses(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_turns SET status='interrupted' WHERE status='needs_reconciliation'`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_inbox SET status='interrupted' WHERE status='needs_reconciliation'`); err != nil {
+		return err
+	}
+	var remainingTurns, remainingInbox int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_turns WHERE status='needs_reconciliation'`).Scan(&remainingTurns); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE status='needs_reconciliation'`).Scan(&remainingInbox); err != nil {
+		return err
+	}
+	if remainingTurns != 0 || remainingInbox != 0 {
+		return fmt.Errorf("legacy interrupted turn migration read-back failed: turns=%d inbox=%d", remainingTurns, remainingInbox)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_turns WHERE status='needs_reconciliation'`).Scan(&remainingTurns); err != nil {
+		return err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE status='needs_reconciliation'`).Scan(&remainingInbox); err != nil {
+		return err
+	}
+	if remainingTurns != 0 || remainingInbox != 0 {
+		return fmt.Errorf("legacy interrupted turn migration did not persist: turns=%d inbox=%d", remainingTurns, remainingInbox)
+	}
 	return nil
 }
 
