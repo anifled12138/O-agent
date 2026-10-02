@@ -26,6 +26,14 @@ desktop/dist/
 .gocache/
 .gomodcache/
 .gopath/
+backend/.gotmp/
+backend/.tmp-go-cache/
+backend/.tmp-go-build-cache*/
+backend/.tmp-go-mod-cache/
+backend/.tmp-axiom-linux-amd64
+backend/axiom-sandbox-check
+backend/backend/
+.gotmp/
 .cache/
 backend/axiom.exe
 backend/o-host.exe

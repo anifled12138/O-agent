@@ -1,0 +1,34 @@
+[Unit]
+Description=Create and verify an encrypted O offsite control backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=oagent
+Group=oagent
+UMask=0077
+EnvironmentFile=/etc/o-agent/backup.env
+LoadCredential=backup-key:/etc/o-agent/backup.key
+LoadCredential=rclone-config:/etc/o-agent/rclone.conf
+Environment=O_BACKUP_KEY_FILE=%d/backup-key
+Environment=RCLONE_CONFIG=%d/rclone-config
+ExecStart=/usr/local/lib/o-agent/backup-and-upload.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/o-agent
+ReadOnlyPaths=/opt/o-agent/current /etc/o-agent/backup.env
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+DevicePolicy=closed
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+TimeoutStartSec=infinity

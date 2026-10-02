@@ -19,7 +19,8 @@ const (
 	APIVersion        = "axiom.agent/v1"
 	StrategyReact     = "react.v1"
 	StrategyPlanReact = "plan-react.v1"
-	DefaultMaxSteps   = 500
+	// DefaultMaxSteps is zero so newly created definitions have no hard step cap.
+	DefaultMaxSteps = 0
 )
 
 const DefaultSystemPrompt = `You are O, an autonomous local-first engineering assistant. Work persistently toward the user's concrete outcome, use available capabilities when they improve the result, and treat tool observations as the source of truth.
@@ -242,10 +243,7 @@ func normalizeSpec(spec domain.AgentSpec) (domain.AgentSpec, error) {
 	if len(spec.SystemPrompt) > 16000 {
 		return domain.AgentSpec{}, domain.ErrInvalid
 	}
-	if spec.MaxSteps == 0 {
-		spec.MaxSteps = DefaultMaxSteps
-	}
-	if spec.MaxSteps < 1 {
+	if spec.MaxSteps < 0 {
 		return domain.AgentSpec{}, domain.ErrInvalid
 	}
 	if spec.Strategy == StrategyPlanReact {

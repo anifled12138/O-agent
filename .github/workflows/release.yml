@@ -46,7 +46,7 @@ jobs:
             - **🧩 原生插件系统与 MCP 协议支持**：
               - 深度整合 Model Context Protocol (MCP) 客户端与工具标准
               - 插件完整自治生命周期：提议、代码生成、沙箱编译与安全权限授权
-              - 零编译运行时能力碎片 (Axiom Fragments) 与不可变状态胶囊 (Capsules)
+              - 零编译运行时能力碎片 (O Fragments) 与不可变状态胶囊 (Capsules)
             - **🧬 自主工程演化闭环 (Self-Evolution & Harness)**：
               - 内置多维度能力基准评测集 (Eval Harness)
               - 具备自动化回溯验证、基线性能对比与安全边界约束

@@ -1,22 +1,132 @@
 'use client';
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Plus, Layers, Settings as SettingsIcon, Activity, ArrowUp, Square, Pause, Sparkles, KeyRound, AlertCircle, Info, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight, GitFork, Shield, Copy } from 'lucide-react';
+import type { CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent, RefObject } from 'react';
+import { Plus, Layers, Settings as SettingsIcon, Activity, ClipboardList, ArrowUp, Square, Pause, Sparkles, KeyRound, AlertCircle, Info, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight, GitFork, Shield, Copy, PanelLeftClose, PanelLeftOpen, Trash2, Laptop, Paperclip } from 'lucide-react';
 import UnifiedPluginCenter from './UnifiedPluginCenter';
 import ObservabilityModal from './ObservabilityModal';
 import { Settings } from './SettingsModal';
 import ProjectModal from './ProjectModal';
 import { copyToClipboard, MarkdownView } from './MarkdownView';
-import { API_V2, request, UnifiedPlugin, getUnifiedPlugins, updateConversationTitle, generateConversationTitle, Project, getProjects, updateConversationProject, updateConversationPermissionProfile, ConversationPermissionProfile, ApprovalRequest, getConversationApprovals, resolveAgentApproval } from './api';
+import WebAppControls from './WebAppControls';
+import CloudTaskCenter from './CloudTaskCenter';
+import ExecutionNodesModal from './ExecutionNodesModal';
+import { API_V2, request, UnifiedPlugin, getUnifiedPlugins, updateConversationTitle, generateConversationTitle, deleteConversation as deleteConversationRequest, getDeletedConversations, restoreConversation as restoreConversationRequest, DeletedConversation, Project, getProjects, updateConversationProject, updateConversationPermissionProfile, ConversationPermissionProfile, ApprovalRequest, getConversationApprovals, resolveAgentApproval, ExecutionNode, getExecutionNodes, submitLocalAgentTask, uploadArtifactFile, UserArtifact } from './api';
 
-export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; contextWindow: number; hasApiKey: boolean };
+export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; contextWindow: number; supportsVision?: boolean | null; hasApiKey: boolean };
 type Conversation = { id: string; title: string; providerId: string; agentGenerationId?: string; agentDefinitionDigest?: string; projectId?: string; permissionProfile: ConversationPermissionProfile; parentConversationId?: string; branchFromMessageId?: string; executionPaused: boolean; updatedAt: string };
 type Message = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string };
 type ConversationDetail = Conversation & { messages: Message[]; lifecycleEvents?: { id: string; kind: string; createdAt: string }[] };
 type TraceEvent = { id: string; turnId: string; sequence: number; kind: string; details: Record<string, unknown>; createdAt: string };
-type AgentTurn = { id: string; conversationId: string; inputMessageId: string; retryOfTurnId?: string; resultMessageId?: string; providerId: string; permissionProfile?: ConversationPermissionProfile; status: string; stopReason?: string; recoveryClass?: string; cancelRequested: boolean; lastSequence: number; startedAt: string; completedAt?: string };
-type TurnReceipt = { turnId: string; conversationId: string; inputMessageId: string; status: string };
+type RunMetrics = { modelCalls: number; toolCalls: number; totalTokens: number; durationMillis: number };
+type RunStateFact = { id: string; kind: string; statement?: string; status: string; sourceKind: string; verification: string; sourceRef: string };
+type RunStateAction = { sequence: number; toolCallId: string; toolName: string; effect?: string; status: string; sourceRef?: string; sourceHash?: string; sourceAvailability: 'available' | 'missing' | 'not_applicable' };
+type AgentRunState = { version: number; completeness: 'complete' | 'degraded'; completenessNote?: string; currentRequest?: RunStateFact; actions?: RunStateAction[]; pendingActions?: RunStateAction[]; assistantResponse?: RunStateFact };
+type CompletionAssessment = { status: 'unassessed' | 'unverified' | 'verified_completed'; assistantSourceRef?: string; evidenceRefs?: string[] };
+type AgentTurn = { id: string; conversationId: string; inputMessageId: string; retryOfTurnId?: string; continuedFromTurnId?: string; continuationChainId?: string; cumulativeMetrics?: RunMetrics; continuationAvailable?: boolean; continuationUnavailableReason?: string; runState: AgentRunState; completionAssessment: CompletionAssessment; resultMessageId?: string; providerId: string; permissionProfile?: ConversationPermissionProfile; status: string; stopReason?: string; recoveryClass?: string; reconciliationNote?: string; cancelRequested: boolean; lastSequence: number; startedAt: string; completedAt?: string };
+type TurnReceipt = { turnId: string; conversationId: string; inputMessageId: string; status: string; continuedFromTurnId?: string; continuationChainId?: string };
 type InboxInput = { id: string; conversationId: string; content: string; status: string; turnId?: string; createdAt: string };
+type CloudExecutionTask = { id: string; nodeId: string; status: string; cancelRequested: boolean; error?: string; result?: Record<string, string> };
+
+const SIDEBAR_MIN_WIDTH = 128;
+const SIDEBAR_COLLAPSE_THRESHOLD = 116;
+const SIDEBAR_MAX_WIDTH = 420;
+const WORKSPACE_MIN_WIDTH = 320;
+const SIDEBAR_RESIZE_GUTTER = 8;
+const CONVERSATION_DELETE_CONFIRMATION_KEY = 'axiom_skip_conversation_delete_confirmation_until';
+const MOBILE_NAVIGATION_QUERY = '(max-width: 720px), (max-height: 500px) and (pointer: coarse)';
+
+function localCalendarDayKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+export default function OApp() {
+  const [gate, setGate] = useState<'checking' | 'open' | 'login' | 'setup'>('checking');
+  const [authRequired, setAuthRequired] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [bootstrapToken, setBootstrapToken] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    request<{ authenticationRequired: boolean; setupRequired: boolean }>('/auth/status')
+      .then(async (status) => {
+        if (cancelled) return;
+        setAuthRequired(status.authenticationRequired);
+        if (!status.authenticationRequired) { setGate('open'); return; }
+        try {
+          await request('/auth/session');
+          if (!cancelled) setGate('open');
+        } catch {
+          if (!cancelled) setGate(status.setupRequired ? 'setup' : 'login');
+        }
+      })
+      .catch((cause: unknown) => { if (!cancelled) { setError(cause instanceof Error ? cause.message : '连接 O 服务失败'); setGate('login'); } });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      if (gate === 'setup') {
+        await request('/auth/setup', {
+          method: 'POST',
+          headers: { 'X-O-Bootstrap-Token': bootstrapToken },
+          body: JSON.stringify({ email, displayName, password }),
+        });
+      } else {
+        await request('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
+      }
+      setGate('open');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '身份验证失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (gate === 'open') return <WorkspaceApp />;
+  if (gate === 'checking') return <Splash />;
+  return (
+    <main style={{ minHeight: '100dvh', display: 'grid', placeItems: 'center', padding: 24, background: '#f4f3ee', color: '#25251f' }}>
+      <form onSubmit={submit} style={{ width: 'min(100%, 400px)', display: 'grid', gap: 14, padding: 28, border: '1px solid #deddd5', borderRadius: 18, background: '#fffefa', boxShadow: '0 16px 48px #25251f12' }}>
+        <div><div style={{ fontSize: 25, fontWeight: 700 }}>O</div><h1 style={{ margin: '8px 0 4px', fontSize: 20 }}>{gate === 'setup' ? '设置云端管理员' : '登录 O'}</h1><p style={{ margin: 0, color: '#696960', fontSize: 14 }}>{gate === 'setup' ? '首次设置需要服务器启动时配置的引导密钥。' : '登录后可安全访问你的任务和工作区。'}</p></div>
+        {gate === 'setup' && <label style={authLabel}>引导密钥<input required autoComplete="off" value={bootstrapToken} onChange={(event) => setBootstrapToken(event.target.value)} style={authInput} /></label>}
+        {gate === 'setup' && <label style={authLabel}>显示名称<input required value={displayName} onChange={(event) => setDisplayName(event.target.value)} style={authInput} /></label>}
+        <label style={authLabel}>邮箱<input required type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} style={authInput} /></label>
+        <label style={authLabel}>密码<input required minLength={12} type="password" autoComplete={gate === 'setup' ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} style={authInput} /></label>
+        {error && <p role="alert" style={{ margin: 0, color: '#a22828', fontSize: 14 }}>{error}</p>}
+        <button disabled={busy} type="submit" style={{ minHeight: 44, border: 0, borderRadius: 10, background: '#25251f', color: 'white', fontWeight: 600, cursor: busy ? 'wait' : 'pointer' }}>{busy ? '请稍候…' : gate === 'setup' ? '创建管理员并登录' : '登录'}</button>
+        {authRequired && <p style={{ margin: 0, color: '#77776e', fontSize: 12 }}>会话使用安全 Cookie 保存；请通过 HTTPS 访问云端服务。</p>}
+      </form>
+    </main>
+  );
+}
+
+const authLabel: CSSProperties = { display: 'grid', gap: 6, fontSize: 13, fontWeight: 600 };
+const authInput: CSSProperties = { width: '100%', boxSizing: 'border-box', minHeight: 42, padding: '8px 11px', border: '1px solid #cbc9c0', borderRadius: 9, background: '#fff', color: '#25251f', font: 'inherit' };
+
+function skipConversationDeleteConfirmationToday() {
+  try {
+    return localStorage.getItem(CONVERSATION_DELETE_CONFIRMATION_KEY) === localCalendarDayKey();
+  } catch {
+    return false;
+  }
+}
+
+function getSidebarMaxWidth() {
+  if (typeof window === 'undefined') return SIDEBAR_MAX_WIDTH;
+  if (window.matchMedia(MOBILE_NAVIGATION_QUERY).matches) return Math.min(320, window.innerWidth - 48);
+  return Math.max(0, Math.min(SIDEBAR_MAX_WIDTH, window.innerWidth - WORKSPACE_MIN_WIDTH - SIDEBAR_RESIZE_GUTTER));
+}
 
 export function cleanTitleString(rawTitle?: string): string {
   if (!rawTitle) return '';
@@ -42,18 +152,153 @@ export function shouldAutoTitle(title?: string): boolean {
   return false;
 }
 
-export default function OApp() {
+function WorkspaceApp() {
   const [loading, setLoading] = useState(true);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [mobileViewport, setMobileViewport] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(240);
+  const [sidebarResizing, setSidebarResizing] = useState(false);
+  const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [recoverableConversations, setRecoverableConversations] = useState<DeletedConversation[]>([]);
+  const hasRecoverableConversations = useMemo(
+    () => recoverableConversations.some((item) => Date.parse(item.recoverUntil) > Date.now()),
+    [recoverableConversations]
+  );
   const [active, setActive] = useState<ConversationDetail | null>(null);
   const [selectedProviderId, setSelectedProviderId] = useState<string>('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [observabilityOpen, setObservabilityOpen] = useState(false);
+  const [cloudTasksOpen, setCloudTasksOpen] = useState(false);
+  const [executionNodesOpen, setExecutionNodesOpen] = useState(false);
   const [pluginsOpen, setPluginsOpen] = useState<false | 'all' | 'mcp' | 'skill' | 'core' | 'release'>(false);
   const [unifiedPlugins, setUnifiedPlugins] = useState<UnifiedPlugin[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [editingProject, setEditingProject] = useState<Project | null | undefined>(undefined);
+  const [recentlyDeletedOpen, setRecentlyDeletedOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
+  const [skipDeleteConfirmationToday, setSkipDeleteConfirmationToday] = useState(false);
+  const [deletingConversation, setDeletingConversation] = useState(false);
+
+  useEffect(() => {
+    const nextExpiry = recoverableConversations
+      .map((item) => Date.parse(item.recoverUntil))
+      .filter((expiry) => expiry > Date.now())
+      .sort((a, b) => a - b)[0];
+    if (!nextExpiry) return;
+    const timeout = window.setTimeout(() => {
+      getDeletedConversations()
+        .then(setRecoverableConversations)
+        .catch(() => {
+          const now = Date.now();
+          setRecoverableConversations((items) => items.filter((item) => Date.parse(item.recoverUntil) > now));
+        });
+    }, Math.max(0, nextExpiry - Date.now() + 50));
+    return () => window.clearTimeout(timeout);
+  }, [recoverableConversations]);
+
+  useEffect(() => {
+    const mobile = window.matchMedia(MOBILE_NAVIGATION_QUERY);
+    let wasMobile = false;
+    function fitSidebarToViewport() {
+      setMobileViewport(mobile.matches);
+      if (mobile.matches) {
+        if (!wasMobile) setSidebarCollapsed(true);
+        wasMobile = true;
+        return;
+      }
+      wasMobile = false;
+      const maxWidth = getSidebarMaxWidth();
+      if (maxWidth < SIDEBAR_MIN_WIDTH) {
+        setSidebarCollapsed(true);
+        return;
+      }
+      setSidebarWidth((width) => Math.min(width, maxWidth));
+    }
+    fitSidebarToViewport();
+    window.addEventListener('resize', fitSidebarToViewport);
+    return () => window.removeEventListener('resize', fitSidebarToViewport);
+  }, []);
+
+  useEffect(() => {
+    if (!mobileViewport || sidebarCollapsed) return;
+    const panel = document.getElementById('app-sidebar');
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    panel?.focus();
+    function handleDrawerKeys(event: KeyboardEvent) {
+      if (event.key === 'Escape') { event.preventDefault(); setSidebarCollapsed(true); }
+      if (event.key !== 'Tab' || !panel) return;
+      const controls = Array.from(panel.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input, [tabindex="0"]')).filter((item) => item.getClientRects().length > 0);
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (!first || !last) { event.preventDefault(); return; }
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === panel)) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+    document.addEventListener('keydown', handleDrawerKeys);
+    return () => { document.removeEventListener('keydown', handleDrawerKeys); previousFocus?.focus(); };
+  }, [mobileViewport, sidebarCollapsed]);
+
+  function toggleSidebar() {
+    if (!sidebarCollapsed) {
+      setSidebarCollapsed(true);
+      return;
+    }
+    const maxWidth = getSidebarMaxWidth();
+    if (maxWidth < SIDEBAR_MIN_WIDTH) return;
+    setSidebarWidth((width) => Math.min(Math.max(width, SIDEBAR_MIN_WIDTH), maxWidth));
+    setSidebarCollapsed(false);
+  }
+
+  function onSidebarResizePointerDown(event: PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    sidebarResizeRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: sidebarWidth };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setSidebarResizing(true);
+  }
+
+  function onSidebarResizePointerMove(event: PointerEvent<HTMLDivElement>) {
+    const drag = sidebarResizeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const requestedWidth = drag.startWidth + event.clientX - drag.startX;
+    if (requestedWidth < SIDEBAR_COLLAPSE_THRESHOLD) {
+      sidebarResizeRef.current = null;
+      setSidebarResizing(false);
+      setSidebarCollapsed(true);
+      return;
+    }
+    const maxWidth = getSidebarMaxWidth();
+    setSidebarWidth(Math.min(Math.max(requestedWidth, SIDEBAR_MIN_WIDTH), maxWidth));
+  }
+
+  function finishSidebarResize(event: PointerEvent<HTMLDivElement>) {
+    if (sidebarResizeRef.current?.pointerId === event.pointerId) sidebarResizeRef.current = null;
+    setSidebarResizing(false);
+  }
+
+  function onSidebarResizeKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Home') {
+      event.preventDefault();
+      setSidebarCollapsed(true);
+      return;
+    }
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      const delta = event.key === 'ArrowLeft' ? -16 : 16;
+      const nextWidth = sidebarWidth + delta;
+      if (nextWidth < SIDEBAR_COLLAPSE_THRESHOLD) {
+        setSidebarCollapsed(true);
+        return;
+      }
+      const maxWidth = getSidebarMaxWidth();
+      setSidebarWidth(Math.min(Math.max(nextWidth, SIDEBAR_MIN_WIDTH), maxWidth));
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      setSidebarWidth(getSidebarMaxWidth());
+    }
+  }
 
   const isProjectPluginEnabled = useMemo(() => {
     const p = unifiedPlugins.find((item) => item.id === 'core:project_workspace');
@@ -99,11 +344,32 @@ export default function OApp() {
   const observeTurnRef = useRef<(turnId: string, conversationId: string) => Promise<void>>(async () => {});
 
   const [notice, setNoticeMessage] = useState('');
+  const [executionTarget, setExecutionTarget] = useState<'current' | 'cloud' | 'local'>('current');
+  const [executionNodes, setExecutionNodes] = useState<ExecutionNode[]>([]);
+  const [selectedExecutionNodeId, setSelectedExecutionNodeId] = useState('');
+  const [activeCloudTaskId, setActiveCloudTaskId] = useState('');
+  const [cloudTaskConversationId, setCloudTaskConversationId] = useState('');
   const [noticeTone, setNoticeTone] = useState<'info' | 'error'>('info');
   const setNotice = useCallback((message: string, tone: 'info' | 'error' = 'info') => {
     setNoticeMessage(message);
     setNoticeTone(tone);
   }, []);
+  useEffect(() => {
+    let active = true;
+    const refreshNodes = async () => {
+      try {
+        const nodes = await getExecutionNodes();
+        if (active) setExecutionNodes(nodes);
+      } catch {
+        if (active) setExecutionNodes([]);
+      }
+    };
+    void refreshNodes();
+    const interval = window.setInterval(() => void refreshNodes(), 10_000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, []);
+  const onlineExecutionNodes = executionNodes.filter((node) => node.connectivity === 'connected' && !node.revokedAt);
+  const selectedExecutionNode = onlineExecutionNodes.find((node) => node.id === selectedExecutionNodeId) ?? onlineExecutionNodes[0];
   const [trace, setTrace] = useState<TraceEvent[]>([]);
   const [turns, setTurns] = useState<AgentTurn[]>([]);
   const [queuedInputs, setQueuedInputs] = useState<Record<string, InboxInput[]>>({});
@@ -111,12 +377,113 @@ export default function OApp() {
   const activeRef = useRef<ConversationDetail | null>(null);
   activeRef.current = active;
 
+  useEffect(() => {
+    if (!deleteTarget) return;
+    function handleDeleteDialogKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape' && !deletingConversation) setDeleteTarget(null);
+    }
+    window.addEventListener('keydown', handleDeleteDialogKeyDown);
+    return () => window.removeEventListener('keydown', handleDeleteDialogKeyDown);
+  }, [deleteTarget, deletingConversation]);
+
+  function requestConversationDeletion(id: string) {
+    const target = conversations.find((item) => item.id === id);
+    if (!target) return;
+    if (skipConversationDeleteConfirmationToday()) {
+      void performConversationDeletion(target, false);
+      return;
+    }
+    setSkipDeleteConfirmationToday(false);
+    setDeleteTarget(target);
+  }
+
+  async function performConversationDeletion(target: Conversation, rememberToday: boolean) {
+    if (deletingConversation) return;
+    let preferenceSaved = true;
+    setDeletingConversation(true);
+
+    let receipt;
+    try {
+      receipt = await deleteConversationRequest(target.id);
+      if (receipt.conversationId !== target.id || !Number.isFinite(Date.parse(receipt.recoverUntil))) {
+        throw new Error('删除接口返回的回收信息无效，请刷新对话列表确认状态。');
+      }
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '删除对话失败', 'error');
+      setDeletingConversation(false);
+      return;
+    }
+
+    if (rememberToday) {
+      try {
+        localStorage.setItem(CONVERSATION_DELETE_CONFIRMATION_KEY, localCalendarDayKey());
+      } catch {
+        preferenceSaved = false;
+      }
+    }
+    const recoveryItem: DeletedConversation = {
+      id: target.id,
+      title: target.title,
+      projectId: target.projectId,
+      deletedAt: receipt.deletedAt,
+      recoverUntil: receipt.recoverUntil,
+    };
+    setRecoverableConversations((items) => [recoveryItem, ...items.filter((item) => item.id !== target.id)]);
+
+    const observer = observersRef.current.get(target.id);
+    if (observer) {
+      observer.controller.abort();
+      observersRef.current.delete(target.id);
+    }
+    setConversations((items) => items.filter((item) => item.id !== target.id));
+    setRunningConvos((items) => {
+      if (!(target.id in items)) return items;
+      const next = { ...items };
+      delete next[target.id];
+      return next;
+    });
+    setQueuedInputs((items) => {
+      if (!(target.id in items)) return items;
+      const next = { ...items };
+      delete next[target.id];
+      return next;
+    });
+    if (activeIdRef.current === target.id) {
+      activeIdRef.current = '';
+      activeRef.current = null;
+      setActive(null);
+      setTrace([]);
+      setTurns([]);
+    }
+    setDeleteTarget(null);
+
+    try {
+      const [readback, recoveryReadback] = await Promise.all([
+        request<Conversation[]>('/conversations'),
+        getDeletedConversations(),
+      ]);
+      if (readback.some((item) => item.id === target.id)) {
+        throw new Error('删除后的对话仍出现在普通列表中。');
+      }
+      setConversations(readback);
+      setRecoverableConversations(recoveryReadback);
+      setNotice(preferenceSaved
+        ? `「${cleanTitleString(target.title) || '新对话'}」已删除，24 小时内可找回。`
+        : '对话已删除，但“今天不再询问”设置未能保存；24 小时内可找回。', preferenceSaved ? 'info' : 'error');
+    } catch (error) {
+      setNotice(`对话已删除，但列表状态核对失败：${error instanceof Error ? error.message : '读取失败'}。请刷新确认。`, 'error');
+    } finally {
+      setDeletingConversation(false);
+    }
+  }
+
   // Title editing state
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
   const titleInputRef = useRef<HTMLInputElement>(null);
   const isSavingTitleRef = useRef(false);
   const isCancellingTitleRef = useRef(false);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (editingTitle && titleInputRef.current) {
@@ -197,28 +564,32 @@ export default function OApp() {
     };
   }, []);
 
+  const newConversationRef = useRef(newConversation);
+  newConversationRef.current = newConversation;
+
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'n') {
         e.preventDefault();
-        newConversation();
+        newConversationRef.current();
       }
     }
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     void Promise.all([
       request<Provider[]>('/providers'),
       request<Conversation[]>('/conversations'),
+      getDeletedConversations().catch(() => [] as DeletedConversation[]),
       getUnifiedPlugins().catch(() => [] as UnifiedPlugin[]),
       getProjects().catch(() => [] as Project[]),
     ])
-      .then(([providerList, conversationList, pluginList, projectList]) => {
+      .then(([providerList, conversationList, recoveryList, pluginList, projectList]) => {
         setProviders(providerList);
         setConversations(conversationList);
+        setRecoverableConversations(recoveryList);
         if (pluginList.length > 0) setUnifiedPlugins(pluginList);
         if (projectList) setProjects(projectList);
       })
@@ -416,30 +787,30 @@ export default function OApp() {
   }
 
   function newConversation() {
-    // 1. 若当前已经是未发消息的新会话草稿状态，直接保持当前界面，不重复创建
-    if (!activeRef.current || (activeRef.current.messages && activeRef.current.messages.length === 0)) {
+    // 1. 若当前已经在空白草稿态，直接聚焦输入框，让用户感知到点击动作已响应
+    if (!activeRef.current) {
+      composerInputRef.current?.focus();
       return;
     }
-    // 2. 如果列表中已存在未发消息或标题为“新对话”的会话，直接切换过去，不新建多余会话
-    const existingNew = conversations.find(
-      (item) => cleanTitleString(item.title) === '新对话' || !cleanTitleString(item.title)
-    );
-    if (existingNew) {
-      void openConversation(existingNew.id);
-      return;
-    }
-    // 3. 否则切换到草稿态（待发送首条消息时再持久化）
+    // 2. 当用户在已有会话（无论是否正在运行）中点击“新会话”时，无条件切换到新会话草稿态
     setEditingTitle(false);
     activeIdRef.current = '';
     setActive(null);
     setTrace([]);
     setTurns([]);
     setNotice('');
+    setTimeout(() => {
+      composerInputRef.current?.focus();
+    }, 0);
   }
 
-  async function send(content: string): Promise<boolean> {
+  async function send(content: string, inputArtifacts: UserArtifact[] = []): Promise<boolean> {
     if (!content.trim()) return false;
-    if (active && runningConvosRef.current[active.id]) {
+    if (executionTarget !== 'cloud' && active && runningConvosRef.current[active.id]) {
+      if (inputArtifacts.length > 0) {
+        setNotice('附件任务需要创建独立的云端或本地执行任务；请等当前回合结束后再提交附件。', 'error');
+        return false;
+      }
       try {
         const item = await request<InboxInput>(`${API_V2}/agent/conversations/${encodeURIComponent(active.id)}/inbox`, {
           method: 'POST',
@@ -480,7 +851,33 @@ export default function OApp() {
         setActive(target);
       }
       const pending: Message = { id: `pending-${Date.now()}`, role: 'user', content, createdAt: new Date().toISOString() };
-      setActive({ ...target, messages: [...target.messages, pending] });
+      if (executionTarget !== 'local') setActive({ ...target, messages: [...target.messages, pending] });
+      if (executionTarget === 'cloud') {
+        const key = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const submitted = await request<{ task: CloudExecutionTask; created: boolean }>(`/conversations/${encodeURIComponent(target.id)}/tasks/cloud`, {
+          method: 'POST',
+          headers: { 'Idempotency-Key': key },
+          body: JSON.stringify({ content, artifactIds: inputArtifacts.map((artifact) => artifact.id) }),
+        });
+        if (submitted.task.status !== 'queued' || !submitted.task.id) throw new Error('云端任务没有读回为已排队状态。');
+        setActiveCloudTaskId(submitted.task.id);
+        setCloudTaskConversationId(target.id);
+        setNotice(`任务 ${submitted.task.id} 已持久进入云端队列。`);
+        void monitorCloudTask(submitted.task.id, target.id);
+        return true;
+      }
+      if (executionTarget === 'local') {
+        const node = selectedExecutionNode;
+        if (!node) throw new Error('没有在线的本地执行设备；请先在“执行设备”中登记电脑并启动本地 O 节点代理。');
+        const key = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const submitted = await submitLocalAgentTask(target.id, node.id, content, key, inputArtifacts.map((artifact) => artifact.id));
+        if (submitted.task.status !== 'queued' || submitted.task.nodeId !== node.id || !submitted.task.id) throw new Error('本地任务没有读回为指定设备上的排队状态。');
+        setActiveCloudTaskId(submitted.task.id);
+        setCloudTaskConversationId(target.id);
+        setNotice(`任务已发给 ${node.name}；本地会话和完整记录会归档到云端任务。`);
+        void monitorCloudTask(submitted.task.id, target.id, 'local');
+        return true;
+      }
       const receipt = await request<TurnReceipt>(`${API_V2}/agent/conversations/${target.id}/turns`, {
         method: 'POST',
         body: JSON.stringify({ content }),
@@ -502,6 +899,18 @@ export default function OApp() {
 
   async function cancelTurn() {
     if (!active) return;
+    if (activeCloudTaskId && cloudTaskConversationId === active.id) {
+      try {
+        const receipt = await request<CloudExecutionTask>(`/tasks/${encodeURIComponent(activeCloudTaskId)}/cancel`, { method: 'POST', body: '{}' });
+        if (!receipt.cancelRequested && !['cancelled', 'completed', 'reported_failed', 'needs_reconciliation'].includes(receipt.status)) throw new Error('取消状态未从云端读回。');
+        setNotice(`云端任务状态：${receipt.status}`);
+        setActiveCloudTaskId('');
+        return;
+      } catch (error) {
+        setNotice(error instanceof Error ? error.message : '无法取消云端任务', 'error');
+        return;
+      }
+    }
     try {
       const receipt = await request<{ cancelledTurnId?: string; cancelledTurnStatus?: string; cancelledInboxCount: number; queuedInboxRemaining: number; executionPaused: boolean }>(`${API_V2}/agent/conversations/${encodeURIComponent(active.id)}/cancel`, {
         method: 'POST',
@@ -515,6 +924,49 @@ export default function OApp() {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '无法停止会话', 'error');
     }
+  }
+
+  async function monitorCloudTask(taskId: string, conversationId: string, destination: 'cloud' | 'local' = 'cloud') {
+    const deadline = Date.now() + 5 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1200));
+      try {
+        const task = await request<CloudExecutionTask>(`/tasks/${encodeURIComponent(taskId)}`);
+        if (task.id !== taskId) throw new Error('任务状态回读 ID 不匹配。');
+        if (task.status === 'completed') {
+          if (activeIdRef.current === conversationId) setNotice(`云端任务 ${taskId} 已完成并验证。`);
+          setActiveCloudTaskId((current) => current === taskId ? '' : current);
+          await refreshConversation(conversationId);
+          return;
+        }
+        if (task.status === 'incomplete') {
+          if (activeIdRef.current === conversationId) setNotice(`云端任务 ${taskId} 已安全暂停，尚未完成；检查点已保存，可以在会话中继续。`, 'info');
+          setActiveCloudTaskId((current) => current === taskId ? '' : current);
+          await refreshConversation(conversationId);
+          return;
+        }
+        if (task.status === 'reported_succeeded' && destination === 'local') {
+          const result = task.result as { assistantText?: unknown; assistantTextTruncated?: unknown; transcriptArtifact?: { id?: unknown; fileName?: unknown } } | undefined;
+          const assistantText = typeof result?.assistantText === 'string' ? result.assistantText : '';
+          const previewSuffix = result?.assistantTextTruncated === true ? '（回复较长，完整内容请到任务中心下载）' : '';
+          if (activeIdRef.current === conversationId) setNotice(`本地节点已报告执行成功，完整会话已归档到云端任务记录。${assistantText ? ` ${assistantText}` : ''}${previewSuffix}`);
+          setActiveCloudTaskId((current) => current === taskId ? '' : current);
+          return;
+        }
+        if (['reported_failed', 'needs_reconciliation', 'cancelled'].includes(task.status)) {
+          const destinationName = destination === 'local' ? '本地任务' : '云端任务';
+          if (activeIdRef.current === conversationId) setNotice(`${destinationName} ${taskId}：${task.status}${task.error ? ` · ${task.error}` : ''}`, task.status === 'cancelled' ? 'info' : 'error');
+          setActiveCloudTaskId((current) => current === taskId ? '' : current);
+          await refreshConversation(conversationId);
+          return;
+        }
+        if (activeIdRef.current === conversationId) setNotice(`云端任务 ${taskId}：${task.status}`);
+      } catch (error) {
+        if (activeIdRef.current === conversationId) setNotice(error instanceof Error ? `读取云端任务失败：${error.message}` : '读取云端任务失败', 'error');
+        return;
+      }
+    }
+    if (activeIdRef.current === conversationId) setNotice(`云端任务 ${taskId} 仍在运行；任务记录仍保存在云端。`);
   }
 
   async function retryTurn(turnId: string, editedContent?: string): Promise<boolean> {
@@ -544,6 +996,33 @@ export default function OApp() {
     }
   }
 
+  async function reconcileTurn(turnId: string, outcome: 'no_effect_applied' | 'effect_applied' | 'still_unknown', note: string): Promise<boolean> {
+    try {
+      const response = await request<{ reconciliation: { turnId: string; decision: string; note: string }; turn: AgentTurn; history: { decision: string; note: string }[] }>(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/reconcile`, {
+        method: 'POST',
+        body: JSON.stringify({ outcome, note }),
+      });
+      const expected = outcome === 'no_effect_applied'
+        ? { recoveryClass: 'safe_to_retry', status: 'interrupted' }
+        : outcome === 'effect_applied'
+          ? { recoveryClass: 'external_effect_confirmed', status: 'interrupted' }
+          : { recoveryClass: 'unknown_external_effect', status: 'needs_reconciliation' };
+      if (response.turn.id !== turnId || response.turn.status !== expected.status || response.turn.recoveryClass !== expected.recoveryClass || response.reconciliation.turnId !== turnId || response.reconciliation.decision !== outcome || !response.history.some((item) => item.decision === outcome && item.note === note.trim())) {
+        throw new Error('副作用核查结果没有从云端持久记录读回。');
+      }
+      await refreshConversation(response.turn.conversationId);
+      setNotice(outcome === 'no_effect_applied'
+        ? '已记录“本轮没有外部副作用”；现在可以显式重试原任务。'
+        : outcome === 'effect_applied'
+          ? '已记录“副作用确认已发生”；原任务不可重放，可以继续发送新的后续指令。'
+          : '仍无法确认副作用；会话继续锁定，不会自动重试。', 'info');
+      return true;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '保存副作用核查结果失败', 'error');
+      return false;
+    }
+  }
+
   async function forkTurn(turnId: string): Promise<boolean> {
     try {
       const created = await request<ConversationDetail>(`${API_V2}/agent/turns/${encodeURIComponent(turnId)}/fork`, { method: 'POST' });
@@ -565,7 +1044,7 @@ export default function OApp() {
     }
   }
 
-  const isCurrentSending = active ? !!runningConvos[active.id] : false;
+  const isCurrentSending = active ? !!runningConvos[active.id] || (activeCloudTaskId !== '' && cloudTaskConversationId === active.id) : false;
   const currentTurn = active ? turns.find((turn) => turn.id === runningConvos[active.id]?.turnId) : undefined;
   const currentTrace = active ? (runningConvos[active.id]?.trace ?? trace) : [];
   const backgroundRunningCount = useMemo(() => {
@@ -574,23 +1053,69 @@ export default function OApp() {
 
   if (loading) return <Splash />;
   return (
-    <main className="app-shell">
+    <main
+      className={`app-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}${sidebarResizing ? ' sidebar-resizing' : ''}`}
+      style={{ '--sidebar-width': `${sidebarWidth}px` } as CSSProperties}
+    >
+      <div className="window-titlebar" inert={mobileViewport && !sidebarCollapsed}>
+        <button
+          type="button"
+          className="sidebar-toggle-button"
+          onClick={toggleSidebar}
+          aria-label={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}
+          aria-expanded={!sidebarCollapsed}
+          aria-controls="app-sidebar"
+          title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}
+        >
+          {sidebarCollapsed ? <PanelLeftOpen size={17} strokeWidth={1.8} aria-hidden="true" /> : <PanelLeftClose size={17} strokeWidth={1.8} aria-hidden="true" />}
+        </button>
+        <WebAppControls />
+      </div>
+      {mobileViewport && !sidebarCollapsed && <div className="mobile-sidebar-backdrop" onClick={() => setSidebarCollapsed(true)} aria-hidden="true" />}
       <Sidebar
+        collapsed={sidebarCollapsed}
+        mobileNavigation={mobileViewport}
+        onCloseMobile={() => setSidebarCollapsed(true)}
         conversations={conversations}
         projects={projects}
         activeId={active?.id}
         runningConvos={runningConvos}
         isProjectPluginEnabled={isProjectPluginEnabled}
-        onNew={newConversation}
-        onNewInProject={handleNewInProject}
-        onOpen={openConversation}
-        onPlugins={() => setPluginsOpen('all')}
-        onSettings={() => setSettingsOpen(true)}
-        onCreateProject={() => setEditingProject(null)}
-        onEditProject={(proj) => setEditingProject(proj)}
+        onNew={() => { if (mobileViewport) setSidebarCollapsed(true); newConversation(); }}
+        onNewInProject={(id) => { if (mobileViewport) setSidebarCollapsed(true); void handleNewInProject(id); }}
+        onOpen={(id) => { if (mobileViewport) setSidebarCollapsed(true); void openConversation(id).catch((error) => setNotice(error instanceof Error ? error.message : '打开会话失败', 'error')); }}
+        onPlugins={() => { if (mobileViewport) setSidebarCollapsed(true); setPluginsOpen('all'); }}
+        onSettings={() => { if (mobileViewport) setSidebarCollapsed(true); setSettingsOpen(true); }}
+        onCreateProject={() => { if (mobileViewport) setSidebarCollapsed(true); setEditingProject(null); }}
+        onEditProject={(proj) => { if (mobileViewport) setSidebarCollapsed(true); setEditingProject(proj); }}
         onMoveConversation={handleMoveConversation}
+        onDeleteConversation={(id) => { if (mobileViewport) setSidebarCollapsed(true); requestConversationDeletion(id); }}
+        hasRecentlyDeleted={hasRecoverableConversations}
+        onOpenRecentlyDeleted={() => { if (mobileViewport) setSidebarCollapsed(true); setRecentlyDeletedOpen(true); }}
       />
-      <section className="workspace">
+      {!sidebarCollapsed && (
+        <div
+          className="sidebar-resize-handle"
+          role="separator"
+          aria-label="调整侧边栏宽度"
+          aria-orientation="vertical"
+          aria-valuemin={SIDEBAR_MIN_WIDTH}
+          aria-valuemax={getSidebarMaxWidth()}
+          aria-valuenow={Math.round(sidebarWidth)}
+          aria-controls="app-sidebar"
+          tabIndex={0}
+          onPointerDown={onSidebarResizePointerDown}
+          onPointerMove={onSidebarResizePointerMove}
+          onPointerUp={finishSidebarResize}
+          onPointerCancel={finishSidebarResize}
+          onLostPointerCapture={() => {
+            sidebarResizeRef.current = null;
+            setSidebarResizing(false);
+          }}
+          onKeyDown={onSidebarResizeKeyDown}
+        />
+      )}
+      <section className="workspace" inert={mobileViewport && !sidebarCollapsed}>
         <header className="workspace-header">
           {!active ? (
             <div className="header-title-static">
@@ -792,6 +1317,12 @@ export default function OApp() {
             </div>
           )}
           <div className="header-actions">
+            <button type="button" className="icon-button" style={{ minWidth: 44, minHeight: 44 }} aria-label="打开执行设备管理" title="执行设备" onClick={() => setExecutionNodesOpen(true)}>
+              <Laptop size={16} strokeWidth={1.75} aria-hidden="true" />
+            </button>
+            <button type="button" className="icon-button" aria-label="打开云端任务" title="云端任务" onClick={() => setCloudTasksOpen(true)}>
+              <ClipboardList size={16} strokeWidth={1.75} aria-hidden="true" />
+            </button>
             <button type="button" className="icon-button" aria-label="打开工具可观测性" title="工具可观测性" onClick={() => setObservabilityOpen(true)}>
               <Activity size={16} strokeWidth={1.75} aria-hidden="true" />
             </button>
@@ -815,6 +1346,7 @@ export default function OApp() {
         </header>
         <div className="workspace-grid">
           <Chat
+            composerInputRef={composerInputRef}
             active={active}
             providers={providers}
             selectedProviderId={selectedProviderId}
@@ -872,8 +1404,14 @@ export default function OApp() {
             unifiedPlugins={unifiedPlugins}
             onNotice={setNotice}
             onSend={send}
+            executionTarget={executionTarget}
+            onExecutionTargetChange={setExecutionTarget}
+            executionNodes={onlineExecutionNodes}
+            selectedExecutionNodeId={selectedExecutionNode?.id ?? ''}
+            onExecutionNodeChange={setSelectedExecutionNodeId}
             onCancel={cancelTurn}
             onRetry={retryTurn}
+            onReconcileTurn={reconcileTurn}
             onFork={forkTurn}
             onConfigure={() => setSettingsOpen(true)}
             onOpenPlugins={(type) => setPluginsOpen(type || 'all')}
@@ -901,6 +1439,20 @@ export default function OApp() {
       )}
 
       {observabilityOpen && <ObservabilityModal onClose={() => setObservabilityOpen(false)} />}
+      {cloudTasksOpen && <CloudTaskCenter onClose={() => setCloudTasksOpen(false)} onOpenConversation={(id) => {
+        setCloudTasksOpen(false);
+        void (async () => {
+          try {
+            const latest = await request<Conversation[]>('/conversations');
+            setConversations(latest);
+            if (mobileViewport) setSidebarCollapsed(true);
+            await openConversation(id);
+          } catch (cause) {
+            setNotice(cause instanceof Error ? `打开云端续接会话失败：${cause.message}` : '打开云端续接会话失败', 'error');
+          }
+        })();
+      }} />}
+      {executionNodesOpen && <ExecutionNodesModal onClose={() => setExecutionNodesOpen(false)} />}
 
       {pluginsOpen && (
         <UnifiedPluginCenter
@@ -910,6 +1462,17 @@ export default function OApp() {
             void refreshPlugins();
           }}
           onPluginsChanged={refreshPlugins}
+        />
+      )}
+
+      {recentlyDeletedOpen && (
+        <RecentlyDeletedModal
+          onClose={() => setRecentlyDeletedOpen(false)}
+          onRecoveryItemsChange={setRecoverableConversations}
+          onRestored={(item, readback) => {
+            setConversations(readback);
+            setNotice(`「${cleanTitleString(item.title) || '新对话'}」已恢复到对话栏。`);
+          }}
         />
       )}
 
@@ -937,6 +1500,47 @@ export default function OApp() {
           }}
         />
       )}
+
+      {deleteTarget && (
+        <div
+          className="modal-backdrop delete-conversation-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !deletingConversation) setDeleteTarget(null);
+          }}
+        >
+          <section
+            className="delete-conversation-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-conversation-title"
+            aria-describedby="delete-conversation-description"
+          >
+            <div className="delete-conversation-icon" aria-hidden="true"><Trash2 size={18} strokeWidth={1.8} /></div>
+            <h2 id="delete-conversation-title">删除对话？</h2>
+            <p id="delete-conversation-description">
+              「{cleanTitleString(deleteTarget.title) || '新对话'}」将从对话栏移除。删除后 24 小时内可以找回，超过期限后将无法恢复。
+            </p>
+            <label className="delete-conversation-reminder">
+              <input
+                type="checkbox"
+                checked={skipDeleteConfirmationToday}
+                disabled={deletingConversation}
+                onChange={(event) => setSkipDeleteConfirmationToday(event.target.checked)}
+              />
+              <span>今天不再询问</span>
+            </label>
+            <div className="delete-conversation-actions">
+              <button type="button" className="delete-conversation-cancel" disabled={deletingConversation} autoFocus onClick={() => setDeleteTarget(null)}>
+                取消
+              </button>
+              <button type="button" className="delete-conversation-confirm" disabled={deletingConversation} onClick={() => void performConversationDeletion(deleteTarget, skipDeleteConfirmationToday)}>
+                {deletingConversation ? '正在删除…' : '删除对话'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -961,8 +1565,7 @@ function waitForTurn(turnId: string, onEvent: (event: TraceEvent) => void, signa
 		  event.kind === 'turn.incomplete' ||
 		  event.kind === 'turn.failed' ||
           event.kind === 'turn.cancelled' ||
-          event.kind === 'turn.interrupted' ||
-          event.kind === 'turn.needs_reconciliation'
+          event.kind === 'turn.interrupted'
         ) {
           source.close();
           resolve();
@@ -988,23 +1591,20 @@ function Splash() {
 }
 
 function deduplicateNewChats(list: Conversation[]): Conversation[] {
+  const seen = new Set<string>();
   const result: Conversation[] = [];
-  let hasDefault = false;
   for (const item of list) {
-    const displayTitle = cleanTitleString(item.title) || '新对话';
-    if (displayTitle === '新对话') {
-      if (!hasDefault) {
-        result.push(item);
-        hasDefault = true;
-      }
-    } else {
-      result.push(item);
-    }
+    if (!item?.id || seen.has(item.id)) continue;
+    seen.add(item.id);
+    result.push(item);
   }
   return result;
 }
 
 function Sidebar({
+  collapsed,
+  mobileNavigation,
+  onCloseMobile,
   conversations,
   projects,
   activeId,
@@ -1018,7 +1618,13 @@ function Sidebar({
   onCreateProject,
   onEditProject,
   onMoveConversation,
+  onDeleteConversation,
+  hasRecentlyDeleted,
+  onOpenRecentlyDeleted,
 }: {
+  collapsed: boolean;
+  mobileNavigation: boolean;
+  onCloseMobile: () => void;
   runningConvos?: Record<string, unknown>;
   conversations: Conversation[];
   projects: Project[];
@@ -1032,6 +1638,9 @@ function Sidebar({
   onCreateProject: () => void;
   onEditProject: (project: Project) => void;
   onMoveConversation: (conversationId: string, projectId: string) => void;
+  onDeleteConversation: (conversationId: string) => void;
+  hasRecentlyDeleted: boolean;
+  onOpenRecentlyDeleted: () => void;
 }) {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
   const [popoverConvoId, setPopoverConvoId] = useState<string | null>(null);
@@ -1061,7 +1670,8 @@ function Sidebar({
   }, [conversations, isProjectPluginEnabled]);
 
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" id="app-sidebar" inert={collapsed} aria-hidden={collapsed} role={mobileNavigation ? 'dialog' : undefined} aria-modal={mobileNavigation || undefined} aria-label={mobileNavigation ? '会话与设置' : undefined} tabIndex={mobileNavigation ? -1 : undefined}>
+      {mobileNavigation && <button type="button" className="mobile-sidebar-close" onClick={onCloseMobile} aria-label="关闭侧边栏"><X size={20} aria-hidden="true" /></button>}
       <div className="brand">
         <div className="brand-mark">
           <Sparkles size={13} strokeWidth={2.2} />
@@ -1192,8 +1802,8 @@ function Sidebar({
                                       e.stopPropagation();
                                       setPopoverConvoId(isMenuOpen ? null : item.id);
                                     }}
-                                    title="设置项目"
-                                    aria-label="设置项目"
+                                    title="更多对话操作"
+                                    aria-label="更多对话操作"
                                   >
                                     <MoreHorizontal size={13} />
                                   </button>
@@ -1201,7 +1811,7 @@ function Sidebar({
 
                                 {isMenuOpen && (
                                   <div className="sidebar-popover-menu" onClick={(e) => e.stopPropagation()}>
-                                    {projects.map((p) => {
+                                    {isProjectPluginEnabled && projects.map((p) => {
                                       const isSelected = item.projectId === p.id;
                                       return (
                                         <button
@@ -1221,28 +1831,44 @@ function Sidebar({
                                         </button>
                                       );
                                     })}
+                                    {isProjectPluginEnabled && (
+                                      <>
+                                        <div className="sidebar-popover-divider" />
+                                        <button
+                                          type="button"
+                                          className="sidebar-popover-item"
+                                          onClick={() => {
+                                            onMoveConversation(item.id, '');
+                                            setPopoverConvoId(null);
+                                          }}
+                                        >
+                                          <LogOut size={13} />
+                                          <span>移出项目</span>
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="sidebar-popover-item"
+                                          onClick={() => {
+                                            onCreateProject();
+                                            setPopoverConvoId(null);
+                                          }}
+                                        >
+                                          <FolderPlus size={13} />
+                                          <span>新建项目</span>
+                                        </button>
+                                      </>
+                                    )}
                                     <div className="sidebar-popover-divider" />
                                     <button
                                       type="button"
                                       className="sidebar-popover-item danger"
                                       onClick={() => {
-                                        onMoveConversation(item.id, '');
+                                        onDeleteConversation(item.id);
                                         setPopoverConvoId(null);
                                       }}
                                     >
-                                      <LogOut size={13} />
-                                      <span>移出项目</span>
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="sidebar-popover-item"
-                                      onClick={() => {
-                                        onCreateProject();
-                                        setPopoverConvoId(null);
-                                      }}
-                                    >
-                                      <FolderPlus size={13} />
-                                      <span>新建项目</span>
+                                      <Trash2 size={13} />
+                                      <span>删除对话</span>
                                     </button>
                                   </div>
                                 )}
@@ -1289,8 +1915,7 @@ function Sidebar({
                     {!!runningConvos?.[item.id] && <span className="sidebar-running-dot" title="任务运行中" />}
                   </button>
 
-                  {isProjectPluginEnabled && (
-                    <div className="sidebar-convo-tools">
+                  <div className="sidebar-convo-tools">
                       <button
                         type="button"
                         className="sidebar-convo-action-btn"
@@ -1298,17 +1923,16 @@ function Sidebar({
                           e.stopPropagation();
                           setPopoverConvoId(isMenuOpen ? null : item.id);
                         }}
-                        title="设置项目"
-                        aria-label="设置项目"
+                        title="更多对话操作"
+                        aria-label="更多对话操作"
                       >
                         <MoreHorizontal size={13} />
                       </button>
-                    </div>
-                  )}
+                  </div>
 
                   {isMenuOpen && (
                     <div className="sidebar-popover-menu" onClick={(e) => e.stopPropagation()}>
-                      {projects.length > 0 ? (
+                      {isProjectPluginEnabled && projects.length > 0 ? (
                         projects.map((proj) => (
                           <button
                             key={proj.id}
@@ -1323,20 +1947,36 @@ function Sidebar({
                             <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{proj.name}</span>
                           </button>
                         ))
-                      ) : (
+                      ) : isProjectPluginEnabled ? (
                         <div className="sidebar-popover-empty">暂无可用项目</div>
+                      ) : null}
+                      {isProjectPluginEnabled && (
+                        <>
+                          <div className="sidebar-popover-divider" />
+                          <button
+                            type="button"
+                            className="sidebar-popover-item"
+                            onClick={() => {
+                              onCreateProject();
+                              setPopoverConvoId(null);
+                            }}
+                          >
+                            <FolderPlus size={13} />
+                            <span>新建项目</span>
+                          </button>
+                        </>
                       )}
-                      <div className="sidebar-popover-divider" />
+                      {isProjectPluginEnabled && <div className="sidebar-popover-divider" />}
                       <button
                         type="button"
-                        className="sidebar-popover-item"
+                        className="sidebar-popover-item danger"
                         onClick={() => {
-                          onCreateProject();
+                          onDeleteConversation(item.id);
                           setPopoverConvoId(null);
                         }}
                       >
-                        <FolderPlus size={13} />
-                        <span>新建项目</span>
+                        <Trash2 size={13} />
+                        <span>删除对话</span>
                       </button>
                     </div>
                   )}
@@ -1348,6 +1988,12 @@ function Sidebar({
       </div>
 
       <div className="sidebar-foot">
+        {hasRecentlyDeleted && (
+          <button type="button" onClick={onOpenRecentlyDeleted} aria-label="打开最近删除" title="24 小时内可恢复">
+            <Trash2 size={16} strokeWidth={1.75} aria-hidden="true" />
+            <span>最近删除</span>
+          </button>
+        )}
         <button type="button" onClick={onPlugins} aria-label="打开插件与能力">
           <Layers size={16} strokeWidth={1.75} aria-hidden="true" />
           <span>插件与能力</span>
@@ -1358,6 +2004,148 @@ function Sidebar({
         </button>
       </div>
     </aside>
+  );
+}
+
+function RecentlyDeletedModal({
+  onClose,
+  onRecoveryItemsChange,
+  onRestored,
+}: {
+  onClose: () => void;
+  onRecoveryItemsChange: (items: DeletedConversation[]) => void;
+  onRestored: (conversation: DeletedConversation, activeConversations: Conversation[]) => void;
+}) {
+  const [items, setItems] = useState<DeletedConversation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
+  const [error, setError] = useState('');
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const deleted = await getDeletedConversations();
+      setItems(deleted);
+      onRecoveryItemsChange(deleted);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '最近删除列表读取失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [onRecoveryItemsChange]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getDeletedConversations().then((deleted) => {
+      if (!cancelled) {
+        setItems(deleted);
+        onRecoveryItemsChange(deleted);
+      }
+    }).catch((cause: unknown) => {
+      if (!cancelled) setError(cause instanceof Error ? cause.message : '最近删除列表读取失败');
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [onRecoveryItemsChange]);
+
+  useEffect(() => {
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape' && !restoringId) onClose();
+    }
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [onClose, restoringId]);
+
+  async function restore(item: DeletedConversation) {
+    if (restoringId) return;
+    setRestoringId(item.id);
+    setError('');
+    try {
+      const restored = await restoreConversationRequest<ConversationDetail>(item.id);
+      if (restored.id !== item.id) throw new Error('恢复接口读回的对话 ID 不一致。');
+      const [activeConversations, deleted] = await Promise.all([
+        request<Conversation[]>('/conversations'),
+        getDeletedConversations(),
+      ]);
+      if (!activeConversations.some((conversation) => conversation.id === item.id)) {
+        throw new Error('普通对话列表尚未读到已恢复的对话。');
+      }
+      setItems(deleted);
+      onRecoveryItemsChange(deleted);
+      onRestored(item, activeConversations);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : '恢复对话失败';
+      try {
+        const [deleted, visible] = await Promise.all([
+          getDeletedConversations(),
+          request<Conversation[]>('/conversations'),
+        ]);
+        setItems(deleted);
+        onRecoveryItemsChange(deleted);
+        if (visible.some((conversation) => conversation.id === item.id)) {
+          onRestored(item, visible);
+          setError('');
+        } else {
+          setError(message);
+        }
+      } catch {
+        setError(message);
+      }
+    } finally {
+      setRestoringId(null);
+    }
+  }
+
+  return (
+    <div
+      className="modal-backdrop recently-deleted-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !restoringId) onClose();
+      }}
+    >
+      <section className="recently-deleted-dialog" role="dialog" aria-modal="true" aria-labelledby="recently-deleted-title" aria-describedby="recently-deleted-description">
+        <header className="recently-deleted-header">
+          <div>
+            <h2 id="recently-deleted-title">最近删除</h2>
+            <p id="recently-deleted-description">对话会保留 24 小时，恢复后会重新出现在侧边栏。</p>
+          </div>
+          <button type="button" className="recently-deleted-close" onClick={onClose} disabled={Boolean(restoringId)} aria-label="关闭最近删除" autoFocus>
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="recently-deleted-list" aria-live="polite">
+          {loading ? (
+            <div className="recently-deleted-state">正在读取…</div>
+          ) : error && items.length === 0 ? (
+            <div className="recently-deleted-state error">{error}</div>
+          ) : items.length === 0 ? (
+            <div className="recently-deleted-state">没有可恢复的对话</div>
+          ) : (
+            items.map((item) => (
+              <div className="recently-deleted-row" key={item.id}>
+                <div className="recently-deleted-copy">
+                  <span className="recently-deleted-name" title={cleanTitleString(item.title) || '新对话'}>{cleanTitleString(item.title) || '新对话'}</span>
+                  <span className="recently-deleted-expiry">将于 {new Date(item.recoverUntil).toLocaleString()} 到期</span>
+                </div>
+                <button type="button" className="recently-deleted-restore" onClick={() => void restore(item)} disabled={Boolean(restoringId)}>
+                  {restoringId === item.id ? '恢复中…' : '恢复'}
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+        {error && items.length > 0 && <div className="recently-deleted-error" role="alert">{error}</div>}
+        <footer className="recently-deleted-footer">
+          <button type="button" className="recently-deleted-refresh" onClick={() => void reload()} disabled={loading || Boolean(restoringId)}>刷新列表</button>
+          <button type="button" className="recently-deleted-done" onClick={onClose} disabled={Boolean(restoringId)}>完成</button>
+        </footer>
+      </section>
+    </div>
   );
 }
 
@@ -1450,6 +2238,7 @@ function persistDrafts(drafts: Record<string, ConversationDraft>) {
 }
 
 function Chat({
+  composerInputRef: externalComposerInputRef,
   active,
   providers,
   selectedProviderId,
@@ -1461,8 +2250,14 @@ function Chat({
   turns,
   queuedInputs,
   onSend,
+  executionTarget,
+  onExecutionTargetChange,
+  executionNodes,
+  selectedExecutionNodeId,
+  onExecutionNodeChange,
   onCancel,
   onRetry,
+  onReconcileTurn,
   onFork,
   onConfigure,
   onOpenPlugins,
@@ -1471,6 +2266,7 @@ function Chat({
   onPermissionProfileChange,
   noticeTone,
 }: {
+  composerInputRef?: RefObject<HTMLTextAreaElement | null>;
   unifiedPlugins: UnifiedPlugin[];
   onNotice?: (msg: string, tone?: 'info' | 'error') => void;
   onPermissionProfileChange: (profile: ConversationPermissionProfile) => Promise<boolean>;
@@ -1485,9 +2281,15 @@ function Chat({
   liveTrace: TraceEvent[];
   turns: AgentTurn[];
   queuedInputs: InboxInput[];
-  onSend: (content: string) => Promise<boolean>;
+  onSend: (content: string, inputArtifacts?: UserArtifact[]) => Promise<boolean>;
+  executionTarget: 'current' | 'cloud' | 'local';
+  onExecutionTargetChange: (target: 'current' | 'cloud' | 'local') => void;
+  executionNodes: ExecutionNode[];
+  selectedExecutionNodeId: string;
+  onExecutionNodeChange: (nodeId: string) => void;
   onCancel: () => void;
   onRetry: (turnId: string, editedContent?: string) => Promise<boolean>;
+  onReconcileTurn: (turnId: string, outcome: 'no_effect_applied' | 'effect_applied' | 'still_unknown', note: string) => Promise<boolean>;
   onFork: (turnId: string) => Promise<boolean>;
   onConfigure: () => void;
   onOpenPlugins: (type?: 'all' | 'mcp' | 'skill' | 'core' | 'release') => void;
@@ -1508,7 +2310,15 @@ function Chat({
   const [permissionSaving, setPermissionSaving] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const permissionMenuRef = useRef<HTMLDivElement>(null);
-  const composerInputRef = useRef<HTMLTextAreaElement>(null);
+  const taskFileInputRef = useRef<HTMLInputElement>(null);
+  const fallbackComposerInputRef = useRef<HTMLTextAreaElement>(null);
+  const composerInputRef = externalComposerInputRef ?? fallbackComposerInputRef;
+
+  useEffect(() => {
+    if (!active && providers.length > 0) {
+      composerInputRef.current?.focus();
+    }
+  }, [active, providers.length, composerInputRef]);
 
   async function copyMessage(message: Message) {
     const copied = await copyToClipboard(message.content);
@@ -1565,7 +2375,7 @@ function Chat({
     return providers[0] || null;
   }, [active, selectedProviderId, providers]);
   const sessionId = active?.id || '__new__';
-  const pendingApprovalEvents = liveTrace.filter((event) => event.kind.startsWith('permission.') || event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied');
+  const pendingApprovalEvents = liveTrace.filter((event) => event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied');
   const approvalRefreshKey = useMemo(() => [...new Map([...trace, ...liveTrace]
     .filter((event) => event.kind === 'approval.requested' || event.kind === 'approval.resolved')
     .map((event) => [event.id, event])).values()]
@@ -1596,6 +2406,9 @@ function Chat({
 
   const [draftsMap, setDraftsMap] = useState<Record<string, ConversationDraft>>(() => loadStoredDrafts());
   const draftsMapRef = useRef(draftsMap);
+  const [taskFilesBySession, setTaskFilesBySession] = useState<Record<string, { id: string; file: File }[]>>({});
+  const [uploadProgress, setUploadProgress] = useState('');
+  const uploadAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     draftsMapRef.current = draftsMap;
@@ -1616,6 +2429,7 @@ function Chat({
   const currentDraftObj = draftsMap[sessionId];
   const draft = currentDraftObj?.text ?? '';
   const attachments = currentDraftObj?.attachments ?? [];
+  const taskFiles = taskFilesBySession[sessionId] ?? [];
 
   useLayoutEffect(() => {
     const textarea = composerInputRef.current;
@@ -1635,7 +2449,7 @@ function Chat({
     resize();
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
-  }, [draft, sessionId]);
+  }, [draft, sessionId, composerInputRef]);
 
   const setDraft = useCallback((textOrUpdater: string | ((prev: string) => string)) => {
     setDraftsMap((prev) => {
@@ -1696,6 +2510,11 @@ function Chat({
   const checkVisionSupport = (): boolean => {
     const modelId = currentProvider?.model || currentProvider?.name || '';
     if (!modelId) return true;
+    if (currentProvider?.supportsVision === false) {
+      onNotice?.('当前模型已配置为纯文本模型，不能接收图片。请在模型设置中启用视觉能力，或切换到视觉模型。');
+      return false;
+    }
+    if (currentProvider?.supportsVision === true) return true;
     try {
       const cfg = JSON.parse(localStorage.getItem('axiom_model_vision') || '{}') as Record<string, boolean>;
       if (cfg[modelId] === false) {
@@ -1737,6 +2556,12 @@ function Chat({
     const files = e.dataTransfer?.files;
     if (!files) return;
     const targetSessionId = sessionId;
+    if (executionTarget !== 'current') {
+      const generalFiles = Array.from(files).filter((file) => !file.type.startsWith('image/'));
+      if (generalFiles.length > 0) {
+        void addTaskFiles(generalFiles);
+      }
+    }
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       if (file.type.startsWith('image/')) {
@@ -1775,20 +2600,69 @@ function Chat({
   const [submitting, setSubmitting] = useState(false);
   const submit = async () => {
     const textValue = draft.trim();
-    if (!submitting && (textValue || attachments.length > 0)) {
+    if (!submitting && (textValue || attachments.length > 0 || taskFiles.length > 0)) {
       let fullContent = textValue;
-      if (attachments.length > 0) {
+      const taskInputMode = executionTarget !== 'current';
+      if (attachments.length > 0 && !taskInputMode) {
         const imgPart = attachments.map((a) => '![' + a.name + '](' + a.dataUrl + ')').join('\n\n');
         fullContent = fullContent ? fullContent + '\n\n' + imgPart : imgPart;
       }
       setSubmitting(true);
       try {
-        if (await onSend(fullContent)) clearCurrentDraft();
+        if (taskInputMode && (taskFiles.length > 0 || attachments.length > 0)) {
+          const abort = new AbortController();
+          uploadAbortRef.current = abort;
+          const files = [...taskFiles];
+          for (const attachment of attachments) {
+            const response = await fetch(attachment.dataUrl);
+            if (!response.ok) throw new Error(`读取图片 ${attachment.name} 失败。`);
+            const blob = await response.blob();
+            files.push({ id: `image-${attachment.id}`, file: new File([blob], attachment.name, { type: blob.type || 'image/jpeg', lastModified: 0 }) });
+          }
+          const uploaded: UserArtifact[] = [];
+          for (const item of files) {
+            const options = {
+              signal: abort.signal,
+              onProgress: (progress: { uploadedBytes: number; totalBytes: number; chunkIndex: number; chunkCount: number }) => setUploadProgress(`上传 ${item.file.name}：${Math.round(progress.uploadedBytes * 100 / Math.max(progress.totalBytes, 1))}% · ${progress.chunkIndex}/${progress.chunkCount} 块`),
+            };
+            let artifact: UserArtifact;
+            try {
+              artifact = await uploadArtifactFile(item.file, `browser-input-${item.id}`, options);
+            } catch (cause) {
+              if (!(cause instanceof Error) || !cause.message.includes('幂等键已绑定另一份文件')) throw cause;
+              const freshKey = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+              artifact = await uploadArtifactFile(item.file, `browser-input-${freshKey}`, options);
+            }
+            uploaded.push(artifact);
+          }
+          setUploadProgress('附件已校验并保存，正在创建任务…');
+          const requestContent = fullContent || '请检查并处理我附加的文件。';
+          if (await onSend(requestContent, uploaded)) {
+            clearCurrentDraft();
+            setTaskFilesBySession((previous) => { const next = { ...previous }; delete next[sessionId]; return next; });
+          }
+        } else if (await onSend(fullContent)) clearCurrentDraft();
+      } catch (error) {
+        onNotice?.(error instanceof Error ? error.message : '附件上传失败', 'error');
       } finally {
+        uploadAbortRef.current = null;
+        setUploadProgress('');
         setSubmitting(false);
       }
     }
   };
+
+  async function addTaskFiles(fileList: FileList | File[] | null) {
+    if (!fileList?.length) return;
+    const targetSessionId = sessionId;
+    const next = await Promise.all(Array.from(fileList, async (file) => {
+      const identity = new TextEncoder().encode(`${targetSessionId}\0${file.name}\0${file.size}\0${file.lastModified}`);
+      const digest = await crypto.subtle.digest('SHA-256', identity);
+      const id = [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('');
+      return { id, file };
+    }));
+    setTaskFilesBySession((previous) => ({ ...previous, [targetSessionId]: [...(previous[targetSessionId] ?? []).filter((item) => !next.some((candidate) => candidate.id === item.id)), ...next] }));
+  }
 
   return (
     <div className="chat-column">
@@ -1842,10 +2716,11 @@ function Chat({
             const messageTurn = associatedTurns.sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt))[0];
             const latestMessage = active.messages[active.messages.length - 1]?.id === message.id;
             const retryable = !!messageTurn && latestMessage && message.role === 'user' &&
-              ['failed', 'cancelled', 'interrupted', 'incomplete', 'needs_reconciliation'].includes(messageTurn.status);
+              ['failed', 'cancelled', 'interrupted', 'incomplete'].includes(messageTurn.status) &&
+              messageTurn.recoveryClass !== 'unknown_external_effect' && messageTurn.recoveryClass !== 'external_effect_confirmed';
             const isEditingMessage = editingMessageId === message.id && retryable;
             return (
-              <article key={message.id} className={`message ${message.role}`}>
+              <article id={`message-${message.id}`} key={message.id} className={`message ${message.role}`}>
                 <div className="message-role">{message.role === 'user' ? '你' : 'O'}</div>
                 <div className="message-body">
                   {isRunInspectorEnabled && message.role === 'assistant' && messageTurn && (
@@ -1869,6 +2744,16 @@ function Chat({
                       </div>
                     </div>
                   ) : <MarkdownView content={message.content} />}
+                  {message.role === 'assistant' && messageTurn?.status === 'incomplete' && !messageTurn.continuationAvailable && messageTurn.continuationUnavailableReason && (
+                    <small className="continuation-unavailable-note">
+                      暂时无法安全续跑：{continuationUnavailableLabel(messageTurn.continuationUnavailableReason)}
+                    </small>
+                  )}
+                  {message.role === 'assistant' && messageTurn?.continuationChainId && messageTurn.cumulativeMetrics && (
+                    <small className="continuation-unavailable-note">
+                      续跑链累计：{formatExactNumber(messageTurn.cumulativeMetrics.modelCalls)} 次模型调用 · {formatExactNumber(messageTurn.cumulativeMetrics.toolCalls)} 次工具调用 · {formatExactNumber(messageTurn.cumulativeMetrics.totalTokens)} tokens
+                    </small>
+                  )}
                 </div>
                 <div className="message-action-toolbar" aria-label={`${message.role === 'user' ? '用户' : '助手'}消息操作`}>
                   <button
@@ -1914,6 +2799,9 @@ function Chat({
             );
           })
         )}
+        {turns.filter((turn) => turn.status === 'needs_reconciliation' && turn.recoveryClass === 'unknown_external_effect').map((turn) => (
+          <TurnReconciliationPanel key={turn.id} turn={turn} busy={messageActionBusy} onBusyChange={setMessageActionBusy} onSubmit={onReconcileTurn} />
+        ))}
         {sending && (
           <article className="message assistant running-message">
             <div className="message-role">O</div>
@@ -1955,6 +2843,7 @@ function Chat({
         </div>
       )}
       <div className="composer-wrap" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
+        <input ref={taskFileInputRef} className="composer-file-input" type="file" multiple onChange={(event) => { void addTaskFiles(event.target.files); event.target.value = ''; }} aria-label="选择任务输入文件" />
         <div className="composer">
         {attachments.length > 0 && (
           <div className="composer-attachments">
@@ -1976,6 +2865,16 @@ function Chat({
             ))}
           </div>
         )}
+        {taskFiles.length > 0 && (
+          <div className="composer-task-files" aria-label="任务输入文件">
+            {taskFiles.map((item) => <span className="composer-task-file" key={item.id} title={`${item.file.name} · ${item.file.size.toLocaleString()} 字节`}>
+              <Paperclip size={12} aria-hidden="true" />
+              <span>{item.file.name}</span>
+              <button type="button" onClick={() => setTaskFilesBySession((previous) => ({ ...previous, [sessionId]: (previous[sessionId] ?? []).filter((candidate) => candidate.id !== item.id) }))} disabled={submitting} aria-label={`移除 ${item.file.name}`}><X size={11} /></button>
+            </span>)}
+          </div>
+        )}
+        {uploadProgress && <div className="composer-upload-progress" role="status" aria-live="polite"><span>{uploadProgress}</span><button type="button" onClick={() => uploadAbortRef.current?.abort()} aria-label="取消附件上传"><X size={12} /></button></div>}
         <textarea
           key={sessionId}
           ref={composerInputRef}
@@ -1983,7 +2882,7 @@ function Chat({
           onChange={(e) => setDraft(e.target.value)}
           onPaste={handlePaste}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey && !submitting && !permissionSaving) {
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !window.matchMedia('(pointer: coarse)').matches && !submitting && !permissionSaving) {
               e.preventDefault();
               void submit();
             }
@@ -1999,7 +2898,22 @@ function Chat({
           aria-label="输入消息内容"
         />
         <div className="composer-row">
+          <button type="button" className="composer-icon-button composer-attach-button" onClick={() => taskFileInputRef.current?.click()} disabled={executionTarget === 'current' || submitting || sending} title={executionTarget === 'current' ? '附件任务请选择云端或本地执行' : '附加文件到云端或本地任务'} aria-label="附加任务文件"><Paperclip size={14} /></button>
           <div className="composer-capability-bar" role="toolbar" aria-label="扩展能力入口">
+            <label className="capability-btn" title="选择任务执行位置">
+              <span>执行于</span>
+              <select aria-label="任务执行位置" value={executionTarget} disabled={sending} onChange={(event) => onExecutionTargetChange(event.target.value as 'current' | 'cloud' | 'local')}>
+                <option value="current">当前服务节点</option>
+                <option value="cloud">云端任务队列</option>
+                <option value="local" disabled={executionNodes.length === 0}>本地电脑任务{executionNodes.length === 0 ? '（暂无在线设备）' : ''}</option>
+              </select>
+            </label>
+            {executionTarget === 'local' && <label className="capability-btn" title="选择接收此任务的在线本地电脑">
+              <span>设备</span>
+              <select aria-label="本地任务执行设备" value={selectedExecutionNodeId} disabled={sending || executionNodes.length === 0} onChange={(event) => onExecutionNodeChange(event.target.value)}>
+                {executionNodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {node.platform}</option>)}
+              </select>
+            </label>}
             <button
               type="button"
               className="capability-btn"
@@ -2014,7 +2928,7 @@ function Chat({
               <button
                 type="button"
                 className={`capability-btn permission-profile-trigger ${permissionMenuOpen ? 'active' : ''}`}
-                title={active ? '仅影响之后启动的任务' : '先为新会话选择权限；该设置会在首条消息前保存'}
+                title="选择会话权限模式"
                 aria-label={`会话权限模式：${permissionProfileLabel(currentPermissionProfile)}`}
                 aria-haspopup="dialog"
                 aria-expanded={permissionMenuOpen}
@@ -2029,12 +2943,13 @@ function Chat({
                 <div className="permission-profile-menu" role="dialog" aria-label="当前会话权限模式" aria-busy={permissionSaving}>
                   <div role="group" aria-label="选择会话权限档位">
                   {[
-                    { value: 'read_only', label: '只读', description: '只允许读取，不允许改动。' },
-                    { value: 'workspace_autonomous', label: '工作区自动', description: '常规操作自动执行；删除/覆盖数据或运行插件代码前确认。启用的 MCP、插件和 Skill 可直接使用。' },
-                    { value: 'fully_autonomous', label: '完全自动', description: '不询问操作权限；系统沙箱仍生效。' },
+                    { value: 'read_only', label: '只读', description: '只允许读取，不允许改动或访问网络。' },
+                    { value: 'request_approval', label: '请求批准', description: '写入工作区文件、运行可写命令或访问网络前请求批准；删除/覆盖数据、运行插件代码等风险操作也会请求批准。' },
+                    { value: 'workspace_autonomous', label: '工作区自动', description: '普通工作区写入、运行脚本和联网自动执行；删除/覆盖数据、运行或安装插件代码等已识别的风险操作仍需批准。' },
+                    { value: 'fully_autonomous', label: '完全自动', description: '不询问逐项操作权限；命令仍受系统沙箱限制。' },
                   ].map((option) => {
                     const profile = option.value as ConversationPermissionProfile;
-                    const selected = normalizePermissionProfile(currentPermissionProfile) === profile;
+                    const selected = currentPermissionProfile === profile;
                     return (
                       <button
                         type="button"
@@ -2064,9 +2979,6 @@ function Chat({
                     );
                   })}
                   </div>
-                  <small className="permission-profile-footnote">
-                    {active ? '更改仅用于之后启动的任务' : '选择后立即保存；首条消息将使用所选权限'}
-                  </small>
                 </div>
               )}
             </div>
@@ -2153,7 +3065,7 @@ function Chat({
                 type="button"
                 className="composer-icon-button send-btn"
                 onClick={() => void submit()}
-                disabled={(!draft.trim() && attachments.length === 0) || !providers.length || submitting || permissionSaving}
+                disabled={(!draft.trim() && attachments.length === 0 && taskFiles.length === 0) || !providers.length || submitting || permissionSaving}
                 title={active?.executionPaused ? '会话已暂停；发送新消息后继续' : '发送'}
                 aria-label={active?.executionPaused ? '发送消息并继续已暂停的会话' : '发送'}
               >
@@ -2165,6 +3077,64 @@ function Chat({
       </div>
       </div>
     </div>
+  );
+}
+
+function TurnReconciliationPanel({
+  turn,
+  busy,
+  onBusyChange,
+  onSubmit,
+}: {
+  turn: AgentTurn;
+  busy: boolean;
+  onBusyChange: (busy: boolean) => void;
+  onSubmit: (turnId: string, outcome: 'no_effect_applied' | 'effect_applied' | 'still_unknown', note: string) => Promise<boolean>;
+}) {
+  const [note, setNote] = useState('');
+  const actions = [...(turn.runState.actions ?? []), ...(turn.runState.pendingActions ?? [])];
+  const completedUnsafeEffect = actions.some((action) => action.status !== 'in_flight' && action.effect !== 'read' && action.effect !== 'external_read');
+  const incompleteEffectClassification = turn.runState.completeness === 'degraded' || actions.some((action) => !action.effect);
+
+  async function submit(outcome: 'no_effect_applied' | 'effect_applied' | 'still_unknown') {
+    if (!note.trim() || busy) return;
+    onBusyChange(true);
+    try {
+      if (await onSubmit(turn.id, outcome, note)) setNote('');
+    } finally {
+      onBusyChange(false);
+    }
+  }
+
+  return (
+    <section className="turn-reconciliation-panel" aria-labelledby={`reconcile-title-${turn.id}`}>
+      <div className="turn-reconciliation-heading">
+        <Shield size={16} aria-hidden="true" />
+        <strong id={`reconcile-title-${turn.id}`}>外部操作结果需要核查</strong>
+      </div>
+      <p>任务停止时有工具调用尚未确认。检查本轮所有外部操作在邮件、文件、远端服务等实际目标上的状态后再选择；存在已完成的外部写入时，系统会禁止重放整轮任务。</p>
+      {turn.reconciliationNote && <p>上次核查记录：{turn.reconciliationNote}</p>}
+      {actions.length > 0 && (
+        <ul className="turn-reconciliation-actions">
+          {actions.map((action) => <li key={`${action.sequence}:${action.toolCallId}`}><code>{action.toolName || '未知工具'}</code><span>{action.effect || '副作用类型未知'} · {action.status}</span></li>)}
+        </ul>
+      )}
+      {completedUnsafeEffect && <p>本轮已有已完成的写操作，不能重跑整轮；请确认实际结果后选择“已发生”或保持不确定。</p>}
+      <label htmlFor={`reconcile-note-${turn.id}`}>核查依据</label>
+      <textarea
+        id={`reconcile-note-${turn.id}`}
+        value={note}
+        onChange={(event) => setNote(event.target.value)}
+        maxLength={2000}
+        placeholder="写明检查了什么，以及看到的实际状态。仍无法确定时不要授权重试。"
+        disabled={busy}
+      />
+      <div className="turn-reconciliation-actions">
+        <button type="button" disabled={busy || !note.trim() || completedUnsafeEffect || incompleteEffectClassification} onClick={() => void submit('no_effect_applied')}>确认全程无副作用，授权重试</button>
+        <button type="button" disabled={busy || !note.trim()} onClick={() => void submit('effect_applied')}>确认本轮有副作用，禁止重放</button>
+        <button type="button" disabled={busy || !note.trim()} onClick={() => void submit('still_unknown')}>仍不确定，保持锁定</button>
+      </div>
+    </section>
   );
 }
 
@@ -2188,7 +3158,7 @@ function ActivityTrace({
   const events = trace;
   const startedAt = turn?.startedAt || events[0]?.createdAt;
   const terminal = [...events].reverse().find((event) => event.kind.startsWith('turn.') && event.kind !== 'turn.started' && event.kind !== 'turn.cancel_requested');
-  const hasTerminalTurnEvent = events.some((event) => ['turn.completed', 'turn.incomplete', 'turn.failed', 'turn.cancelled', 'turn.needs_reconciliation', 'turn.interrupted'].includes(event.kind));
+  const hasTerminalTurnEvent = events.some((event) => ['turn.completed', 'turn.incomplete', 'turn.failed', 'turn.cancelled', 'turn.interrupted'].includes(event.kind));
   const approvalRequest = hasTerminalTurnEvent ? undefined : [...events].reverse().find((event) => {
     if (event.kind !== 'approval.requested') return false;
     const approvalId = textDetail(event.details, 'id');
@@ -2258,9 +3228,9 @@ function ActivityTrace({
         ) : (
           <p className="activity-empty">正在等待第一条运行事件…</p>
         )}
-        {events.some((event) => event.kind.startsWith('permission.') || event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied') && (
-          <div className="activity-events compact-events permission-events">
-            {events.filter((event) => event.kind.startsWith('permission.') || event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied').map((event) => (
+        {events.some((event) => event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied') && (
+          <div className="activity-events compact-events approval-events">
+            {events.filter((event) => event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied').map((event) => (
               <article key={event.id} className={eventTone(event.kind)}>
                 <div className="activity-event-content"><div className="activity-event-title"><b>{eventLabel(event.kind)}</b><span>{eventSummary(event)}</span></div></div>
               </article>
@@ -2318,7 +3288,7 @@ function PendingPermissionApproval({ approval, onResolved }: { approval: Approva
         </div>
       )}
       <p className="approval-request-reason">{approval.reason || permissionApprovalSummary(approval.effect)}</p>
-      <details className="approval-request-payload">
+      <details className="approval-request-payload" open={approval.toolName === 'exec_command'}>
         <summary>查看本次调用参数</summary>
         {approval.impact && <pre>{prettyValue(approval.impact)}</pre>}
         <pre>{prettyValue(approval.arguments)}</pre>
@@ -2434,7 +3404,7 @@ function textDetail(details: Record<string, unknown>, key: string) {
 function approvalFromTraceEvents(events: TraceEvent[], conversationId: string): ApprovalRequest | null {
   const uniqueEvents = [...new Map(events.map((event) => [event.id, event])).values()]
     .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt) || left.sequence - right.sequence);
-  const terminalTurnEvents = new Set(['turn.completed', 'turn.incomplete', 'turn.failed', 'turn.cancelled', 'turn.needs_reconciliation', 'turn.interrupted']);
+  const terminalTurnEvents = new Set(['turn.completed', 'turn.incomplete', 'turn.failed', 'turn.cancelled', 'turn.interrupted']);
 
   for (const event of [...uniqueEvents].reverse()) {
     if (event.kind !== 'approval.requested') continue;
@@ -2449,7 +3419,7 @@ function approvalFromTraceEvents(events: TraceEvent[], conversationId: string): 
     if (resolved || turnFinished) return null;
 
     const profile = textDetail(details, 'permissionProfile');
-    const permissionProfile: ConversationPermissionProfile = ['read_only', 'workspace_autonomous', 'ask_on_sensitive', 'fully_autonomous'].includes(profile)
+    const permissionProfile: ConversationPermissionProfile = ['read_only', 'workspace_autonomous', 'request_approval', 'fully_autonomous'].includes(profile)
       ? profile as ConversationPermissionProfile
       : 'workspace_autonomous';
     const createdAt = textDetail(details, 'createdAt') || event.createdAt;
@@ -2494,6 +3464,7 @@ function permissionApprovalSummary(effect: string) {
     workspace_write: '这会修改工作区文件。',
     external_read: '这会向外部服务发送查询内容。',
     external_write: '这会修改外部服务中的数据。',
+    shell: '这条命令请求了工作区写入或网络访问权限。批准仅适用于本次指定命令。',
     destructive: '这可能删除或覆盖数据。',
     sensitive: '这会安装或构建插件代码。',
     unknown: '这个工具的影响范围无法确认。',
@@ -2508,15 +3479,30 @@ function turnStatusLabel(status: string) {
     failed: '运行失败',
     cancelled: '已暂停',
 	    interrupted: '已暂停',
-    needs_reconciliation: '已暂停',
 	'turn.completed': '已完成',
 	'turn.incomplete': '未完成',
     'turn.failed': '运行失败',
 	    'turn.cancelled': '已暂停',
 	    'turn.interrupted': '已暂停',
-    'turn.needs_reconciliation': '已暂停',
   };
   return labels[status] || '已结束';
+}
+
+function continuationUnavailableLabel(reason: string) {
+  const labels: Record<string, string> = {
+    continuation_checkpoint_missing: '没有可用的进度检查点',
+    runtime_state_not_resumable: '本轮依赖无法跨轮恢复的运行时状态或临时文件',
+    continuation_not_at_safe_boundary: '停止时仍有未完成的模型或工具调用',
+    snapshot_encryption_failed: '加密保存进度失败',
+    snapshot_decryption_failed: '读取加密进度失败',
+    snapshot_decode_failed: '进度格式无法读取',
+    snapshot_not_at_safe_boundary: '进度检查点不在安全边界',
+    snapshot_integrity_failed: '进度完整性检查失败',
+    execution_binding_changed: '模型、Agent、权限、项目或工具发生变化',
+    conversation_changed: '任务结束后会话已有新消息',
+    user_started_new_task: '你选择了新任务，旧进度不能安全接续',
+  };
+  return labels[reason] ?? '运行环境或进度检查未通过';
 }
 
 function activityHeadline(events: TraceEvent[], running: boolean, turnStatus: string, approvalRequest?: TraceEvent) {
@@ -2531,7 +3517,6 @@ function activityHeadline(events: TraceEvent[], running: boolean, turnStatus: st
     if (terminal.kind === 'turn.cancelled' || terminal.kind === 'turn.interrupted') return '已暂停';
     if (terminal.kind === 'turn.failed') return '运行失败';
     if (terminal.kind === 'turn.incomplete') return '本轮结束，任务未完成';
-    if (terminal.kind === 'turn.needs_reconciliation') return '已暂停';
   }
   if (!running) {
     if (turnStatus === 'completed') return '已完成';
@@ -2569,12 +3554,9 @@ function activityHeadline(events: TraceEvent[], running: boolean, turnStatus: st
 
 function permissionProfileLabel(profile: ConversationPermissionProfile) {
   if (profile === 'read_only') return '只读';
+  if (profile === 'request_approval') return '请求批准';
   if (profile === 'fully_autonomous') return '完全自动';
   return '工作区自动';
-}
-
-function normalizePermissionProfile(profile: ConversationPermissionProfile): Exclude<ConversationPermissionProfile, 'ask_on_sensitive'> {
-  return profile === 'ask_on_sensitive' ? 'workspace_autonomous' : profile;
 }
 
 function inboxTurnStatusLabel(status: string) {
@@ -2583,7 +3565,6 @@ function inboxTurnStatusLabel(status: string) {
     failed: '消息已开始处理，但运行失败。',
     cancelled: '消息已暂停。',
     interrupted: '消息已暂停，可从原始输入继续。',
-    needs_reconciliation: '消息已暂停。',
   };
   return labels[status] || `消息状态：${status}`;
 }
@@ -2617,12 +3598,17 @@ function eventLabel(value: string) {
     checkpointed: '已保存',
     'turn.started': '任务开始',
 	'turn.completed': '任务完成',
-	'turn.incomplete': '达到步数上限',
+	'turn.incomplete': '本段停止，任务尚未完成',
+	'turn.continuation_saved': '续跑进度已保存',
+	'turn.continued': '从已保存进度继续',
+	'turn.continuation_invalidated': '续跑进度不可用',
+	'continuation.intent_classified': 'Agent 判断后续意图',
+	'loop.stalled': '重复失败，已暂停',
+	'loop.nudged': '检测到重复操作，已提醒 Agent 换方法',
     'turn.failed': '任务失败',
 	    'turn.cancelled': '会话已暂停',
 	    'turn.interrupted': '会话已暂停',
     'turn.cancel_requested': '正在停止任务',
-    'turn.needs_reconciliation': '已暂停',
     'model.requested': '正在请求模型',
     'model.started': '模型调用',
     'model.completed': '模型完成',
@@ -2634,7 +3620,6 @@ function eventLabel(value: string) {
     'tools.completed': '工具批次完成',
     'tool.started': '工具调用',
     'tool.completed': '工具完成',
-    'permission.checked': '权限检查',
     'approval.requested': '等待用户授权',
     'approval.resolved': '用户已决定',
     'tool.authorization_denied': '调用已拦截',
@@ -2672,7 +3657,6 @@ function eventSummary(event: TraceEvent) {
   }
   if (event.kind === 'tool.completed')
     return `${text('name') || '未命名工具'} · ${details.ok === false ? '执行失败' : '执行成功'} · ${number('durationMillis') ?? 0} ms`;
-  if (event.kind === 'permission.checked') return `${text('tool') || '工具'} · ${text('outcome') || '未知'} · ${text('reason')}`;
   if (event.kind === 'approval.requested') return `${text('toolName') || '工具'} · ${text('effect') || '未知影响'} · 等待表单决定`;
   if (event.kind === 'approval.resolved') return `${text('decision') || '未知'} · ${text('status') || '状态已更新'}`;
   if (event.kind === 'tool.authorization_denied') return `${text('name') || '工具'} · ${text('reason') || '未通过当前会话权限策略'}`;
@@ -2686,12 +3670,18 @@ function eventSummary(event: TraceEvent) {
 	}
   if (event.kind === 'provider.compatibility_warning') return text('message') || text('code') || '供应商兼容性提示';
   if (event.kind === 'turn.started') return `${number('messageCount') ?? 0} 条消息 · ${number('pinnedTools') ?? 0} 个固定工具`;
-	if (event.kind === 'turn.completed') {
+  if (event.kind === 'turn.completed') {
     const metrics = asRecord(details.metrics);
     const duration = typeof metrics.durationMillis === 'number' ? metrics.durationMillis : 0;
     return duration > 0 ? `结果已保存 · 总耗时 ${formatDuration(duration)}` : '结果已经保存到当前对话';
 	}
-	if (event.kind === 'turn.incomplete') return '已保存当前总结，但任务尚未完成';
+	if (event.kind === 'continuation.intent_classified') {
+		const decision = text('decision');
+		if (decision === 'resume') return '将从保存的检查点继续';
+		if (decision === 'new_task') return '将作为新任务处理';
+		return '意图判断失败，未消费检查点';
+	}
+	if (event.kind === 'turn.incomplete') return '本段已停止，任务尚未完成';
   if (event.kind === 'turn.cancel_requested') return '正在等待当前操作安全结束';
   if (event.kind === 'turn.cancelled') return '用户停止了当前任务';
   return step ? `第 ${step} 步` : '运行状态已更新';

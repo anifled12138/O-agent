@@ -1,0 +1,32 @@
+[Unit]
+Description=O Agent web control interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node /opt/o-agent/current/frontend/standalone/server.js
+Restart=on-failure
+RestartSec=3s
+User=oagent-web
+Group=oagent-web
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+WorkingDirectory=/opt/o-agent/current/frontend/standalone
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

@@ -96,7 +96,7 @@ function run(command, args, cwd, extraEnv = {}) {
     const child = spawn(command, args, {
       cwd,
       stdio: 'inherit',
-      shell: process.platform === 'win32',
+      shell: process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command),
       env: { ...process.env, ...extraEnv },
     });
     child.on('exit', (code) => {
@@ -104,6 +104,28 @@ function run(command, args, cwd, extraEnv = {}) {
       else reject(new Error(`${command} ${args.join(' ')} 退出，错误码: ${code}`));
     });
   });
+}
+
+async function verifyBuiltBinary(outputPath, settleMs = 0) {
+  if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+  const info = await fs.stat(outputPath).catch((err) => {
+    throw new Error(`Go build returned successfully but its output is missing: ${outputPath}: ${err.message}`);
+  });
+  if (!info.isFile() || info.size < 2) {
+    throw new Error(`Go build output is not a non-empty file: ${outputPath}`);
+  }
+  if (process.platform === 'win32') {
+    const file = await fs.open(outputPath, 'r');
+    try {
+      const signature = Buffer.alloc(2);
+      const { bytesRead } = await file.read(signature, 0, signature.length, 0);
+      if (bytesRead !== 2 || signature[0] !== 0x4d || signature[1] !== 0x5a) {
+        throw new Error(`Go build output is not a Windows executable: ${outputPath}`);
+      }
+    } finally {
+      await file.close();
+    }
+  }
 }
 
 async function cleanRelease() {
@@ -151,12 +173,30 @@ async function buildBackendBinary() {
   const backendOutput = path.join(desktopDir, '.runtime', 'package', process.platform === 'win32' ? 'o-host.exe' : 'o-host');
   await fs.mkdir(path.dirname(backendOutput), { recursive: true });
 
-  await run(goBin, ['build', '-trimpath', '"-ldflags=-s -w"', '-o', backendOutput, './cmd/axiom'], backendDir, {
+  await run(goBin, ['build', '-trimpath', '-o', backendOutput, './cmd/axiom'], backendDir, {
     ...process.env,
     CGO_ENABLED: '0',
     GOCACHE: path.join(rootDir, '.gocache'),
     GOPATH: path.join(rootDir, '.gopath'),
   });
+  await verifyBuiltBinary(backendOutput, process.platform === 'win32' ? 1500 : 0);
+
+  if (process.platform === 'win32') {
+    const sandboxCommands = [
+      ['axiom-command-runner.exe', './cmd/axiom-command-runner'],
+      ['axiom-sandbox-setup.exe', './cmd/axiom-sandbox-setup'],
+    ];
+    for (const [binary, packagePath] of sandboxCommands) {
+      const output = path.join(desktopDir, '.runtime', 'package', binary);
+      await run(goBin, ['build', '-trimpath', '-o', output, packagePath], backendDir, {
+        ...process.env,
+        CGO_ENABLED: '0',
+        GOCACHE: path.join(rootDir, '.gocache'),
+        GOPATH: path.join(rootDir, '.gopath'),
+      });
+      await verifyBuiltBinary(output);
+    }
+  }
 
   logSuccess(`后端服务编译完成 -> ${backendOutput}`);
   return backendOutput;
@@ -204,7 +244,7 @@ async function main() {
   await buildFrontendUI();
 
   // 2. 后端二进制
-  logStep(2, totalSteps, '编译 Go 后端服务 (Axiom Agent Runtime)');
+  logStep(2, totalSteps, '编译 Go 后端服务 (O Agent Runtime)');
   const backendOutput = await buildBackendBinary();
   const backendName = path.basename(backendOutput);
 
@@ -243,7 +283,17 @@ async function main() {
       process.platform === 'darwin' ? 'O.app/Contents/Resources/app/runtime' : 'resources/app/runtime'
     );
     await fs.mkdir(path.join(runtimeDir, 'ui'), { recursive: true });
-    await fs.copyFile(backendOutput, path.join(runtimeDir, backendName));
+    const packagedBackend = path.join(runtimeDir, backendName);
+    await fs.copyFile(backendOutput, packagedBackend);
+    await verifyBuiltBinary(packagedBackend, process.platform === 'win32' ? 1500 : 0);
+    if (process.platform === 'win32') {
+      const helperDir = path.join(desktopDir, '.runtime', 'package');
+      for (const helper of ['axiom-command-runner.exe', 'axiom-sandbox-setup.exe']) {
+        const packagedHelper = path.join(runtimeDir, helper);
+        await fs.copyFile(path.join(helperDir, helper), packagedHelper);
+        await verifyBuiltBinary(packagedHelper);
+      }
+    }
     await fs.cp(path.join(frontendDir, 'dist-desktop'), path.join(runtimeDir, 'ui'), { recursive: true });
     logSuccess(`桌面端程序包生成完成: ${appPath}`);
   }

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted offsite O control backup
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 UTC
+Persistent=true
+RandomizedDelaySec=20m
+Unit=o-agent-backup.service
+
+[Install]
+WantedBy=timers.target

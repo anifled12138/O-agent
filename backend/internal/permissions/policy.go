@@ -1,7 +1,7 @@
 // Package permissions applies one session policy to every tool call. The
 // caller classifies effects where the host can verify them; an enabled tool is
 // otherwise available without a per-call approval in workspace-autonomous
-// mode.
+// mode, unless the effect is classified as risky.
 package permissions
 
 import "axiom.local/agent/internal/domain"
@@ -49,7 +49,8 @@ type Decision struct {
 // tool is built in or provided by an enabled extension. Unknown effects are
 // not an implicit approval prompt: workspace-autonomous mode only asks for
 // high-impact actions the host has positively classified as destructive or
-// sensitive. The process sandbox remains an independent enforcement boundary.
+// sensitive. Request-approval mode additionally asks before workspace writes
+// and external access. The process sandbox remains an independent boundary.
 func Evaluate(profile domain.PermissionProfile, request Request) Decision {
 	request.Profile = profile
 	if !profile.Valid() {
@@ -74,9 +75,15 @@ func Evaluate(profile domain.PermissionProfile, request Request) Decision {
 	if request.Effect == EffectSensitive {
 		return Decision{Outcome: OutcomeAsk, Reason: "操作会执行或启用新的插件代码"}
 	}
+	if profile == domain.PermissionProfileRequestApproval {
+		switch request.Effect {
+		case EffectWorkspaceWrite, EffectShell, EffectExternalRead, EffectExternalWrite, EffectUnknown:
+			return Decision{Outcome: OutcomeAsk, Reason: "此模式要求在工作区写入或访问网络前获得批准"}
+		}
+	}
 
-	// workspace_autonomous is the default, including the legacy
-	// ask_on_sensitive profile. Ordinary writes, network reads/writes, shell
-	// operations and enabled extension tools run without per-call prompts.
+	// workspace_autonomous is the default: normal workspace writes, command
+	// execution and network access run without per-call prompts. Only effects
+	// positively classified as destructive or sensitive require approval.
 	return Decision{Outcome: OutcomeAllow, Reason: "工作区自动模式允许常规操作"}
 }

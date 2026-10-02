@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,18 +20,45 @@ import (
 )
 
 type Input struct {
-	Name          string `json:"name"`
-	Kind          string `json:"kind"`
-	BaseURL       string `json:"baseUrl"`
-	Model         string `json:"model"`
-	APIKey        string `json:"apiKey"`
-	ContextWindow int    `json:"contextWindow"`
+	Name             string `json:"name"`
+	Kind             string `json:"kind"`
+	BaseURL          string `json:"baseUrl"`
+	Model            string `json:"model"`
+	APIKey           string `json:"apiKey"`
+	ContextWindow    int    `json:"contextWindow"`
+	SupportsVision   *bool  `json:"supportsVision"`
+	SourceProviderID string `json:"sourceProviderId,omitempty"`
+}
+
+type ModelConfiguration struct {
+	Model          string `json:"model"`
+	ContextWindow  int    `json:"contextWindow"`
+	SupportsVision bool   `json:"supportsVision"`
+}
+
+type BatchInput struct {
+	Name             string               `json:"name"`
+	Kind             string               `json:"kind"`
+	BaseURL          string               `json:"baseUrl"`
+	APIKey           string               `json:"apiKey"`
+	SourceProviderID string               `json:"sourceProviderId,omitempty"`
+	Models           []ModelConfiguration `json:"models"`
 }
 type ChatMessage struct {
 	Role       string     `json:"role"`
 	Content    string     `json:"content,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	// ProviderItems carries an opaque provider-native input window. Only the
+	// matching adapter may serialize it; application code must not inspect or
+	// rewrite these items.
+	ProviderItems []json.RawMessage `json:"providerItems,omitempty"`
+	// Provider identity pins opaque Responses items to the exact source binding.
+	ProviderID             string `json:"providerId,omitempty"`
+	ProviderModel          string `json:"providerModel,omitempty"`
+	ProviderTranscriptHash string `json:"providerTranscriptSha256,omitempty"`
+	SourceID               string `json:"contextSourceId,omitempty"`
+	Historical             bool   `json:"contextHistorical,omitempty"`
 }
 type ToolCall struct {
 	ID       string       `json:"id"`
@@ -52,10 +81,13 @@ type ToolDefinition struct {
 type Completion struct {
 	Content   string
 	ToolCalls []ToolCall
-	Model     string
-	Usage     Usage
-	Attempts  int
-	Warnings  []CompatibilityWarning
+	// ProviderItems is the complete raw Responses output window. Keep each
+	// item intact so opaque compaction and reasoning items round-trip unchanged.
+	ProviderItems []json.RawMessage
+	Model         string
+	Usage         Usage
+	Attempts      int
+	Warnings      []CompatibilityWarning
 }
 type Usage struct {
 	PromptTokens     int `json:"promptTokens"`
@@ -72,10 +104,44 @@ func New(store *storage.Store, vault *secure.Vault) *Service {
 	return &Service{store: store, vault: vault, client: &http.Client{Timeout: 90 * time.Second}}
 }
 
+func (s *Service) sealOrReuseProviderKey(ctx context.Context, userID, kind, baseURL, apiKey, sourceProviderID string, allowsBlankKey bool) ([]byte, []byte, bool, error) {
+	if apiKey != "" {
+		cipher, nonce, err := s.vault.Seal([]byte(apiKey))
+		return cipher, nonce, true, err
+	}
+	if sourceProviderID != "" {
+		source, cipher, nonce, err := s.store.ProviderSecret(ctx, userID, sourceProviderID)
+		if err != nil || source.Kind != kind || source.BaseURL != baseURL {
+			return nil, nil, false, domain.ErrInvalid
+		}
+		var plain []byte
+		if len(cipher) > 0 {
+			plain, err = s.vault.Open(cipher, nonce)
+			if err != nil {
+				return nil, nil, false, err
+			}
+		}
+		if !allowsBlankKey && len(plain) == 0 {
+			return nil, nil, false, domain.ErrInvalid
+		}
+		return cipher, nonce, len(plain) > 0, nil
+	}
+	if !allowsBlankKey {
+		return nil, nil, false, domain.ErrInvalid
+	}
+	return nil, nil, false, nil
+}
+
 // SealRunCheckpoint protects the replay transcript and tool payloads at rest
 // with the same local master key used for provider credentials.
 func (s *Service) SealRunCheckpoint(plain []byte) ([]byte, []byte, error) {
 	return s.vault.Seal(plain)
+}
+
+// SealRunCheckpointDeterministic creates repeatable ciphertext for immutable,
+// content-addressed chunks so an interrupted artifact upload can resume.
+func (s *Service) SealRunCheckpointDeterministic(plain, context []byte) ([]byte, []byte, error) {
+	return s.vault.SealDeterministic(plain, context)
 }
 
 func (s *Service) OpenRunCheckpoint(ciphertext, nonce []byte) ([]byte, error) {
@@ -89,17 +155,84 @@ func (s *Service) Create(ctx context.Context, userID string, in Input) (domain.P
 	in.Model = strings.TrimSpace(in.Model)
 	baseURL, validURL := canonicalBaseURL(in.BaseURL)
 	allowsBlankKey := in.Kind == KindOllama || in.Kind == KindVLLM || in.Kind == KindOpenAICompatible
-	if in.Name == "" || in.Model == "" || (!allowsBlankKey && in.APIKey == "") || !ok || !validURL || in.ContextWindow < 0 || in.ContextWindow > 2_000_000 {
+	if in.Name == "" || in.Model == "" || (!allowsBlankKey && in.APIKey == "" && in.SourceProviderID == "") || !ok || !validURL || in.ContextWindow < 0 || in.ContextWindow > 2_000_000 {
 		return domain.Provider{}, domain.ErrInvalid
 	}
 	in.BaseURL = baseURL
-	cipher, nonce, err := s.vault.Seal([]byte(in.APIKey))
+	cipher, nonce, hasKey, err := s.sealOrReuseProviderKey(ctx, userID, in.Kind, in.BaseURL, in.APIKey, in.SourceProviderID, allowsBlankKey)
 	if err != nil {
 		return domain.Provider{}, err
 	}
 	now := time.Now().UTC()
-	p := domain.Provider{ID: newID(), UserID: userID, Name: in.Name, Kind: in.Kind, BaseURL: in.BaseURL, Model: in.Model, ContextWindow: in.ContextWindow, HasAPIKey: len(cipher) > 0, CreatedAt: now, UpdatedAt: now}
-	return p, s.store.UpsertProvider(ctx, p, cipher, nonce)
+	vision := true
+	if in.SupportsVision != nil {
+		vision = *in.SupportsVision
+	}
+	p := domain.Provider{ID: newID(), UserID: userID, Name: in.Name, Kind: in.Kind, BaseURL: in.BaseURL, Model: in.Model, ContextWindow: in.ContextWindow, SupportsVision: &vision, HasAPIKey: hasKey, CreatedAt: now, UpdatedAt: now}
+	if err := s.store.UpsertProvider(ctx, p, cipher, nonce); err != nil {
+		return domain.Provider{}, err
+	}
+	saved, _, _, err := s.store.ProviderSecret(ctx, userID, p.ID)
+	if err != nil || saved.Name != p.Name || saved.Kind != p.Kind || saved.BaseURL != p.BaseURL || saved.Model != p.Model || saved.ContextWindow != p.ContextWindow || saved.SupportsVision == nil || *saved.SupportsVision != vision {
+		if err != nil {
+			return domain.Provider{}, fmt.Errorf("provider created but could not verify saved model: %w", err)
+		}
+		return domain.Provider{}, errors.New("provider created but saved model settings did not match")
+	}
+	return saved, nil
+}
+
+func (s *Service) CreateBatch(ctx context.Context, userID string, in BatchInput) ([]domain.Provider, error) {
+	in.Name = strings.TrimSpace(in.Name)
+	kind, validKind := normalizeKind(in.Kind)
+	baseURL, validURL := canonicalBaseURL(in.BaseURL)
+	allowsBlankKey := kind == KindOllama || kind == KindVLLM || kind == KindOpenAICompatible
+	if in.Name == "" || !validKind || !validURL || (!allowsBlankKey && strings.TrimSpace(in.APIKey) == "" && in.SourceProviderID == "") || len(in.Models) == 0 || len(in.Models) > 128 {
+		return nil, domain.ErrInvalid
+	}
+	cipher, nonce, hasKey, err := s.sealOrReuseProviderKey(ctx, userID, kind, baseURL, in.APIKey, in.SourceProviderID, allowsBlankKey)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	records := make([]storage.ProviderRecord, 0, len(in.Models))
+	seen := make(map[string]struct{}, len(in.Models))
+	for _, configured := range in.Models {
+		model := strings.TrimSpace(configured.Model)
+		if model == "" || configured.ContextWindow < 1 || configured.ContextWindow > 2_000_000 {
+			return nil, domain.ErrInvalid
+		}
+		if _, exists := seen[model]; exists {
+			return nil, domain.ErrInvalid
+		}
+		seen[model] = struct{}{}
+		vision := configured.SupportsVision
+		p := domain.Provider{
+			ID: newID(), UserID: userID, Name: in.Name + " · " + model, Kind: kind,
+			BaseURL: baseURL, Model: model, ContextWindow: configured.ContextWindow,
+			SupportsVision: &vision, HasAPIKey: hasKey, CreatedAt: now, UpdatedAt: now,
+		}
+		records = append(records, storage.ProviderRecord{Provider: p, Cipher: append([]byte(nil), cipher...), Nonce: append([]byte(nil), nonce...)})
+	}
+	if err := s.store.CreateProviders(ctx, records); err != nil {
+		return nil, err
+	}
+
+	// Read the committed rows back so the API only reports models that the
+	// provider store can observe after the transaction has completed.
+	created := make([]domain.Provider, 0, len(records))
+	for _, record := range records {
+		p, _, _, err := s.store.ProviderSecret(ctx, userID, record.Provider.ID)
+		if err != nil {
+			return nil, fmt.Errorf("provider batch committed but could not verify model %q: %w", record.Provider.Model, err)
+		}
+		if p.Name != record.Provider.Name || p.Kind != record.Provider.Kind || p.BaseURL != record.Provider.BaseURL || p.Model != record.Provider.Model || p.ContextWindow != record.Provider.ContextWindow || p.SupportsVision == nil || *p.SupportsVision != *record.Provider.SupportsVision {
+			return nil, fmt.Errorf("provider batch committed but model %q did not match its saved settings", record.Provider.Model)
+		}
+		created = append(created, p)
+	}
+	return created, nil
 }
 
 func (s *Service) Update(ctx context.Context, userID, id string, in Input) (domain.Provider, error) {
@@ -131,9 +264,22 @@ func (s *Service) Update(ctx context.Context, userID, id string, in Input) (doma
 	if in.ContextWindow > 0 {
 		existing.ContextWindow = in.ContextWindow
 	}
+	if in.SupportsVision != nil {
+		existing.SupportsVision = in.SupportsVision
+	}
 	existing.HasAPIKey = len(cipher) > 0
 	existing.UpdatedAt = time.Now().UTC()
-	return existing, s.store.UpdateProvider(ctx, existing, cipher, nonce)
+	if err := s.store.UpdateProvider(ctx, existing, cipher, nonce); err != nil {
+		return domain.Provider{}, err
+	}
+	saved, _, _, err := s.store.ProviderSecret(ctx, userID, id)
+	if err != nil {
+		return domain.Provider{}, fmt.Errorf("provider updated but could not verify saved settings: %w", err)
+	}
+	if saved.Name != existing.Name || saved.Kind != existing.Kind || saved.BaseURL != existing.BaseURL || saved.Model != existing.Model || saved.ContextWindow != existing.ContextWindow || (existing.SupportsVision == nil && saved.SupportsVision != nil) || (existing.SupportsVision != nil && (saved.SupportsVision == nil || *saved.SupportsVision != *existing.SupportsVision)) {
+		return domain.Provider{}, errors.New("provider updated but saved settings did not match")
+	}
+	return saved, nil
 }
 
 func (s *Service) List(ctx context.Context, userID string) ([]domain.Provider, error) {
@@ -294,13 +440,55 @@ func (s *Service) CompleteWithTools(ctx context.Context, userID, id string, mess
 	if err != nil {
 		return Completion{}, err
 	}
+	contextWindow := p.ContextWindow
+	if contextWindow <= 0 {
+		contextWindow = 131072
+	}
+	inputTokens := EstimateInputTokens(messages, tools)
+	inputBudget := contextWindow * 75 / 100
+	if inputBudget < 1 {
+		inputBudget = 1
+	}
+	if inputTokens > inputBudget {
+		return Completion{}, &ProviderError{Class: ErrorContextOverflow, SafeDetail: fmt.Sprintf("estimated model input (%d tokens) exceeds the preflight budget (%d of %d context tokens)", inputTokens, inputBudget, contextWindow)}
+	}
+	if p.SupportsVision != nil && !*p.SupportsVision {
+		for _, message := range messages {
+			if imageMarkdownRegex.MatchString(message.Content) {
+				return Completion{}, errors.New("the selected model is configured for text-only input; remove image attachments or enable vision for this model")
+			}
+		}
+	}
 	adapter, err := adapterFor(p.Kind)
 	if err != nil {
 		return Completion{}, err
 	}
+	for _, message := range messages {
+		if len(message.ProviderItems) > 0 && p.Kind != KindOpenAIResponses {
+			return Completion{}, &ProviderError{Class: ErrorProtocol, SafeDetail: "provider-native context state is incompatible with the selected provider protocol"}
+		}
+	}
 	req, err := adapter.completionRequest(ctx, p, key, messages, tools)
 	if err != nil {
 		return Completion{}, err
+	}
+	if observer := requestAuditObserver(ctx); observer != nil {
+		if req.GetBody == nil {
+			return Completion{}, errors.New("provider adapter did not expose a replayable serialized request for audit")
+		}
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return Completion{}, fmt.Errorf("read serialized provider request for audit: %w", bodyErr)
+		}
+		digest := sha256.New()
+		requestBytes, readErr := io.Copy(digest, body)
+		closeErr := body.Close()
+		if readErr != nil || closeErr != nil {
+			return Completion{}, fmt.Errorf("read serialized provider request for audit: %w", errors.Join(readErr, closeErr))
+		}
+		if auditErr := observer(RequestAudit{PayloadSHA256: hex.EncodeToString(digest.Sum(nil)), RequestBytes: int(requestBytes)}); auditErr != nil {
+			return Completion{}, fmt.Errorf("model request pre-send audit failed: %w", auditErr)
+		}
 	}
 	resp, attempts, err := s.doCompletionRequest(req)
 	if err != nil {
@@ -324,6 +512,82 @@ func (s *Service) CompleteWithTools(ctx context.Context, userID, id string, mess
 		return Completion{}, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, Attempts: attempts, SafeDetail: err.Error(), Cause: err}
 	}
 	completion.Attempts = attempts
+	return completion, nil
+}
+
+// CompactResponses asks the Responses API to compact a historical window and
+// returns every item in the resulting canonical window without decoding or
+// filtering provider-owned state.
+func (s *Service) CompactResponses(ctx context.Context, userID, id string, messages []ChatMessage) (Completion, error) {
+	p, key, err := s.secret(ctx, userID, id)
+	if err != nil {
+		return Completion{}, err
+	}
+	if p.Kind != KindOpenAIResponses {
+		return Completion{}, &ProviderError{Class: ErrorProtocol, SafeDetail: "native compaction requires the OpenAI Responses protocol"}
+	}
+	adapter, err := adapterFor(p.Kind)
+	if err != nil {
+		return Completion{}, err
+	}
+	responses, ok := adapter.(interface {
+		compactionRequest(context.Context, domain.Provider, string, []ChatMessage) (*http.Request, error)
+		decodeCompaction([]byte) (Completion, error)
+	})
+	if !ok {
+		return Completion{}, errors.New("Responses adapter does not support native compaction")
+	}
+	window := p.ContextWindow
+	if window <= 0 {
+		window = 131072
+	}
+	if estimate := EstimateInputTokens(messages, nil); estimate > window {
+		return Completion{}, &ProviderError{Class: ErrorContextOverflow, SafeDetail: fmt.Sprintf("native compaction input estimate (%d tokens) exceeds the configured context window (%d)", estimate, window)}
+	}
+	req, err := responses.compactionRequest(ctx, p, key, messages)
+	if err != nil {
+		return Completion{}, err
+	}
+	if observer := requestAuditObserver(ctx); observer != nil {
+		if req.GetBody == nil {
+			return Completion{}, errors.New("Responses compact adapter did not expose a replayable request for audit")
+		}
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return Completion{}, fmt.Errorf("read serialized Responses compact request for audit: %w", bodyErr)
+		}
+		digest := sha256.New()
+		requestBytes, readErr := io.Copy(digest, body)
+		closeErr := body.Close()
+		if readErr != nil || closeErr != nil {
+			return Completion{}, fmt.Errorf("read serialized Responses compact request for audit: %w", errors.Join(readErr, closeErr))
+		}
+		if auditErr := observer(RequestAudit{PayloadSHA256: hex.EncodeToString(digest.Sum(nil)), RequestBytes: int(requestBytes)}); auditErr != nil {
+			return Completion{}, fmt.Errorf("Responses compact pre-send audit failed: %w", auditErr)
+		}
+	}
+	resp, attempts, err := s.doCompletionRequest(req)
+	if err != nil {
+		return Completion{Attempts: attempts}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return Completion{Attempts: attempts}, &ProviderError{Class: ErrorProtocol, Attempts: attempts, SafeDetail: "could not read the Responses compact result", Cause: err}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		providerErr := asProviderError(httpProviderError(resp, raw))
+		providerErr.Attempts = attempts
+		return Completion{Attempts: attempts}, providerErr
+	}
+	if !json.Valid(raw) {
+		return Completion{Attempts: attempts}, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, Attempts: attempts, SafeDetail: "Responses compact endpoint returned non-JSON content"}
+	}
+	completion, err := responses.decodeCompaction(raw)
+	completion.Attempts = attempts
+	if err != nil {
+		return completion, &ProviderError{Class: ErrorProtocol, StatusCode: resp.StatusCode, Attempts: attempts, SafeDetail: err.Error(), Cause: err}
+	}
 	return completion, nil
 }
 
@@ -464,6 +728,9 @@ func (s *Service) secret(ctx context.Context, userID, id string) (domain.Provide
 	p, cipher, nonce, err := s.store.ProviderSecret(ctx, userID, id)
 	if err != nil {
 		return p, "", err
+	}
+	if len(cipher) == 0 {
+		return p, "", nil
 	}
 	plain, err := s.vault.Open(cipher, nonce)
 	return p, string(plain), err

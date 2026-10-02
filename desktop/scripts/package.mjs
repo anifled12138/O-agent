@@ -20,7 +20,7 @@ function run(command, args, cwd, extraEnv = {}) {
     const child = spawn(command, args, {
       cwd,
       stdio: 'inherit',
-      shell: process.platform === 'win32',
+      shell: process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command),
       env: { ...process.env, ...extraEnv },
     });
     child.on('exit', (code) => {
@@ -30,8 +30,31 @@ function run(command, args, cwd, extraEnv = {}) {
   });
 }
 
+async function verifyBuiltBinary(outputPath, settleMs = 0) {
+  if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+  const info = await fs.stat(outputPath).catch((err) => {
+    throw new Error(`Go build returned successfully but its output is missing: ${outputPath}: ${err.message}`);
+  });
+  if (!info.isFile() || info.size < 2) {
+    throw new Error(`Go build output is not a non-empty file: ${outputPath}`);
+  }
+  if (process.platform === 'win32') {
+    const file = await fs.open(outputPath, 'r');
+    try {
+      const signature = Buffer.alloc(2);
+      const { bytesRead } = await file.read(signature, 0, signature.length, 0);
+      if (bytesRead !== 2 || signature[0] !== 0x4d || signature[1] !== 0x5a) {
+        throw new Error(`Go build output is not a Windows executable: ${outputPath}`);
+      }
+    } finally {
+      await file.close();
+    }
+  }
+}
+
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const go = process.platform === 'win32' ? 'D:\\agent-harness\\work\\toolchains\\go\\bin\\go.exe' : 'go';
+const bundledGo = path.join(repositoryRoot, 'work', 'toolchains', 'go', 'bin', process.platform === 'win32' ? 'go.exe' : 'go');
+const go = (await fs.stat(bundledGo).then(() => true, () => false)) ? bundledGo : (process.platform === 'win32' ? 'go.exe' : 'go');
 
 await run(npm, ['run', 'build:desktop-ui'], frontendDir);
 
@@ -41,12 +64,27 @@ const backendOutput = path.join(desktopDir, '.runtime', 'package', process.platf
 const backendName = process.platform === 'win32' ? 'o-host.exe' : 'o-host';
 
 await fs.mkdir(path.dirname(backendOutput), { recursive: true });
-await run(go, ['build', '-trimpath', '"-ldflags=-s -w"', '-o', backendOutput, './cmd/axiom'], backendDir, {
+await run(go, ['build', '-trimpath', '-o', backendOutput, './cmd/axiom'], backendDir, {
   ...process.env,
   CGO_ENABLED: '0',
   GOCACHE: path.join(repositoryRoot, '.gocache'),
   GOPATH: path.join(repositoryRoot, '.gopath'),
 });
+await verifyBuiltBinary(backendOutput, process.platform === 'win32' ? 1500 : 0);
+
+const helperBinaries = process.platform === 'win32'
+  ? ['axiom-command-runner.exe', 'axiom-sandbox-setup.exe']
+  : [];
+for (const binary of helperBinaries) {
+  const packagePath = binary === 'axiom-command-runner.exe' ? './cmd/axiom-command-runner' : './cmd/axiom-sandbox-setup';
+  await run(go, ['build', '-trimpath', '-o', path.join(path.dirname(backendOutput), binary), packagePath], backendDir, {
+    ...process.env,
+    CGO_ENABLED: '0',
+    GOCACHE: path.join(repositoryRoot, '.gocache'),
+    GOPATH: path.join(repositoryRoot, '.gopath'),
+  });
+  await verifyBuiltBinary(path.join(path.dirname(backendOutput), binary));
+}
 
 const appPaths = await packager({
   dir: desktopDir,
@@ -74,7 +112,14 @@ for (const appPath of appPaths) {
   const runtimeDir = path.join(appPath, process.platform === 'darwin' ? 'O.app/Contents/Resources/app/runtime' : 'resources/app/runtime');
   await fs.mkdir(path.join(runtimeDir, 'ui'), { recursive: true });
   await new Promise((r) => setTimeout(r, 1000));
-  await fs.copyFile(backendOutput, path.join(runtimeDir, backendName));
+  const packagedBackend = path.join(runtimeDir, backendName);
+  await fs.copyFile(backendOutput, packagedBackend);
+  await verifyBuiltBinary(packagedBackend, process.platform === 'win32' ? 1500 : 0);
+  for (const helper of helperBinaries) {
+    const packagedHelper = path.join(runtimeDir, helper);
+    await fs.copyFile(path.join(path.dirname(backendOutput), helper), packagedHelper);
+    await verifyBuiltBinary(packagedHelper);
+  }
   await new Promise((r) => setTimeout(r, 1000));
   await fs.cp(path.join(frontendDir, 'dist-desktop'), path.join(runtimeDir, 'ui'), { recursive: true });
   process.stdout.write(`\nO desktop package: ${appPath}\n`);

@@ -22,7 +22,7 @@
 | 目标场景 | 推荐命令 | 耗时 | 产物位置与作用 |
 | :--- | :--- | :--- | :--- |
 | **仅修改了前端代码** (UI/CSS/React) | `npm run package:ui`<br>或 `node scripts/package.mjs --ui` | ~200ms | `frontend/dist-desktop`<br>更新桌面端静态资源 |
-| **仅修改了后端代码** (Go/API/Axiom) | `npm run package:backend`<br>或 `node scripts/package.mjs --backend` | ~300ms | `desktop/.runtime/package/o-host.exe`<br>更新独立后端执行体 |
+| **仅修改了后端代码** (Go/API/O) | `npm run package:backend`<br>或 `node scripts/package.mjs --backend` | ~300ms | `desktop/.runtime/package/o-host.exe`<br>更新独立后端执行体 |
 | **日常开发/测试快速出包** (推荐) | `npm run package:fast`<br>或 `build.bat --fast` | ~2-3s | `release/O-0.1.0-xxxx/O-win32-x64/O.exe`<br>生成绿色免安装目录，可直接双击启动验证 |
 | **全量发布交付打包** (包含 Zip) | `npm run package`<br>或 `build.bat` | ~15-25s | `release/O-0.1.0-xxxx/`<br>包含完整程序目录与 `O-win32-x64-portable.zip` |
 | **磁盘空间清理** | `npm run package:clean`<br>或 `build.bat --clean` | <1s | 清理历史 `release/O-*` 过期产物 |

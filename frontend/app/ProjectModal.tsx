@@ -12,14 +12,22 @@ import {
   Sparkles,
   Check,
   AlertCircle,
+  RefreshCw,
+  Upload,
 } from 'lucide-react';
 import {
   Project,
+  ProjectPublication,
+  GitPublicationPreview,
   createProject,
   updateProject,
   deleteProject,
   selectNativeDirectory,
   cloneProjectGit,
+  previewProjectPublication,
+  createProjectPublication,
+  reconcileProjectPublication,
+  getProjectPublications,
 } from './api';
 import { useDialogA11y } from './useDialogA11y';
 
@@ -46,14 +54,18 @@ export default function ProjectModal({
   );
   const [workdir, setWorkdir] = useState(project?.workdir ?? '');
   const [remoteRepoUrl, setRemoteRepoUrl] = useState(project?.remoteRepoUrl ?? '');
-  const [remoteBranch, setRemoteBranch] = useState(project?.remoteBranch ?? 'main');
+  const [remoteBranch, setRemoteBranch] = useState(project?.remoteBranch ?? '');
   const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
   const [deleteConsent, setDeleteConsent] = useState(false);
 
   const [busy, setBusy] = useState(false);
   const [pickingDir, setPickingDir] = useState(false);
   const [cloningGit, setCloningGit] = useState(false);
-  const [cloneNotice, setCloneNotice] = useState<{ type: 'ok' | 'err'; message: string } | null>(null);
+  const [projectNotice, setProjectNotice] = useState<{ type: 'ok' | 'err'; message: string } | null>(null);
+  const [publicationPreview, setPublicationPreview] = useState<GitPublicationPreview | null>(null);
+  const [publications, setPublications] = useState<ProjectPublication[]>([]);
+  const [publicationBusy, setPublicationBusy] = useState(false);
+  const [publicationError, setPublicationError] = useState('');
   const [error, setError] = useState('');
 
   async function handlePickDirectory() {
@@ -79,7 +91,7 @@ export default function ProjectModal({
     }
     setCloningGit(true);
     setError('');
-    setCloneNotice(null);
+    setProjectNotice(null);
     try {
       const res = await cloneProjectGit({
         projectId: project?.id,
@@ -87,15 +99,103 @@ export default function ProjectModal({
         targetDir: workdir.trim() || undefined,
         branch: remoteBranch.trim() || undefined,
       });
-      if (res.ok) {
-        setWorkdir(res.targetDir);
-        setCloneNotice({ type: 'ok', message: `仓库克隆成功: ${res.targetDir}` });
-      }
+      setWorkdir(res.targetDir);
+      const sizeNotice = res.measurementStatus === 'measured'
+        ? `；工作副本约 ${(res.measuredBytes / 1_000_000).toFixed(1)} MB`
+        : '；工作副本大小暂时无法准确测量';
+      const transferNotice = res.recommendedTransferMode === 'incremental_or_artifact_link'
+        ? '；建议后续云端同步采用增量、分块续传或成果链接，本地任务不受影响'
+        : '';
+      setProjectNotice({ type: 'ok', message: `仓库已检出到 ${res.targetDir}${sizeNotice}${transferNotice}` });
     } catch (err) {
       const msg = err instanceof Error ? err.message : '克隆仓库失败';
-      setCloneNotice({ type: 'err', message: msg });
+      setProjectNotice({ type: 'err', message: msg });
     } finally {
       setCloningGit(false);
+    }
+  }
+
+  async function handlePreviewPublication() {
+    if (!project || project.remoteRepoUrl !== remoteRepoUrl.trim() || project.workdir !== workdir.trim() || project.remoteBranch !== remoteBranch.trim()) {
+      setPublicationError('请先保存项目的仓库地址、工作目录和目标分支，再检查发布状态。');
+      return;
+    }
+    setPublicationBusy(true);
+    setPublicationError('');
+    const [previewResult, historyResult] = await Promise.allSettled([
+      previewProjectPublication(project.id, remoteBranch.trim() || undefined),
+      getProjectPublications(project.id),
+    ]);
+    if (previewResult.status === 'fulfilled') setPublicationPreview(previewResult.value);
+    if (historyResult.status === 'fulfilled') setPublications(historyResult.value);
+    const failures = [previewResult, historyResult].filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failures.length) setPublicationError(failures.map((failure) => failure.reason instanceof Error ? failure.reason.message : '读取 Git 发布状态失败').join('；'));
+    setPublicationBusy(false);
+  }
+
+  async function handlePublishCommit() {
+    if (!project || !publicationPreview || !publicationPreview.worktreeClean || !publicationPreview.remoteSha) return;
+    const childSummary = publicationPreview.submodules.length
+      ? `\n\n同时会在 ${publicationPreview.submodules.length} 个子仓库创建提交地址 ref：\n${publicationPreview.submodules.slice(0, 3).map((item) => `• ${item.path} · ${item.repositoryUrl} · ${item.commitSha.slice(0, 12)}`).join('\n')}${publicationPreview.submodules.length > 3 ? '\n其余目标请查看发布预览中的完整清单。' : ''}`
+      : '';
+    const confirmed = window.confirm(`将当前提交 ${publicationPreview.commitSha.slice(0, 12)} 推送到 ${publicationPreview.targetBranch}？\n\n目标远端当前版本：${publicationPreview.remoteSha.slice(0, 12)}${childSummary}\n\n只会执行普通快进推送；不会创建提交或覆盖已有远端历史。父仓库或子仓库的 push 可能触发仓库 CI 自动化。`);
+    if (!confirmed) return;
+    setPublicationBusy(true);
+    setPublicationError('');
+    try {
+      const key = `project-publish-${crypto.randomUUID()}`;
+      const result = await createProjectPublication(project.id, {
+        targetBranch: publicationPreview.targetBranch,
+        expectedRemoteSha: publicationPreview.remoteSha,
+        commitSha: publicationPreview.commitSha,
+      }, key);
+      setPublications((items) => [result, ...items.filter((item) => item.id !== result.id)]);
+      if (result.status === 'published') setProjectNotice({ type: 'ok', message: `远端已核实发布到 ${result.targetBranch}，SHA ${result.remoteSha}` });
+      else if (result.status === 'needs_reconciliation') setPublicationError(result.error || '推送结果不确定，请核查远端状态后再继续。');
+      else if (result.status === 'failed') setPublicationError(result.error || '发布失败；远端没有读回目标提交。');
+      const [historyResult, previewResult] = await Promise.allSettled([
+        getProjectPublications(project.id),
+        previewProjectPublication(project.id, remoteBranch.trim() || undefined),
+      ]);
+      if (historyResult.status === 'fulfilled') setPublications(historyResult.value);
+      else setPublicationError((current) => [current, '发布状态已读回，但刷新发布历史失败。'].filter(Boolean).join(' '));
+      if (previewResult.status === 'fulfilled') setPublicationPreview(previewResult.value);
+      else setPublicationError((current) => [current, '发布状态已读回，但刷新仓库预览失败。'].filter(Boolean).join(' '));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Git 发布请求失败';
+      try {
+        setPublications(await getProjectPublications(project.id));
+        setPublicationError(message);
+      } catch (readErr) {
+        const readMessage = readErr instanceof Error ? readErr.message : '发布记录读取失败';
+        setPublicationError(`${message}；同时无法读取云端发布记录：${readMessage}`);
+      }
+    } finally {
+      setPublicationBusy(false);
+    }
+  }
+
+  async function handleReconcilePublication(publicationId: string) {
+    if (!project) return;
+    setPublicationBusy(true);
+    setPublicationError('');
+    try {
+      const result = await reconcileProjectPublication(project.id, publicationId);
+      setPublications((items) => [result, ...items.filter((item) => item.id !== result.id)]);
+      if (result.status === 'publishing') setPublicationError('该发布请求仍在执行中；已返回最新持久状态，本次没有并发核查远端。');
+      else if (result.status === 'needs_reconciliation') setPublicationError(result.error || '远端状态仍无法判定，请稍后重新核查。');
+      else if (result.status === 'published') setProjectNotice({ type: 'ok', message: `远端已核实发布到 ${result.targetBranch}，SHA ${result.remoteSha}` });
+      else if (result.status === 'failed') setPublicationError(result.error || '核查完成：远端仍处于发布前版本。');
+      try {
+        setPublications(await getProjectPublications(project.id));
+      } catch (readErr) {
+        const readMessage = readErr instanceof Error ? readErr.message : '发布记录读取失败';
+        setPublicationError((current) => [current, `核查状态已读回，但刷新发布历史失败：${readMessage}`].filter(Boolean).join(' '));
+      }
+    } catch (err) {
+      setPublicationError(err instanceof Error ? err.message : '发布核查失败');
+    } finally {
+      setPublicationBusy(false);
     }
   }
 
@@ -371,13 +471,68 @@ export default function ProjectModal({
                 </button>
               </div>
 
-              {cloneNotice && (
+              {projectNotice && (
                 <div
-                  className={`project-notice ${cloneNotice.type === 'ok' ? 'success' : 'error'}`}
+                  className={`project-notice ${projectNotice.type === 'ok' ? 'success' : 'error'}`}
                   style={{ marginTop: 6 }}
                 >
-                  {cloneNotice.type === 'ok' ? <Check size={13} /> : <AlertCircle size={13} />}
-                  <span>{cloneNotice.message}</span>
+                  {projectNotice.type === 'ok' ? <Check size={13} /> : <AlertCircle size={13} />}
+                  <span>{projectNotice.message}</span>
+                </div>
+              )}
+              {isEditing && (
+                <div style={{ marginTop: 12, borderTop: '1px solid var(--border, #deddd5)', paddingTop: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <strong style={{ fontSize: 13 }}>发布已提交的 Git commit</strong>
+                    <button type="button" className="upc-btn-secondary" onClick={() => void handlePreviewPublication()} disabled={publicationBusy || !remoteRepoUrl.trim() || !workdir.trim()}>
+                      <RefreshCw size={13} />
+                      <span>{publicationBusy ? '检查中…' : '检查当前提交'}</span>
+                    </button>
+                  </div>
+                  <p className="project-field-hint" style={{ margin: '6px 0 8px' }}>只发布工作区中已经创建的 commit；不会替你自动提交文件。子仓库提交 ref 会在预览中逐项列出。脏工作区和远端发生变化时会阻止推送。</p>
+                  {publicationError && <div className="project-notice error" role="alert" style={{ marginBottom: 8 }}><AlertCircle size={13} /><span>{publicationError}</span></div>}
+                  {publicationPreview && (
+                    <div style={{ border: '1px solid var(--border, #deddd5)', borderRadius: 9, padding: 10, fontSize: 12, overflowWrap: 'anywhere' }}>
+                      <div>目标分支：<strong>{publicationPreview.targetBranch}</strong> · 当前分支：{publicationPreview.currentBranch || 'detached HEAD'}</div>
+                      <div style={{ marginTop: 4 }}>本地 HEAD：<code>{publicationPreview.commitSha}</code></div>
+                      <div style={{ marginTop: 4 }}>远端基线：<code>{publicationPreview.remoteSha || '分支不存在'}</code></div>
+                      <div style={{ marginTop: 4 }}>工作区：{publicationPreview.worktreeClean ? '干净' : '有未提交或未跟踪文件'}</div>
+                      {publicationPreview.submodules.length > 0 && (
+                        <div style={{ marginTop: 8, borderTop: '1px solid var(--border, #deddd5)', paddingTop: 7 }}>
+                          <div style={{ fontWeight: 600 }}>本次还会发布以下子仓库提交 ref（不会自动创建子仓库 commit）</div>
+                          <div role="region" aria-label="子仓库提交 ref 发布清单" tabIndex={0} style={{ maxHeight: 132, overflowY: 'auto', marginTop: 4, paddingRight: 4 }}>
+                            {publicationPreview.submodules.map((item) => (
+                              <div key={`${item.path}:${item.ref}`} style={{ padding: '4px 0', borderTop: '1px solid var(--border, #deddd5)' }}>
+                                <div>{item.path} · <code>{item.commitSha.slice(0, 12)}</code></div>
+                                <div style={{ color: 'var(--muted, #77776e)', overflowWrap: 'anywhere' }}>{item.repositoryUrl}</div>
+                                <div style={{ color: 'var(--muted, #77776e)', overflowWrap: 'anywhere' }}>目标 ref：<code>{item.ref}</code></div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {publicationPreview.remoteSha ? (
+                        <button type="button" className="upc-btn-primary" style={{ marginTop: 9 }} onClick={() => void handlePublishCommit()} disabled={publicationBusy || !publicationPreview.worktreeClean || publicationPreview.commitSha === publicationPreview.remoteSha}>
+                          <Upload size={13} />
+                          <span>{publicationBusy ? '发布中…' : publicationPreview.commitSha === publicationPreview.remoteSha ? '远端已是此版本' : '确认推送此 commit'}</span>
+                        </button>
+                      ) : <div style={{ marginTop: 7, color: 'var(--muted, #77776e)' }}>当前 API 只允许更新已有父仓库目标分支，不会自动创建父仓库分支。</div>}
+                    </div>
+                  )}
+                  {publications.length > 0 && (
+                    <div style={{ marginTop: 9 }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>发布记录</div>
+                      {publications.slice(0, 5).map((item) => (
+                        <div key={item.id} style={{ padding: '5px 0', fontSize: 11, borderTop: '1px solid var(--border, #deddd5)' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <span style={{ flex: 1, overflowWrap: 'anywhere' }}>{item.targetBranch} · {item.status} · {item.commitSha.slice(0, 12)}{item.error ? ` · ${item.error}` : ''}</span>
+                            {(item.status === 'publishing' || item.status === 'needs_reconciliation') && <button type="button" className="upc-btn-secondary" disabled={publicationBusy} onClick={() => void handleReconcilePublication(item.id)}>核查</button>}
+                          </div>
+                          {item.submodules && item.submodules.length > 0 && <div style={{ marginTop: 3, color: 'var(--muted, #77776e)', overflowWrap: 'anywhere' }}>{item.submodules.map((child) => `${child.path}: ${child.status}${child.remoteSha ? ` (${child.remoteSha.slice(0, 12)})` : ''}`).join(' · ')}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

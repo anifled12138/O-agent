@@ -1,0 +1,32 @@
+[Unit]
+Description=O Agent cloud control plane and persistent task worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env /opt/o-agent/current/backend/axiom
+Restart=on-failure
+RestartSec=3s
+EnvironmentFile=/etc/o-agent/cloud.env
+Environment=O_ADDR=127.0.0.1:9171
+Environment=O_EXECUTION_ROLE=cloud
+Environment=O_DATA_DIR=/var/lib/o-agent/data
+Environment=O_WORKSPACE_ROOT=/var/lib/o-agent/workspaces
+Environment=O_AGENT_TEMP_DIR=/var/lib/o-agent/tmp/agent-runs
+UMask=0077
+WorkingDirectory=/var/lib/o-agent
+NoNewPrivileges=yes
+PrivateDevices=yes
+# The backend must connect to the user manager's D-Bus socket under
+# /run/user/<uid> to start per-task systemd scopes. Keep that tree read-only.
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/o-agent
+RestrictSUIDSGID=yes
+LockPersonality=yes
+LimitNOFILE=65536
+TasksMax=4096
+
+[Install]
+WantedBy=default.target

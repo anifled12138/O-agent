@@ -11,6 +11,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-sandbox-build:
+    name: Windows Sandbox Helpers & Tests
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Build Windows backend and sandbox helpers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CGO_ENABLED = '0'
+          go build ./...
+          go build -o $env:RUNNER_TEMP/axiom-command-runner.exe ./cmd/axiom-command-runner
+          go build -o $env:RUNNER_TEMP/axiom-sandbox-setup.exe ./cmd/axiom-sandbox-setup
+          if (-not (Test-Path $env:RUNNER_TEMP/axiom-command-runner.exe)) { throw 'command runner was not built' }
+          if (-not (Test-Path $env:RUNNER_TEMP/axiom-sandbox-setup.exe)) { throw 'sandbox setup helper was not built' }
+
+      - name: Vet Windows sandbox code
+        run: go vet ./internal/sandbox ./internal/coretools ./cmd/axiom-command-runner ./cmd/axiom-sandbox-setup
+
+      - name: Test Windows sandbox and Git credential broker
+        run: go test ./internal/sandbox ./internal/gitcredential
+
   backend-test-and-build:
     name: Backend Test & Build
     runs-on: ubuntu-latest
@@ -34,6 +68,9 @@ jobs:
       - name: Run Go Vet
         run: go vet ./...
 
+      - name: Prepare O host-config path for Linux sandbox mask tests
+        run: sudo install -d -m 0750 /etc/o-agent
+
       - name: Run Backend Unit & Integration Tests
         shell: bash
         run: |
@@ -48,6 +85,48 @@ jobs:
             exit $TEST_EXIT
           fi
 
+      - name: Install project quota filesystem tools
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs xfsprogs
+
+      - name: Verify kernel project quota enforcement on ext4 and XFS
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test_binary="$RUNNER_TEMP/projectquota-linux.test"
+          go test -c -o "$test_binary" ./internal/projectquota
+          chmod 0755 "$test_binary"
+          ext4_image="$RUNNER_TEMP/o-agent-quota-ext4.img"
+          xfs_image="$RUNNER_TEMP/o-agent-quota-xfs.img"
+          ext4_mount="$RUNNER_TEMP/o-agent-quota-ext4"
+          xfs_mount="$RUNNER_TEMP/o-agent-quota-xfs"
+          mkdir -p "$ext4_mount" "$xfs_mount"
+          mounted_ext4=0
+          mounted_xfs=0
+          cleanup() {
+            local status=$?
+            trap - EXIT
+            if (( mounted_xfs )); then sudo umount -- "$xfs_mount" || status=1; fi
+            if (( mounted_ext4 )); then sudo umount -- "$ext4_mount" || status=1; fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          truncate -s 512M "$ext4_image"
+          mkfs.ext4 -F -O project,quota "$ext4_image"
+          sudo mount -t ext4 -o loop,prjquota "$ext4_image" "$ext4_mount"
+          mounted_ext4=1
+          sudo env O_PROJECT_QUOTA_TEST_ROOT="$ext4_mount" "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v
+          sudo umount -- "$ext4_mount"
+          mounted_ext4=0
+
+          truncate -s 1G "$xfs_image"
+          mkfs.xfs -f "$xfs_image"
+          sudo mount -t xfs -o loop,pquota "$xfs_image" "$xfs_mount"
+          mounted_xfs=1
+          sudo env O_PROJECT_QUOTA_TEST_ROOT="$xfs_mount" "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v
+          sudo umount -- "$xfs_mount"
+          mounted_xfs=0
+
       - name: Upload Test Logs on Failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -55,15 +134,18 @@ jobs:
           name: backend-test-log
           path: backend/test.log
 
-      - name: Build Axiom Binary
+      - name: Build O Binary
         run: |
+          mkdir -p bin
           CGO_ENABLED=0 go build -v -o bin/axiom ./cmd/axiom
+          CGO_ENABLED=0 go build -v -o bin/axiom-sandbox-check ./cmd/axiom-sandbox-check
+          CGO_ENABLED=0 go build -v -o bin/axiom-quota-helper ./cmd/axiom-quota-helper
 
       - name: Upload Backend Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: axiom-backend-binary
-          path: backend/bin/axiom
+          name: axiom-linux-runtime
+          path: backend/bin
 
   frontend-test-and-build:
     name: Frontend Typecheck & Build
@@ -83,16 +165,13 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        shell: bash
-        run: |
-          set +e
-          npm ci --legacy-peer-deps > npm-install.log 2>&1
-          NPM_EXIT=$?
-          cat npm-install.log
-          if [ $NPM_EXIT -ne 0 ]; then
-            echo "npm ci failed, retrying with npm install..."
-            npm install --legacy-peer-deps
-          fi
+        run: npm ci --legacy-peer-deps
+
+      - name: Run frontend lint
+        run: npm run lint
+
+      - name: Run web runtime tests
+        run: npm run test:web
 
       - name: Run TypeScript Typecheck
         run: npm run typecheck
@@ -108,3 +187,89 @@ jobs:
         with:
           name: frontend-dist
           path: frontend/dist
+
+  assemble-cloud-runtime:
+    name: Assemble Ubuntu Cloud Runtime
+    needs: [backend-test-and-build, frontend-test-and-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download backend runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: axiom-linux-runtime
+          path: staging/backend
+
+      - name: Download standalone web runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: staging/frontend
+
+      - name: Assemble, validate, and checksum release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f staging/backend/axiom
+          test -f staging/backend/axiom-sandbox-check
+          test -f staging/backend/axiom-quota-helper
+          test -f staging/frontend/standalone/server.js
+          test -d staging/frontend/standalone/dist
+          test -d staging/frontend/standalone/public
+          mkdir -p release/backend release/frontend release/deploy/ubuntu
+          install -m 0755 staging/backend/axiom release/backend/axiom
+          install -m 0755 staging/backend/axiom-sandbox-check release/backend/axiom-sandbox-check
+          install -m 0755 staging/backend/axiom-quota-helper release/backend/axiom-quota-helper
+          cp -a staging/frontend/. release/frontend/
+          cp deploy/ubuntu/o-agent.service deploy/ubuntu/o-agent-quota-helper.service deploy/ubuntu/o-web.service deploy/ubuntu/o-agent-backup.service deploy/ubuntu/o-agent-backup.timer deploy/ubuntu/backup-and-upload.sh deploy/ubuntu/user-manager-delegation.conf deploy/ubuntu/install-runtime.sh deploy/ubuntu/config-paths.sh deploy/ubuntu/README.md deploy/ubuntu/Caddyfile.example release/deploy/ubuntu/
+          printf 'source_commit=%s\n' "$GITHUB_SHA" > release/BUILD-INFO
+          bash -n deploy/ubuntu/install-runtime.sh
+          bash -n deploy/ubuntu/config-paths.sh deploy/ubuntu/config-paths.test.sh
+          bash deploy/ubuntu/config-paths.test.sh
+          bash -n deploy/ubuntu/backup-and-upload.sh
+          bash -n deploy/ubuntu/backup-and-upload.test.sh
+          bash deploy/ubuntu/backup-and-upload.test.sh
+          grep -Fq '# Reserve Linux project IDs 0x80000000-0xffffffff for O task workspaces.' deploy/ubuntu/install-runtime.sh
+          grep -Fq 'Do not assign that range to other project-quota consumers' deploy/ubuntu/README.md
+          grep -Fq 'o_agent_require_real_config_file /etc/o-agent/quota-helper.env' deploy/ubuntu/install-runtime.sh
+          grep -Fq 'o_agent_require_real_directory /etc/o-agent' deploy/ubuntu/install-runtime.sh
+          test -x release/backend/axiom
+          test -x release/backend/axiom-quota-helper
+          test -f release/deploy/ubuntu/install-runtime.sh
+          test -f release/deploy/ubuntu/config-paths.sh
+          test -f release/deploy/ubuntu/backup-and-upload.sh
+          test -f release/deploy/ubuntu/o-agent-backup.service
+          test -f release/deploy/ubuntu/o-agent-backup.timer
+          test -f release/deploy/ubuntu/o-agent-quota-helper.service
+          bash -n release/deploy/ubuntu/install-runtime.sh release/deploy/ubuntu/config-paths.sh release/deploy/ubuntu/backup-and-upload.sh
+          sudo install -D -m 0755 deploy/ubuntu/backup-and-upload.sh /usr/local/lib/o-agent/backup-and-upload.sh
+          sudo install -D -m 0644 deploy/ubuntu/o-agent-backup.service /etc/systemd/system/o-agent-backup.service
+          sudo install -D -m 0644 deploy/ubuntu/o-agent-backup.timer /etc/systemd/system/o-agent-backup.timer
+          sudo install -D -m 0600 /dev/null /etc/o-agent/backup.key
+          sudo install -D -m 0640 /dev/null /etc/o-agent/rclone.conf
+          sudo install -D -m 0640 /dev/null /etc/o-agent/backup.env
+          grep -Fx 'EnvironmentFile=/etc/o-agent/cloud.env' deploy/ubuntu/o-agent.service
+          if grep -Eq '^Environment=O_FRONTEND_ORIGIN=' deploy/ubuntu/o-agent.service; then
+            echo 'o-agent.service must read O_FRONTEND_ORIGIN from the deployment cloud.env, not override it with an Environment entry' >&2
+            exit 1
+          fi
+          getent passwd oagent >/dev/null || sudo useradd --system --create-home --home-dir /var/lib/o-agent --shell /usr/sbin/nologin oagent
+          getent passwd oagent-web >/dev/null || sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin oagent-web
+          sudo mkdir -p /opt/o-agent /etc/o-agent /var/lib/o-agent
+          sudo ln -s "$GITHUB_WORKSPACE/release" /opt/o-agent/current
+          sudo touch /etc/o-agent/cloud.env
+          sudo systemd-analyze verify deploy/ubuntu/o-agent.service deploy/ubuntu/o-agent-quota-helper.service deploy/ubuntu/o-web.service deploy/ubuntu/o-agent-backup.service deploy/ubuntu/o-agent-backup.timer
+          tar -czf o-agent-cloud-runtime.tar.gz -C release .
+          sha256sum o-agent-cloud-runtime.tar.gz > o-agent-cloud-runtime.tar.gz.sha256
+          sha256sum -c o-agent-cloud-runtime.tar.gz.sha256
+          tar -tzf o-agent-cloud-runtime.tar.gz >/dev/null
+      - name: Upload deployable cloud runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: o-agent-cloud-runtime
+          path: |
+            o-agent-cloud-runtime.tar.gz
+            o-agent-cloud-runtime.tar.gz.sha256
+          if-no-files-found: error

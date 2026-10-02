@@ -1,11 +1,17 @@
 # O 设计文档索引
 
 状态：Active Design  
-更新时间：2026-09-12
+更新时间：2026-10-02
 
 本目录把总体架构拆成可以实现和验收的独立部分。每个文档都必须同时回答：边界
 是什么、为什么这样选、接口如何落地、失败时怎么办、怎样测试。总体方向见
 [`../architecture-v0.2-discussion.md`](../architecture-v0.2-discussion.md)。
+
+当前“云端记录中心 + 持久 Linux 云电脑 + 多台可选本地执行节点 + Android/iPhone Web/PWA 控制台”的主设计和实施验收统一见
+[`../o-cloud-first-architecture.md`](../o-cloud-first-architecture.md)。本地/云端架构背景见
+[`../local-cloud-architecture.md`](../local-cloud-architecture.md)，手机 Web/PWA 路线见
+[`../web-mobile-development.md`](../web-mobile-development.md)，Linux 任务磁盘配额见
+[`../adr/0006-linux-task-workspace-project-quotas.md`](../adr/0006-linux-task-workspace-project-quotas.md)。
 
 ## 文档
 

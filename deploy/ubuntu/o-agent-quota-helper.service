@@ -1,0 +1,34 @@
+[Unit]
+Description=O Agent restricted Linux project quota helper
+After=local-fs.target
+RequiresMountsFor=/var/lib/o-agent/workspaces
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/o-agent/quota-helper.env
+ExecStart=/opt/o-agent/current/backend/axiom-quota-helper /run/o-agent/quota.sock /var/lib/o-agent/workspaces ${O_AGENT_UID} ${O_AGENT_GID} ${O_QUOTA_MAX_BYTES}
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=o-agent
+RuntimeDirectoryMode=0750
+RuntimeDirectoryGroup=oagent
+UMask=0007
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/o-agent/workspaces /run/o-agent
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+TasksMax=32
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

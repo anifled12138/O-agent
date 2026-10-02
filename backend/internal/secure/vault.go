@@ -3,13 +3,18 @@ package secure
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 )
 
-type Vault struct{ aead cipher.AEAD }
+type Vault struct {
+	aead cipher.AEAD
+	key  []byte
+}
 
 func Open(dataDir string) (*Vault, error) {
 	path := filepath.Join(dataDir, "master.key")
@@ -44,7 +49,7 @@ func Open(dataDir string) (*Vault, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Vault{aead: aead}, nil
+	return &Vault{aead: aead, key: append([]byte(nil), key...)}, nil
 }
 
 func (v *Vault) Seal(plain []byte) (ciphertext, nonce []byte, err error) {
@@ -52,6 +57,21 @@ func (v *Vault) Seal(plain []byte) (ciphertext, nonce []byte, err error) {
 	if _, err = rand.Read(nonce); err != nil {
 		return nil, nil, err
 	}
+	return v.aead.Seal(nil, nonce, plain, nil), nonce, nil
+}
+
+// SealDeterministic derives an AEAD nonce from the vault key and a caller
+// context. It is intended only for immutable, content-addressed chunks where
+// the context includes a plaintext digest and chunk index, so a context cannot
+// be reused for different plaintext without a hash collision.
+func (v *Vault) SealDeterministic(plain []byte, context []byte) (ciphertext, nonce []byte, err error) {
+	if len(context) == 0 {
+		return nil, nil, fmt.Errorf("deterministic encryption context is required")
+	}
+	mac := hmac.New(sha256.New, v.key)
+	_, _ = mac.Write([]byte("axiom-deterministic-aead-nonce-v1\x00"))
+	_, _ = mac.Write(context)
+	nonce = append([]byte(nil), mac.Sum(nil)[:v.aead.NonceSize()]...)
 	return v.aead.Seal(nil, nonce, plain, nil), nonce, nil
 }
 

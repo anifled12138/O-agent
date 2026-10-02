@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -47,12 +50,19 @@ type securityCapabilities struct {
 }
 
 type accessGrant struct {
-	path string
-	sid  *windows.SID
+	path             string
+	sid              *windows.SID
+	write            bool
+	oldIntegritySDDL string
+	hadOriginalLabel bool
 }
 
 type accessPath struct {
-	path string
+	path             string
+	write            bool
+	deny             bool
+	oldIntegritySDDL string
+	hadOriginalLabel bool
 }
 
 type cleanupJournal struct {
@@ -61,12 +71,14 @@ type cleanupJournal struct {
 	ProcessStart    uint64         `json:"processStart"`
 	ProfileName     string         `json:"profileName"`
 	AppContainerSID string         `json:"appContainerSid"`
+	LoopbackExempt  bool           `json:"loopbackExempt,omitempty"`
 	Grants          []journalGrant `json:"grants"`
 }
 
 type journalGrant struct {
 	Path             string `json:"path"`
-	Write            bool   `json:"write"`
+	Write            bool   `json:"write,omitempty"` // Legacy mandatory-label journal field.
+	ACLWrite         bool   `json:"aclWrite,omitempty"`
 	OldIntegritySDDL string `json:"oldIntegritySddl,omitempty"`
 	HadIntegrity     bool   `json:"hadIntegrity"`
 }
@@ -83,11 +95,31 @@ type processExitError struct {
 func (e processExitError) Error() string { return fmt.Sprintf("process exited with code %d", e.code) }
 func (e processExitError) ExitCode() int { return int(e.code) }
 
-// Run creates a per-invocation AppContainer identity, grants it read access
-// only to requested paths and runtime directories, and confines writes to the
-// profile's private Temp directory. It starts the process suspended inside a
-// kill-on-close Job Object. No network capabilities are attached.
+// Run dispatches to a host-selected backend and fails closed for unknown values.
+// Empty keeps the AppContainer migration backend until native acceptance.
 func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (runErr, cleanupErr error) {
+	if len(input) > 1<<20 {
+		return errors.New("sandbox command input exceeds the 1 MiB limit"), nil
+	}
+	if policy.PowerShellExitWrapper {
+		wrapped, err := wrapPowerShellInput(input)
+		if err != nil {
+			return err, nil
+		}
+		input = wrapped
+	}
+	switch policy.Backend {
+	case "", BackendAppContainer:
+		return runAppContainer(ctx, command, input, policy)
+	case BackendWindowsNative:
+		return runNative(ctx, command, input, policy)
+	default:
+		return fmt.Errorf("unsupported sandbox backend %q", policy.Backend), nil
+	}
+}
+
+// runAppContainer retains the existing backend as an explicit migration option.
+func runAppContainer(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (runErr, cleanupErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -109,6 +141,7 @@ func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (r
 	if command.Dir == "" {
 		return errors.New("sandbox command working directory is empty"), nil
 	}
+
 	if policy.JournalPath == "" {
 		return errors.New("sandbox cleanup journal path is required"), nil
 	}
@@ -120,6 +153,7 @@ func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (r
 	var appContainerFolder, tempDir string
 	var grants []accessGrant
 	var journalCreated bool
+	var loopbackExemption bool
 	defer func() {
 		var tempCleanupErr error
 		if tempDir != "" {
@@ -136,8 +170,17 @@ func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (r
 				break
 			}
 		}
+		var loopbackRestoreErr error
+		if loopbackExemption {
+			for attempt := 0; attempt < 2; attempt++ {
+				loopbackRestoreErr = setAppContainerLoopbackExemption(profile.sid.String(), false)
+				if loopbackRestoreErr == nil {
+					break
+				}
+			}
+		}
 		var profileCleanupErr error
-		if accessRestoreErr == nil {
+		if accessRestoreErr == nil && loopbackRestoreErr == nil {
 			for attempt := 0; attempt < 2; attempt++ {
 				profileCleanupErr = profile.close()
 				if profileCleanupErr == nil {
@@ -154,12 +197,12 @@ func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (r
 				tempCleanupErr = errors.Join(tempCleanupErr, fmt.Errorf("verify AppContainer temporary directory cleanup: %w", err))
 			}
 		}
-		if accessRestoreErr != nil {
+		if accessRestoreErr != nil || loopbackRestoreErr != nil {
 			degradedMu.Lock()
-			sandboxDegraded = errors.Join(sandboxDegraded, accessRestoreErr)
+			sandboxDegraded = errors.Join(sandboxDegraded, accessRestoreErr, loopbackRestoreErr)
 			degradedMu.Unlock()
 		}
-		restoreErr := errors.Join(accessRestoreErr, profileCleanupErr)
+		restoreErr := errors.Join(accessRestoreErr, loopbackRestoreErr, profileCleanupErr)
 		if journalCreated && restoreErr == nil {
 			if err := removeCleanupJournal(policy.JournalPath); err != nil {
 				restoreErr = errors.Join(restoreErr, err)
@@ -211,16 +254,19 @@ func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (r
 	if err := os.MkdirAll(goCache, 0o700); err != nil {
 		return fmt.Errorf("create private Go build cache: %w", err), nil
 	}
-	environment := commandEnvironment(command.Env, tempDir, goCache, appContainerFolder)
+	environment, err := commandEnvironment(command.Env, tempDir, goCache, appContainerFolder, policy.NetworkAccess)
+	if err != nil {
+		return fmt.Errorf("prepare sandbox command environment: %w", err), nil
+	}
 	environmentBlock, err := encodeEnvironment(environment)
 	if err != nil {
 		return fmt.Errorf("prepare sandbox environment: %w", err), nil
 	}
 
 	readOnly := append([]string(nil), policy.ReadOnlyPaths...)
-	readOnly = append(readOnly, runtimeReadPaths(command.Path, environment)...)
+	readOnly = append(readOnly, runtimeReadPaths(command.Path)...)
 	readOnly = append(readOnly, environmentReadPaths(environment)...)
-	accessPaths, err := normalizeAccessPaths(readOnly)
+	accessPaths, err := normalizeAccessPaths(readOnly, policy.WritePaths)
 	if err != nil {
 		return fmt.Errorf("prepare sandbox filesystem policy: %w", err), nil
 	}
@@ -238,6 +284,8 @@ func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (r
 	if err != nil {
 		return fmt.Errorf("prepare sandbox cleanup journal: %w", err), nil
 	}
+	loopbackExemption = policy.NetworkAccess && proxyNeedsLoopbackExemption(environment)
+	journal.LoopbackExempt = loopbackExemption
 	if err := writeCleanupJournal(policy.JournalPath, journal); err != nil {
 		return fmt.Errorf("persist sandbox cleanup journal: %w", err), nil
 	}
@@ -246,11 +294,73 @@ func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (r
 	if err != nil {
 		return err, nil
 	}
+	if loopbackExemption {
+		if err := setAppContainerLoopbackExemption(profile.sid.String(), true); err != nil {
+			return fmt.Errorf("enable configured local proxy for sandbox command: %w", err), nil
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err, nil
 	}
-	runErr, cleanupErr = runAppContainerProcess(ctx, command, input, environmentBlock, profile.sid)
+	processCtx := ctx
+	var timeoutCancel context.CancelFunc
+	if policy.Timeout > 0 {
+		processCtx, timeoutCancel = context.WithTimeout(ctx, policy.Timeout)
+		defer timeoutCancel()
+	}
+	input, err = stageAppContainerPowerShellInput(command, input, tempDir)
+	if err != nil {
+		return fmt.Errorf("stage private PowerShell input: %w", err), nil
+	}
+	runErr, cleanupErr = runAppContainerProcess(processCtx, command, input, environmentBlock, profile.sid, policy.NetworkAccess)
 	return runErr, cleanupErr
+}
+
+// AppContainer PowerShell hosts do not reliably consume redirected stdin on
+// every supported Windows build, and Restricted execution policy can reject
+// -File. Keep the source in the private command directory and use a short
+// -EncodedCommand loader to evaluate it in memory. Other commands keep stdin.
+func stageAppContainerPowerShellInput(command *exec.Cmd, input []byte, tempDir string) ([]byte, error) {
+	if command == nil || len(input) == 0 || len(command.Args) < 3 {
+		return input, nil
+	}
+	if !strings.EqualFold(filepath.Base(command.Path), "powershell.exe") && !strings.EqualFold(filepath.Base(command.Path), "pwsh.exe") {
+		return input, nil
+	}
+	last := len(command.Args)
+	if !strings.EqualFold(command.Args[last-2], "-Command") || command.Args[last-1] != "-" {
+		return input, nil
+	}
+	if strings.TrimSpace(tempDir) == "" || !filepath.IsAbs(tempDir) {
+		return input, errors.New("private PowerShell temporary directory must be absolute")
+	}
+	path := filepath.Join(tempDir, "command-input.ps1")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return input, fmt.Errorf("create private PowerShell input: %w", err)
+	}
+	written, writeErr := file.Write(input)
+	if writeErr == nil && written != len(input) {
+		writeErr = io.ErrShortWrite
+	}
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return input, errors.Join(err, os.Remove(path))
+	}
+	quotedPath := strings.ReplaceAll(path, "'", "''")
+	quotedTempDir := strings.ReplaceAll(tempDir, "'", "''")
+	loader := "$env:TEMP = '" + quotedTempDir + "'\n" +
+		"$env:TMP = '" + quotedTempDir + "'\n" +
+		"$__oagentSource = [System.IO.File]::ReadAllText('" + quotedPath + "')\n" +
+		"& ([ScriptBlock]::Create($__oagentSource))\n"
+	encodedUnits := utf16.Encode([]rune(loader))
+	encodedBytes := make([]byte, len(encodedUnits)*2)
+	for index, unit := range encodedUnits {
+		binary.LittleEndian.PutUint16(encodedBytes[index*2:], unit)
+	}
+	encodedLoader := base64.StdEncoding.EncodeToString(encodedBytes)
+	command.Args = append(append([]string(nil), command.Args[:last-2]...), "-EncodedCommand", encodedLoader)
+	return nil, nil
 }
 
 func createAppContainerProfile() (*appContainerProfile, error) {
@@ -269,7 +379,7 @@ func createAppContainerProfile() (*appContainerProfile, error) {
 	if err != nil {
 		return nil, err
 	}
-	displayName, err := windows.UTF16PtrFromString("Axiom agent command")
+	displayName, err := windows.UTF16PtrFromString("O agent command")
 	if err != nil {
 		return nil, fmt.Errorf("encode sandbox display name: %w", err)
 	}
@@ -383,23 +493,48 @@ func canonicalDirectory(path string) (string, error) {
 	return filepath.Clean(resolved), nil
 }
 
-func normalizeAccessPaths(readOnly []string) ([]accessPath, error) {
+func normalizeAccessPaths(readOnly, writable []string) ([]accessPath, error) {
 	byPath := map[string]accessPath{}
-	for _, raw := range readOnly {
+	add := func(raw string, write bool) error {
 		if strings.TrimSpace(raw) == "" {
-			return nil, errors.New("sandbox path is empty")
+			return errors.New("sandbox path is empty")
 		}
 		path, err := canonicalDirectory(raw)
 		if err != nil {
-			return nil, fmt.Errorf("resolve allowed path %q: %w", raw, err)
+			return fmt.Errorf("resolve allowed path %q: %w", raw, err)
 		}
 		if filepath.VolumeName(path) == path || strings.EqualFold(path, filepath.VolumeName(path)+string(filepath.Separator)) {
-			return nil, fmt.Errorf("refusing to grant access to a drive root: %s", path)
+			return fmt.Errorf("refusing to grant access to a drive root: %s", path)
 		}
-		byPath[strings.ToLower(path)] = accessPath{path: path}
+		if write && (isBroadRuntimePath(path) || isSensitiveRuntimePath(path) || isSystemRuntimePath(path)) {
+			return fmt.Errorf("refusing to grant workspace write access to a protected or broad path: %s", path)
+		}
+		key := strings.ToLower(path)
+		prior := byPath[key]
+		prior.path = path
+		prior.write = prior.write || write
+		byPath[key] = prior
+		return nil
+	}
+	for _, raw := range readOnly {
+		if err := add(raw, false); err != nil {
+			return nil, err
+		}
+	}
+	for _, raw := range writable {
+		if err := add(raw, true); err != nil {
+			return nil, err
+		}
 	}
 	paths := make([]accessPath, 0, len(byPath))
 	for _, path := range byPath {
+		if path.write {
+			label, hadLabel, err := readIntegrityLabel(path.path)
+			if err != nil {
+				return nil, fmt.Errorf("read original workspace integrity label for %s: %w", path.path, err)
+			}
+			path.oldIntegritySDDL, path.hadOriginalLabel = label, hadLabel
+		}
 		paths = append(paths, path)
 	}
 	sort.Slice(paths, func(i, j int) bool { return len(paths[i].path) < len(paths[j].path) })
@@ -409,16 +544,78 @@ func normalizeAccessPaths(readOnly []string) ([]accessPath, error) {
 func applyAccessGrants(paths []accessPath, sid *windows.SID) ([]accessGrant, error) {
 	grants := make([]accessGrant, 0, len(paths))
 	for _, path := range paths {
-		if err := setAccess(path.path, sid, windows.SET_ACCESS); err != nil {
-			revokeErr := setAccess(path.path, sid, windows.REVOKE_ACCESS)
-			if revokeErr != nil {
-				grants = append(grants, accessGrant{path: path.path, sid: sid})
-			}
-			return grants, errors.Join(fmt.Errorf("grant sandbox access to %s: %w", path.path, err), revokeErr)
+		if err := setAccess(path.path, sid, windows.SET_ACCESS, path.write); err != nil {
+			// Only successfully applied grants belong in the rollback list. The failed
+			// ACL operation is returned directly, without a speculative revoke.
+			return grants, fmt.Errorf("grant AppContainer read/execute access to %s: %w", path.path, err)
 		}
-		grants = append(grants, accessGrant{path: path.path, sid: sid})
+		grant := accessGrant{path: path.path, sid: sid, write: path.write, oldIntegritySDDL: path.oldIntegritySDDL, hadOriginalLabel: path.hadOriginalLabel}
+		grants = append(grants, grant)
+		if path.write {
+			if err := setLowIntegrityLabel(path.path); err != nil {
+				return grants, fmt.Errorf("allow the AppContainer to write workspace path %s: %w", path.path, err)
+			}
+		}
 	}
 	return grants, nil
+}
+
+func readIntegrityLabel(path string) (string, bool, error) {
+	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.LABEL_SECURITY_INFORMATION)
+	if err != nil {
+		return "", false, err
+	}
+	if descriptor == nil {
+		return "", false, errors.New("workspace path has no security descriptor")
+	}
+	_, _, err = descriptor.SACL()
+	if errors.Is(err, windows.ERROR_OBJECT_NOT_FOUND) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	sddl := descriptor.String()
+	if strings.TrimSpace(sddl) == "" {
+		return "", false, errors.New("encode original workspace integrity label")
+	}
+	return sddl, true, nil
+}
+
+func setLowIntegrityLabel(path string) error {
+	descriptor, err := windows.SecurityDescriptorFromString("S:(ML;OICI;NW;;;LW)")
+	if err != nil {
+		return fmt.Errorf("prepare temporary low-integrity workspace label: %w", err)
+	}
+	label, _, err := descriptor.SACL()
+	if err != nil {
+		return fmt.Errorf("read temporary workspace integrity label: %w", err)
+	}
+	if label == nil {
+		return errors.New("temporary workspace integrity label is missing")
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.LABEL_SECURITY_INFORMATION, nil, nil, nil, label); err != nil {
+		return fmt.Errorf("set temporary workspace integrity label: %w", err)
+	}
+	return nil
+}
+
+func restoreIntegrityLabel(path, oldSDDL string, hadLabel bool) error {
+	var oldLabel *windows.ACL
+	if hadLabel {
+		descriptor, err := windows.SecurityDescriptorFromString(oldSDDL)
+		if err != nil {
+			return fmt.Errorf("decode original workspace integrity label: %w", err)
+		}
+		oldLabel, _, err = descriptor.SACL()
+		if err != nil {
+			return fmt.Errorf("read original workspace integrity label: %w", err)
+		}
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.LABEL_SECURITY_INFORMATION, nil, nil, nil, oldLabel); err != nil {
+		return fmt.Errorf("restore original workspace integrity label: %w", err)
+	}
+	return nil
 }
 
 func newCleanupJournal(profile *appContainerProfile, paths []accessPath) (cleanupJournal, error) {
@@ -431,7 +628,10 @@ func newCleanupJournal(profile *appContainerProfile, paths []accessPath) (cleanu
 	journal := cleanupJournal{Version: 1, PID: os.Getpid(), ProcessStart: processStart, ProfileName: profile.name, AppContainerSID: sid}
 	for _, path := range paths {
 		journal.Grants = append(journal.Grants, journalGrant{
-			Path: path.path,
+			Path:             path.path,
+			ACLWrite:         path.write,
+			OldIntegritySDDL: path.oldIntegritySDDL,
+			HadIntegrity:     path.hadOriginalLabel,
 		})
 	}
 	return journal, nil
@@ -597,6 +797,11 @@ func recoverCleanupJournal(path, root string) (RecoveryReport, error) {
 	if err != nil {
 		return report, fmt.Errorf("decode AppContainer SID: %w", err)
 	}
+	if journal.LoopbackExempt {
+		if err := setAppContainerLoopbackExemption(journal.AppContainerSID, false); err != nil {
+			return report, fmt.Errorf("remove stale AppContainer loopback exemption: %w", err)
+		}
+	}
 	var joined error
 	for index := len(journal.Grants) - 1; index >= 0; index-- {
 		grant := journal.Grants[index]
@@ -616,7 +821,7 @@ func recoverCleanupJournal(path, root string) (RecoveryReport, error) {
 			report.OtherFailures++
 			continue
 		}
-		if grant.Write {
+		if grant.Write || grant.ACLWrite {
 			var oldLabel *windows.ACL
 			var descriptor *windows.SECURITY_DESCRIPTOR
 			var descriptorErr error
@@ -648,7 +853,7 @@ func recoverCleanupJournal(path, root string) (RecoveryReport, error) {
 				continue
 			}
 		}
-		if err := setAccess(grant.Path, sid, windows.REVOKE_ACCESS); err != nil {
+		if err := setAccess(grant.Path, sid, windows.REVOKE_ACCESS, grant.ACLWrite); err != nil {
 			joined = errors.Join(joined, fmt.Errorf("revoke access from %s: %w", grant.Path, err))
 			report.UnresolvedGrants++
 			if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
@@ -711,26 +916,35 @@ func revokeAccessGrants(grants []accessGrant) error {
 	var joined error
 	for i := len(grants) - 1; i >= 0; i-- {
 		grant := grants[i]
-		if err := setAccess(grant.path, grant.sid, windows.REVOKE_ACCESS); err != nil {
+		if grant.write {
+			if err := restoreIntegrityLabel(grant.path, grant.oldIntegritySDDL, grant.hadOriginalLabel); err != nil {
+				joined = errors.Join(joined, fmt.Errorf("restore workspace integrity label on %s: %w", grant.path, err))
+			}
+		}
+		if err := setAccess(grant.path, grant.sid, windows.REVOKE_ACCESS, grant.write); err != nil {
 			joined = errors.Join(joined, fmt.Errorf("revoke sandbox access from %s: %w", grant.path, err))
 		}
 	}
 	return joined
 }
 
-func setAccess(path string, sid *windows.SID, accessMode windows.ACCESS_MODE) error {
+func setAccess(path string, sid *windows.SID, accessMode windows.ACCESS_MODE, write bool) error {
 	aclMutationMu.Lock()
 	defer aclMutationMu.Unlock()
 
 	current, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
-		return err
+		return fmt.Errorf("read directory DACL: %w", err)
 	}
 	if current == nil {
 		return errors.New("filesystem object has no security descriptor")
 	}
+	permissions := windows.ACCESS_MASK(windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE)
+	if write {
+		permissions |= windows.ACCESS_MASK(windows.FILE_GENERIC_WRITE | 0x40) // FILE_DELETE_CHILD for workspace-local cleanup.
+	}
 	entry := windows.EXPLICIT_ACCESS{
-		AccessPermissions: windows.ACCESS_MASK(windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE),
+		AccessPermissions: permissions,
 		AccessMode:        accessMode,
 		Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 		Trustee: windows.TRUSTEE{
@@ -741,16 +955,19 @@ func setAccess(path string, sid *windows.SID, accessMode windows.ACCESS_MODE) er
 	}
 	updated, err := windows.BuildSecurityDescriptor(nil, nil, []windows.EXPLICIT_ACCESS{entry}, nil, current)
 	if err != nil {
-		return err
+		return fmt.Errorf("build updated directory DACL: %w", err)
 	}
 	dacl, _, err := updated.DACL()
 	if err != nil {
-		return err
+		return fmt.Errorf("read updated directory DACL: %w", err)
 	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		return fmt.Errorf("write directory DACL: %w", err)
+	}
+	return nil
 }
 
-func commandEnvironment(input []string, tempDir, goCache, appContainerFolder string) map[string]string {
+func commandEnvironment(input []string, tempDir, goCache, appContainerFolder string, networkAccess bool) (map[string]string, error) {
 	allowed := map[string]struct{}{
 		"COMSPEC": {}, "DOTNET_ROOT": {}, "GOMODCACHE": {}, "GOPATH": {}, "GOROOT": {},
 		"JAVA_HOME": {}, "LANG": {}, "LC_ALL": {}, "LOCALAPPDATA": {}, "NUMBER_OF_PROCESSORS": {}, "OS": {},
@@ -776,7 +993,16 @@ func commandEnvironment(input []string, tempDir, goCache, appContainerFolder str
 	values["TMPDIR"] = tempDir
 	values["GOCACHE"] = goCache
 	values["LOCALAPPDATA"] = appContainerFolder
-	return values
+	if networkAccess {
+		proxyValues, err := commandProxyEnvironment(input)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range proxyValues {
+			values[key] = value
+		}
+	}
+	return values, nil
 }
 
 func encodeEnvironment(environment map[string]string) ([]uint16, error) {
@@ -820,23 +1046,35 @@ func environmentReadPaths(environment map[string]string) []string {
 	return paths
 }
 
-func runtimeReadPaths(executable string, environment map[string]string) []string {
+func runtimeReadPaths(executable string) []string {
 	paths := []string{}
-	if executableDir, err := canonicalDirectory(filepath.Dir(executable)); err == nil && !isSensitiveRuntimePath(executableDir) && !isBroadRuntimePath(executableDir) && !isSystemRuntimePath(executableDir) {
-		paths = append(paths, executableDir)
-	}
-	for _, item := range filepath.SplitList(environment["PATH"]) {
-		item = strings.TrimSpace(strings.Trim(item, `"`))
-		if item == "" || !filepath.IsAbs(item) {
-			continue
-		}
-		resolved, err := canonicalDirectory(item)
+	appendRuntimeReadPath := func(path string) {
+		resolved, err := canonicalDirectory(path)
 		if err != nil || isSensitiveRuntimePath(resolved) || isBroadRuntimePath(resolved) || isSystemRuntimePath(resolved) {
-			continue
+			return
 		}
 		paths = append(paths, resolved)
 	}
+
+	executableDir, err := canonicalDirectory(filepath.Dir(executable))
+	if err == nil {
+		appendRuntimeReadPath(executableDir)
+		// Windows virtual environments keep Python in Scripts while the standard
+		// library and site-packages live under the environment root.
+		if strings.EqualFold(filepath.Base(executableDir), "Scripts") && isPythonExecutable(executable) {
+			appendRuntimeReadPath(filepath.Dir(executableDir))
+		}
+	}
 	return paths
+}
+
+func isPythonExecutable(path string) bool {
+	switch strings.ToLower(filepath.Base(path)) {
+	case "python.exe", "python3.exe", "pythonw.exe":
+		return true
+	default:
+		return false
+	}
 }
 
 func isBroadRuntimePath(path string) bool {
@@ -916,7 +1154,7 @@ func directoryCovered(target string, paths []accessPath) bool {
 	return false
 }
 
-func runAppContainerProcess(ctx context.Context, command *exec.Cmd, input []byte, environmentBlock []uint16, sid *windows.SID) (runErr, cleanupErr error) {
+func runAppContainerProcess(ctx context.Context, command *exec.Cmd, input []byte, environmentBlock []uint16, sid *windows.SID, networkAccess bool) (runErr, cleanupErr error) {
 	if !filepath.IsAbs(command.Path) {
 		resolved, err := exec.LookPath(command.Path)
 		if err != nil {
@@ -982,6 +1220,20 @@ func runAppContainerProcess(ctx context.Context, command *exec.Cmd, input []byte
 		return nil, fmt.Errorf("limit sandbox inherited handles: %w", err)
 	}
 	caps := securityCapabilities{AppContainerSID: sid}
+	var internetClientSID *windows.SID
+	var capabilityAttrs []windows.SIDAndAttributes
+	if networkAccess {
+		internetClientSID, err = windows.StringToSid("S-1-15-3-1") // SECURITY_CAPABILITY_INTERNET_CLIENT
+		if err != nil {
+			return nil, fmt.Errorf("resolve InternetClient AppContainer capability: %w", err)
+		}
+		// StringToSid returns a Go-owned copy (it frees the native SID internally).
+		// Do not pass it to FreeSid: that API only releases SIDs created by
+		// AllocateAndInitializeSid and would corrupt the Go heap here.
+		capabilityAttrs = []windows.SIDAndAttributes{{Sid: internetClientSID, Attributes: windows.SE_GROUP_ENABLED}}
+		caps.Capabilities = &capabilityAttrs[0]
+		caps.CapabilityCount = uint32(len(capabilityAttrs))
+	}
 	if err := attributes.Update(procThreadAttributeSecurityCapabilities, unsafe.Pointer(&caps), unsafe.Sizeof(caps)); err != nil {
 		return nil, fmt.Errorf("configure Windows AppContainer isolation: %w", err)
 	}
@@ -1015,8 +1267,16 @@ func runAppContainerProcess(ctx context.Context, command *exec.Cmd, input []byte
 	}
 	processInfo := windows.ProcessInformation{}
 	flags := uint32(windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW)
-	if err := windows.CreateProcess(executable16, commandLine, nil, nil, true, flags, &environmentBlock[0], workingDirectory16, &startup.StartupInfo, &processInfo); err != nil {
-		return nil, fmt.Errorf("start command in Windows AppContainer: %w", err)
+	createErr := windows.CreateProcess(executable16, commandLine, nil, nil, true, flags, &environmentBlock[0], workingDirectory16, &startup.StartupInfo, &processInfo)
+	// UpdateProcThreadAttribute stores pointers to these Go-owned values for
+	// CreateProcess to read. Keep both the handle list and security capability
+	// graph alive until the native call has finished consuming the attributes.
+	runtime.KeepAlive(inheritedHandles)
+	runtime.KeepAlive(caps)
+	runtime.KeepAlive(capabilityAttrs)
+	runtime.KeepAlive(internetClientSID)
+	if createErr != nil {
+		return nil, fmt.Errorf("start command in Windows AppContainer: %w", createErr)
 	}
 	defer func() {
 		if processInfo.Thread != 0 {
@@ -1123,17 +1383,53 @@ func runAppContainerProcess(ctx context.Context, command *exec.Cmd, input []byte
 }
 
 func newJobObject() (windows.Handle, error) {
+	return newJobObjectWithLimit(maxProcessesPerJob)
+}
+
+func newJobObjectWithLimit(maxProcesses uint32) (windows.Handle, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return 0, err
 	}
 	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-	info.BasicLimitInformation.ActiveProcessLimit = maxProcessesPerJob
+	info.BasicLimitInformation.ActiveProcessLimit = maxProcesses
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
 		return 0, errors.Join(err, windows.CloseHandle(job))
 	}
 	return job, nil
+}
+
+type nativeJobAccounting struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaults           uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
+}
+
+func terminateAndWaitJob(job windows.Handle, exitCode uint32) error {
+	var accounting nativeJobAccounting
+	if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); err != nil {
+		if killErr := windows.TerminateJobObject(job, exitCode); killErr != nil {
+			return errors.Join(fmt.Errorf("query Job Object processes: %w", err), fmt.Errorf("terminate Job Object: %w", killErr))
+		}
+	} else if accounting.ActiveProcesses > 0 {
+		if err := windows.TerminateJobObject(job, exitCode); err != nil {
+			return fmt.Errorf("terminate %d command processes: %w", accounting.ActiveProcesses, err)
+		}
+	}
+	wait, err := windows.WaitForSingleObject(job, 30_000)
+	if err != nil {
+		return fmt.Errorf("wait for command process tree to exit: %w", err)
+	}
+	if wait != windows.WAIT_OBJECT_0 {
+		return fmt.Errorf("command Job Object remained active after termination (wait=%d)", wait)
+	}
+	return nil
 }
 
 func waitProcess(ctx context.Context, process, job windows.Handle) error {

@@ -1,0 +1,17 @@
+{
+  "id": "/",
+  "name": "O Agent",
+  "short_name": "O",
+  "description": "O 的会话与任务工作台",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#faf9f6",
+  "theme_color": "#f4f3ee",
+  "icons": [
+    { "src": "/icons/o-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/o-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/o-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

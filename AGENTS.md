@@ -1,4 +1,4 @@
-# Axiom engineering rules
+# O engineering rules
 
 These instructions apply to the whole repository. More specific `AGENTS.md`
 files may add directory-local rules.
@@ -32,4 +32,3 @@ files may add directory-local rules.
   test for multi-step state changes.
 - Tool and API descriptions are contracts. Update them in the same change as
   behavior, especially around lossiness, permissions, limits, and completion.
-

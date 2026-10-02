@@ -36,6 +36,20 @@ let backendRestartPromise;
 let allowingQuit = false;
 let backendReady = false;
 
+function logDesktopEvent(event, details = {}) {
+  const logDir = path.join(app.getPath('userData'), 'logs');
+  try {
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.appendFileSync(path.join(logDir, 'desktop-main.log'), `${JSON.stringify({
+      time: new Date().toISOString(),
+      event,
+      ...details,
+    })}\n`);
+  } catch (error) {
+    console.error('Could not persist desktop lifecycle diagnostic.', error);
+  }
+}
+
 function packagedRepositoryRoot() {
   if (development) return repositoryRoot;
   const candidate = path.resolve(path.dirname(app.getPath('exe')), '..', '..', '..');
@@ -161,16 +175,41 @@ async function startBackend(frontendOrigin) {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  const child = backendProcess;
+  const startedAt = Date.now();
+  logDesktopEvent('backend.spawned', {
+    pid: child.pid,
+    executable,
+    port,
+    development,
+  });
+  child.once('error', (error) => {
+    logDesktopEvent('backend.spawn_error', {
+      pid: child.pid,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  });
   pipeLogs(backendProcess, 'o-host');
-  backendProcess.once('exit', (code, signal) => {
-    if (!backendReady || allowingQuit) return;
+  child.once('exit', (code, signal) => {
+    const wasReady = backendReady;
+    logDesktopEvent('backend.exit', {
+      pid: child.pid,
+      code,
+      signal,
+      uptimeMs: Date.now() - startedAt,
+      wasReady,
+      allowingQuit,
+    });
+    if (!wasReady || allowingQuit) return;
     backendReady = false;
     console.error(`Go Host exited unexpectedly (${code ?? signal ?? 'unknown'}); scheduling recovery.`);
+    logDesktopEvent('backend.recovery_scheduled', { pid: child.pid, code, signal });
     if (appTray) appTray.setToolTip('O — Agent Host is restarting');
     void restartBackend();
   });
   await waitFor(`${runtimeOrigin}/api/v1/health`, 20_000, backendProcess);
   backendReady = true;
+  logDesktopEvent('backend.ready', { pid: backendProcess.pid, port, uptimeMs: Date.now() - startedAt });
 }
 
 function installLocalProtocol() {
@@ -195,13 +234,17 @@ async function createWindow(url) {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
-    minWidth: 900,
-    minHeight: 640,
+    minWidth: 640,
+    minHeight: 480,
     show: false,
     backgroundColor: '#ffffff',
     title: 'O',
     icon: path.join(__dirname, 'assets', 'icon.ico'),
     autoHideMenuBar: true,
+    ...(process.platform === 'win32' ? {
+      titleBarStyle: 'hidden',
+      titleBarOverlay: { color: '#faf9f6', symbolColor: '#6f6e69', height: 40 },
+    } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       additionalArguments: [`--o-api-origin=${runtimeOrigin}`],
@@ -251,6 +294,11 @@ async function stopChildren() {
 async function stopBackendProcess() {
   const child = backendProcess;
   if (child && child.exitCode === null && child.signalCode === null) {
+    logDesktopEvent('backend.stdin_end_requested', {
+      pid: child.pid,
+      exitCode: child.exitCode,
+      signalCode: child.signalCode,
+    });
     child.stdin?.end();
     await Promise.race([
       new Promise((resolve) => child.once('exit', resolve)),
@@ -274,6 +322,11 @@ function restartBackend() {
       } catch (error) {
         backendReady = false;
         console.error('Go Host restart failed; will retry with backoff.', error);
+        logDesktopEvent('backend.restart_failed', {
+          pid: backendProcess?.pid,
+          message: error instanceof Error ? error.message : String(error),
+          retryDelayMs: delay,
+        });
         await stopBackendProcess();
         delay = Math.min(delay * 2, 30_000);
       }

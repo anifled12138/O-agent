@@ -47,23 +47,66 @@ type UnifiedPlugin struct {
 }
 
 type Manager struct {
-	mu             sync.RWMutex
-	workspaceRoot  string
-	skillsRegistry *skills.Registry
-	mcpManager     *mcp.Manager
-	coreTools      map[string]coretools.Tool
-	coreEnabled    map[string]bool
-	corePluginName map[string]string
-	corePluginInfo map[string]func() map[string]string
-	contextPlugin  *ContextManagerPlugin
-	providerLister func(ctx context.Context) ([]domain.Provider, error)
-	disabledModels map[string]bool
-	statePath      string
+	mu                sync.RWMutex
+	workspaceRoot     string
+	skillsRegistry    *skills.Registry
+	mcpManager        *mcp.Manager
+	coreTools         map[string]coretools.Tool
+	coreEnabled       map[string]bool
+	corePluginName    map[string]string
+	corePluginInfo    map[string]func() map[string]string
+	contextCompactor  *ContextCompactorPlugin
+	providerLister    func(ctx context.Context) ([]domain.Provider, error)
+	disabledModels    map[string]bool
+	contextCompaction CompactionSettings
+	statePath         string
+}
+
+// CompactionSettings is persisted with the core plugin settings. The host
+// coordinator enforces hard limits and passes the selected policy to the plugin.
+type CompactionSettings struct {
+	Mode                               string `json:"mode"`
+	TriggerPercent                     int    `json:"triggerPercent"`
+	MinimumGrowthBeforeRecompactTokens int    `json:"minimumGrowthBeforeRecompactTokens"`
+	RecentContextTokens                int    `json:"recentContextTokens"`
+	CompactionCallBudget               int    `json:"compactionCallBudget"`
+	Version                            int    `json:"version"`
 }
 
 type persistedState struct {
-	CoreEnabled    map[string]bool `json:"coreEnabled"`
-	DisabledModels map[string]bool `json:"disabledModels,omitempty"`
+	Version           int                `json:"version"`
+	CoreEnabled       map[string]bool    `json:"coreEnabled"`
+	DisabledModels    map[string]bool    `json:"disabledModels,omitempty"`
+	ContextCompaction CompactionSettings `json:"contextCompaction"`
+}
+
+const persistedStateVersion = 3
+
+const hardCompactionTriggerPercent = 75
+
+func defaultCompactionSettings() CompactionSettings {
+	return CompactionSettings{Mode: "auto", TriggerPercent: hardCompactionTriggerPercent, MinimumGrowthBeforeRecompactTokens: 8000, RecentContextTokens: 20000, CompactionCallBudget: 12, Version: 2}
+}
+
+func validateCompactionSettings(settings CompactionSettings) error {
+	switch settings.Mode {
+	case "auto", "semantic", "provider_native", "extractive":
+	default:
+		return fmt.Errorf("unsupported compaction mode %q", settings.Mode)
+	}
+	if settings.TriggerPercent < 10 || settings.TriggerPercent > hardCompactionTriggerPercent {
+		return fmt.Errorf("compaction trigger must be between 10 and %d percent", hardCompactionTriggerPercent)
+	}
+	if settings.MinimumGrowthBeforeRecompactTokens < 1000 || settings.MinimumGrowthBeforeRecompactTokens > 200000 {
+		return fmt.Errorf("minimum growth must be between 1000 and 200000 tokens")
+	}
+	if settings.RecentContextTokens < 1000 || settings.RecentContextTokens > 100000 {
+		return fmt.Errorf("recent context retention must be between 1000 and 100000 tokens")
+	}
+	if settings.CompactionCallBudget < 1 || settings.CompactionCallBudget > 32 {
+		return fmt.Errorf("compaction model-call budget must be between 1 and 32 calls")
+	}
+	return nil
 }
 
 type CorePluginRegistration struct {
@@ -75,7 +118,10 @@ type CorePluginRegistration struct {
 }
 
 func NewManager(workspaceRoot string) (*Manager, error) {
-	manager := newManager(workspaceRoot)
+	manager, err := newManager(workspaceRoot)
+	if err != nil {
+		return nil, err
+	}
 	if err := manager.loadState(); err != nil {
 		return nil, err
 	}
@@ -85,7 +131,10 @@ func NewManager(workspaceRoot string) (*Manager, error) {
 // NewManagerWithCorePlugins builds the complete core registry before loading
 // persisted settings, so settings are applied to the registry as one unit.
 func NewManagerWithCorePlugins(workspaceRoot string, registrations ...CorePluginRegistration) (*Manager, error) {
-	manager := newManager(workspaceRoot)
+	manager, err := newManager(workspaceRoot)
+	if err != nil {
+		return nil, err
+	}
 	for _, registration := range registrations {
 		if err := manager.registerCorePlugin(registration); err != nil {
 			return nil, err
@@ -97,10 +146,14 @@ func NewManagerWithCorePlugins(workspaceRoot string, registrations ...CorePlugin
 	return manager, nil
 }
 
-func newManager(workspaceRoot string) *Manager {
-	skillsReg := skills.NewRegistry(workspaceRoot)
+func newManager(workspaceRoot string) (*Manager, error) {
+	skillsReg, err := skills.NewRegistry(workspaceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("load workspace skills: %w", err)
+	}
 	mcpMgr := mcp.NewManagerWithWorkspace(workspaceRoot)
 	contextPlugin := NewDefaultContextManagerPlugin()
+	contextCompactor := NewContextCompactorPluginWithPolicy(contextPlugin)
 
 	tools := coretools.GetCoreTools(workspaceRoot)
 	coreMap := make(map[string]coretools.Tool, len(tools))
@@ -108,7 +161,7 @@ func newManager(workspaceRoot string) *Manager {
 	for _, t := range tools {
 		name := t.Definition.Function.Name
 		coreMap[name] = t
-		coreEnabled[name] = (name != "exec_command" && name != "exec_script") || os.Getenv("O_ENABLE_SHELL_TOOL") == "1"
+		coreEnabled[name] = true
 	}
 	coreEnabled["model_selector"] = true
 	coreEnabled["context_compactor"] = true
@@ -118,18 +171,19 @@ func newManager(workspaceRoot string) *Manager {
 	coreEnabled["conversation_fork"] = true
 
 	manager := &Manager{
-		workspaceRoot:  workspaceRoot,
-		skillsRegistry: skillsReg,
-		mcpManager:     mcpMgr,
-		coreTools:      coreMap,
-		coreEnabled:    coreEnabled,
-		corePluginName: make(map[string]string),
-		corePluginInfo: make(map[string]func() map[string]string),
-		contextPlugin:  contextPlugin,
-		disabledModels: make(map[string]bool),
-		statePath:      filepath.Join(workspaceRoot, ".axiom", "plugin-state.json"),
+		workspaceRoot:     workspaceRoot,
+		skillsRegistry:    skillsReg,
+		mcpManager:        mcpMgr,
+		coreTools:         coreMap,
+		coreEnabled:       coreEnabled,
+		corePluginName:    make(map[string]string),
+		corePluginInfo:    make(map[string]func() map[string]string),
+		contextCompactor:  contextCompactor,
+		disabledModels:    make(map[string]bool),
+		contextCompaction: defaultCompactionSettings(),
+		statePath:         filepath.Join(workspaceRoot, ".axiom", "plugin-state.json"),
 	}
-	return manager
+	return manager, nil
 }
 
 func (m *Manager) registerCorePlugin(registration CorePluginRegistration) error {
@@ -156,8 +210,8 @@ func (m *Manager) MCPManager() *mcp.Manager {
 	return m.mcpManager
 }
 
-func (m *Manager) ContextPlugin() *ContextManagerPlugin {
-	return m.contextPlugin
+func (m *Manager) ContextCompactor() *ContextCompactorPlugin {
+	return m.contextCompactor
 }
 
 func (m *Manager) SetProviderLister(lister func(ctx context.Context) ([]domain.Provider, error)) {
@@ -170,6 +224,28 @@ func (m *Manager) IsContextCompactorEnabled() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.coreEnabled["context_compactor"]
+}
+
+func (m *Manager) ContextCompactionSettings() CompactionSettings {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.contextCompaction
+}
+
+func (m *Manager) SetContextCompactionSettings(settings CompactionSettings) (CompactionSettings, error) {
+	settings.Version = 2
+	if err := validateCompactionSettings(settings); err != nil {
+		return CompactionSettings{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	previous := m.contextCompaction
+	m.contextCompaction = settings
+	if err := m.persistStateLocked(); err != nil {
+		m.contextCompaction = previous
+		return CompactionSettings{}, fmt.Errorf("persist context compaction settings: %w", err)
+	}
+	return m.contextCompaction, nil
 }
 
 func (m *Manager) IsProjectWorkspaceEnabled() bool {
@@ -279,9 +355,16 @@ func (m *Manager) Catalog() []UnifiedPlugin {
 		ID:           "core:context_compactor",
 		Name:         "智能上下文压缩提炼器 (Context Compactor)",
 		Type:         TypeCore,
-		Description:  "按模型或用户配置的上下文窗口管理预算；默认将约 55% 留给持久化对话，并为系统指令、工具、推理和输出预留余量。压缩是有损的，会优先保留当前目标和近期完整步骤。",
+		Description:  "在模型请求前统一管理跨轮历史与轮内工具上下文；auto 模式在 75% 触发上限内优先使用 OpenAI Responses 原生 compact，并完整往返 opaque item；语义模式用持久来源和原文摘录校验摘要，extractive 模式不调用摘要模型。近期完整工具交互会跨轮恢复。摘要作为低信任历史资料注入；原生状态不兼容时从原始来源重建，来源不可读则明确终止。关闭策略后仍保留 host 硬窗口保护。",
 		Status:       compactorStatus,
-		Capabilities: []string{"context_compaction", "adaptive_budget", "memory_distillation"},
+		Capabilities: []string{"context_compaction", "adaptive_budget", "memory_distillation", "provider_native_compaction"},
+		Metadata: map[string]string{
+			"mode":                               m.contextCompaction.Mode,
+			"triggerPercent":                     fmt.Sprintf("%d", m.contextCompaction.TriggerPercent),
+			"minimumGrowthBeforeRecompactTokens": fmt.Sprintf("%d", m.contextCompaction.MinimumGrowthBeforeRecompactTokens),
+			"recentContextTokens":                fmt.Sprintf("%d", m.contextCompaction.RecentContextTokens),
+			"compactionCallBudget":               fmt.Sprintf("%d", m.contextCompaction.CompactionCallBudget),
+		},
 	})
 
 	runInspectorStatus := StatusEnabled
@@ -426,9 +509,21 @@ func (m *Manager) loadState() error {
 	if err := json.Unmarshal(raw, &state); err != nil {
 		return fmt.Errorf("decode plugin state: %w", err)
 	}
+	needsShellToolMigration := state.Version < 1
+	needsCompactionSettingsMigration := state.Version < 3
 	for name, enabled := range state.CoreEnabled {
 		if _, known := m.coreEnabled[name]; known {
+			if needsShellToolMigration && (name == "exec_command" || name == "exec_script") {
+				continue
+			}
 			m.coreEnabled[name] = enabled
+		}
+	}
+	if needsShellToolMigration {
+		for _, name := range []string{"exec_command", "exec_script"} {
+			if _, known := m.coreEnabled[name]; known {
+				m.coreEnabled[name] = true
+			}
 		}
 	}
 	for providerID, disabled := range state.DisabledModels {
@@ -436,13 +531,51 @@ func (m *Manager) loadState() error {
 			m.disabledModels[providerID] = true
 		}
 	}
+	if !needsCompactionSettingsMigration {
+		settings := state.ContextCompaction
+		settings.Version = 2
+		if err := validateCompactionSettings(settings); err != nil {
+			return fmt.Errorf("decode persisted context compaction settings: %w", err)
+		}
+		m.contextCompaction = settings
+	} else if state.Version >= 2 {
+		settings := state.ContextCompaction
+		defaults := defaultCompactionSettings()
+		if settings.Mode == "" {
+			settings.Mode = defaults.Mode
+		}
+		if settings.TriggerPercent == 0 {
+			settings.TriggerPercent = defaults.TriggerPercent
+		}
+		if settings.MinimumGrowthBeforeRecompactTokens == 0 {
+			settings.MinimumGrowthBeforeRecompactTokens = defaults.MinimumGrowthBeforeRecompactTokens
+		}
+		if settings.RecentContextTokens == 0 {
+			settings.RecentContextTokens = defaults.RecentContextTokens
+		}
+		if settings.CompactionCallBudget == 0 {
+			settings.CompactionCallBudget = defaults.CompactionCallBudget
+		}
+		settings.Version = defaults.Version
+		if err := validateCompactionSettings(settings); err != nil {
+			return fmt.Errorf("migrate persisted context compaction settings: %w", err)
+		}
+		m.contextCompaction = settings
+	}
+	if needsShellToolMigration || needsCompactionSettingsMigration {
+		if err := m.persistStateLocked(); err != nil {
+			return fmt.Errorf("persist plugin state migration: %w", err)
+		}
+	}
 	return nil
 }
 
 func (m *Manager) persistStateLocked() error {
 	state := persistedState{
-		CoreEnabled:    make(map[string]bool, len(m.coreEnabled)),
-		DisabledModels: make(map[string]bool, len(m.disabledModels)),
+		Version:           persistedStateVersion,
+		CoreEnabled:       make(map[string]bool, len(m.coreEnabled)),
+		DisabledModels:    make(map[string]bool, len(m.disabledModels)),
+		ContextCompaction: m.contextCompaction,
 	}
 	for name, enabled := range m.coreEnabled {
 		state.CoreEnabled[name] = enabled

@@ -12,7 +12,8 @@
     "build:desktop-ui": "vite build --config vite.desktop.config.ts",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-desktop --ignore-pattern .next",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:web": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@types/dompurify": "^3.2.0",

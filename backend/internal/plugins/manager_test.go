@@ -42,10 +42,10 @@ Instructions for mock skill`
 		t.Fatal("builtin plugin toggle must not report success for a no-op")
 	}
 
-	// Shell execution is opt-in; the other five core tools are active by default.
+	// Core tools, including shell and script execution, are active by default.
 	tools := mgr.ActiveTools()
-	if len(tools) != 5 {
-		t.Errorf("expected 5 active tools, got %d", len(tools))
+	if len(tools) != 7 {
+		t.Errorf("expected 7 active tools, got %d", len(tools))
 	}
 
 	// Disable a core tool
@@ -53,8 +53,8 @@ Instructions for mock skill`
 		t.Fatalf("failed to disable fs_read: %v", err)
 	}
 	tools = mgr.ActiveTools()
-	if len(tools) != 4 {
-		t.Errorf("expected 4 active tools after disabling fs_read, got %d", len(tools))
+	if len(tools) != 6 {
+		t.Errorf("expected 6 active tools after disabling fs_read, got %d", len(tools))
 	}
 
 	// Re-enable
@@ -62,8 +62,8 @@ Instructions for mock skill`
 		t.Fatalf("failed to enable fs_read: %v", err)
 	}
 	tools = mgr.ActiveTools()
-	if len(tools) != 5 {
-		t.Errorf("expected 5 active tools after re-enabling fs_read, got %d", len(tools))
+	if len(tools) != 7 {
+		t.Errorf("expected 7 active tools after re-enabling fs_read, got %d", len(tools))
 	}
 }
 

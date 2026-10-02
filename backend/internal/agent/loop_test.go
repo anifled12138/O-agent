@@ -12,6 +12,45 @@ import (
 	"axiom.local/agent/internal/provider"
 )
 
+func TestDecodeSafeContinuationCheckpointRequiresReplayBoundary(t *testing.T) {
+	base := loopCheckpoint{
+		Version: 1, ProviderID: "provider_1", GenerationID: "generation_1", RuntimeFingerprint: "fingerprint",
+		ResumeAllowed: true, Stage: "loop", Messages: []provider.ChatMessage{{Role: "system", Content: "system"}},
+	}
+	encoded, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeSafeContinuationCheckpoint(encoded); err != nil {
+		t.Fatalf("safe checkpoint rejected: %v", err)
+	}
+	unsafe := []struct {
+		name   string
+		mutate func(*loopCheckpoint)
+	}{
+		{name: "model call in flight", mutate: func(value *loopCheckpoint) { value.InFlightModelCall = true }},
+		{name: "pending call", mutate: func(value *loopCheckpoint) { value.PendingCalls = []provider.ToolCall{{ID: "call_1"}} }},
+		{name: "pending tool step", mutate: func(value *loopCheckpoint) { value.PendingStep = 1 }},
+		{name: "nonresumable runtime", mutate: func(value *loopCheckpoint) { value.ResumeAllowed = false }},
+		{name: "unsupported stage", mutate: func(value *loopCheckpoint) { value.Stage = "dispatch" }},
+		{name: "missing transcript", mutate: func(value *loopCheckpoint) { value.Messages = nil }},
+	}
+	for _, test := range unsafe {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := base
+			candidate.Messages = append([]provider.ChatMessage(nil), base.Messages...)
+			test.mutate(&candidate)
+			raw, err := json.Marshal(candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := decodeSafeContinuationCheckpoint(raw); !errors.Is(err, errContinuationCheckpointUnsafe) {
+				t.Fatalf("unsafe checkpoint error = %v", err)
+			}
+		})
+	}
+}
+
 type scriptedModel struct {
 	results []provider.Completion
 	calls   [][]provider.ChatMessage
@@ -39,10 +78,14 @@ func (s *fakeScope) execute(context.Context, string, json.RawMessage) json.RawMe
 
 type compactingScope struct{ fakeScope }
 
-func (s *compactingScope) prepareTurnMessages(messages []provider.ChatMessage, step int) ([]provider.ChatMessage, turnCompaction) {
+type budgetScope struct{ fakeScope }
+
+func (s *budgetScope) contextWindowTokens() int { return 128 }
+
+func (s *compactingScope) prepareTurnMessages(_ context.Context, _ modelRuntime, _ loopRequest, messages []provider.ChatMessage, _ []provider.ToolDefinition, step int, metrics domain.RunMetrics) ([]provider.ChatMessage, turnCompaction, domain.RunMetrics, error) {
 	original := messageChars(messages)
 	if step != 1 {
-		return messages, turnCompaction{OriginalChars: original, CompactedChars: original}
+		return messages, turnCompaction{OriginalChars: original, CompactedChars: original}, metrics, nil
 	}
 	compacted := append([]provider.ChatMessage(nil), messages...)
 	for i := range compacted {
@@ -50,7 +93,7 @@ func (s *compactingScope) prepareTurnMessages(messages []provider.ChatMessage, s
 			compacted[i].Content = `{"ok":true,"compacted":true}`
 		}
 	}
-	return compacted, turnCompaction{Applied: true, OriginalChars: original, CompactedChars: messageChars(compacted)}
+	return compacted, turnCompaction{Applied: true, OriginalChars: original, CompactedChars: messageChars(compacted)}, metrics, nil
 }
 
 func testGeneration(strategy string, maxSteps int) domain.AgentGeneration {
@@ -72,6 +115,42 @@ func TestReactLoopExecutesToolAndAccumulatesMetrics(t *testing.T) {
 	}
 	if model.calls[1][len(model.calls[1])-1].Role != "tool" {
 		t.Fatalf("tool observation was not returned to model: %#v", model.calls[1])
+	}
+}
+
+func TestReactLoopPausesForHandoffAfterCompletedToolBoundary(t *testing.T) {
+	model := &scriptedModel{results: []provider.Completion{
+		{ToolCalls: []provider.ToolCall{{ID: "call_safe", Type: "function", Function: provider.ToolFunction{Name: "read", Arguments: `{}`}}}},
+		{Content: "must not be requested"},
+	}}
+	scope := &fakeScope{}
+	events := []string{}
+	result, err := executeLoop(context.Background(), model, loopRequest{
+		UserID: "u", ProviderID: "p", Generation: testGeneration(evolution.StrategyReact, 5),
+		Messages: []provider.ChatMessage{{Role: "user", Content: "inspect"}}, Scope: scope, RuntimeFingerprint: "runtime-fingerprint",
+		ShouldPause: func() bool { return scope.executions > 0 },
+		Emit:        func(kind string, _ any) error { events = append(events, kind); return nil },
+	})
+	if err != nil || !result.HandoffPaused || result.Metrics.ToolCalls != 1 || scope.executions != 1 || len(model.calls) != 1 || len(result.Continuation) == 0 {
+		t.Fatalf("handoff did not stop at the completed tool boundary: result=%#v executions=%d modelCalls=%d err=%v", result, scope.executions, len(model.calls), err)
+	}
+	checkpoint, err := decodeSafeContinuationCheckpoint(result.Continuation)
+	if err != nil || checkpoint.NextStep != 1 || checkpoint.InFlightModelCall || len(checkpoint.PendingCalls) != 0 || checkpoint.PendingStep != 0 || !containsString(events, "turn.handoff_paused") {
+		t.Fatalf("handoff checkpoint/event was not replay-safe and durable: checkpoint=%#v events=%v err=%v", checkpoint, events, err)
+	}
+}
+
+func TestContextPlanRejectsOversizedRequestBeforeModelCall(t *testing.T) {
+	model := &scriptedModel{results: []provider.Completion{{Content: "should not be used"}}}
+	scope := &budgetScope{}
+	rejectedPlanRecorded := false
+	_, plan, err := completeWithContextPlan(context.Background(), model, scope, loopRequest{UserID: "u", ProviderID: "p"}, "planner", []provider.ChatMessage{{Role: "user", Content: strings.Repeat("too large ", 80)}}, scope.definitions(), func(kind string, _ any) error {
+		rejectedPlanRecorded = kind == "context.plan.rejected"
+		return nil
+	})
+	var budgetErr *contextBudgetError
+	if !errors.As(err, &budgetErr) || !rejectedPlanRecorded || !plan.Rejected || plan.InputBudget != 96 || plan.ToolCount != 1 || len(model.calls) != 0 {
+		t.Fatalf("oversized request was not rejected and recorded at the common preflight: plan=%+v calls=%d err=%v", plan, len(model.calls), err)
 	}
 }
 
@@ -113,8 +192,27 @@ func TestPlanReactAddsAdvisoryBriefBeforeExecution(t *testing.T) {
 		t.Fatalf("unexpected plan-react result: %#v, %v", result, err)
 	}
 	last := model.calls[1][len(model.calls[1])-1]
-	if last.Role != "system" || !strings.Contains(last.Content, "inspect then answer") {
+	if last.Role != "assistant" || !strings.Contains(last.Content, "inspect then answer") {
 		t.Fatalf("planner brief missing from executor context: %#v", model.calls[1])
+	}
+}
+
+func TestContinuationIntentClassifierLetsModelInterpretNaturalLanguage(t *testing.T) {
+	model := &scriptedModel{results: []provider.Completion{{Content: `{"decision":"resume"}`, Usage: provider.Usage{TotalTokens: 9}}}}
+	input := continuationIntentInput{
+		PreviousRequest: "Implement and test conversation recovery.",
+		PreviousReply:   "The run stopped at the step limit before tests finished.",
+		StopReason:      "step_limit",
+		CurrentMessage:  "go on",
+	}
+	decision, usage, plan, err := classifyContinuationIntent(context.Background(), model, loopRequest{
+		UserID: "u", ProviderID: "p", Generation: testGeneration(evolution.StrategyReact, 3),
+	}, 4096, input)
+	if err != nil || decision != "resume" || usage.TotalTokens != 9 || plan.Stage != "continuation_intent" || plan.PlanHash == "" {
+		t.Fatalf("classifier result = decision %q, usage %#v, plan %#v, err %v", decision, usage, plan, err)
+	}
+	if len(model.calls) != 1 || !strings.Contains(model.calls[0][1].Content, `"currentMessage":"go on"`) {
+		t.Fatalf("classifier did not receive the natural-language message: %#v", model.calls)
 	}
 }
 
@@ -122,7 +220,7 @@ func TestLoopStopsAtGenerationStepBudget(t *testing.T) {
 	toolCall := provider.Completion{ToolCalls: []provider.ToolCall{{ID: "call", Type: "function", Function: provider.ToolFunction{Name: "read", Arguments: `{}`}}}}
 	model := &scriptedModel{results: []provider.Completion{toolCall, toolCall, {Content: "partial summary", Usage: provider.Usage{TotalTokens: 7}}}}
 	result, err := executeLoop(context.Background(), model, loopRequest{UserID: "u", ProviderID: "p", Generation: testGeneration(evolution.StrategyReact, 2), Scope: &fakeScope{}})
-	if err != nil || !result.Metrics.ReachedStepLimit || result.Metrics.ModelCalls != 3 || result.Metrics.TotalTokens != 7 {
+	if err != nil || !result.Metrics.ReachedStepLimit || result.Metrics.ModelCalls != 2 || len(model.calls) != 2 || len(result.Continuation) == 0 {
 		t.Fatalf("step budget was not enforced: %#v, %v", result, err)
 	}
 }

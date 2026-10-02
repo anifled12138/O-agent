@@ -6,6 +6,7 @@ import {
   UnifiedPlugin,
   McpServerConfig,
   WebSearchPluginSettings,
+  ContextCompactionSettings,
   getUnifiedPlugins,
   toggleUnifiedPlugin,
   addMcpServerConfig,
@@ -14,6 +15,8 @@ import {
   saveWebSearchPluginSettings,
   clearWebSearchPluginSettings,
   testWebSearchPlugin,
+  getContextCompactionSettings,
+  saveContextCompactionSettings,
 } from './api';
 import { useDialogA11y } from './useDialogA11y';
 
@@ -50,6 +53,11 @@ export default function UnifiedPluginCenter({
   const [webSearchError, setWebSearchError] = useState('');
   const [webSearchMessage, setWebSearchMessage] = useState('');
   const [confirmWebSearchClear, setConfirmWebSearchClear] = useState(false);
+  const [showContextCompactorSettings, setShowContextCompactorSettings] = useState(false);
+  const [contextCompactorDraft, setContextCompactorDraft] = useState<ContextCompactionSettings | null>(null);
+  const [contextCompactorBusy, setContextCompactorBusy] = useState(false);
+  const [contextCompactorError, setContextCompactorError] = useState('');
+  const [contextCompactorMessage, setContextCompactorMessage] = useState('');
 
   // Form states for adding MCP
   const [mcpId, setMcpId] = useState('');
@@ -68,6 +76,8 @@ export default function UnifiedPluginCenter({
     setWebSearchApiKey('');
     setConfirmWebSearchClear(false);
   }, []);
+
+  const closeContextCompactorSettings = useCallback(() => setShowContextCompactorSettings(false), []);
 
   const loadPlugins = useCallback(async () => {
     try {
@@ -98,17 +108,18 @@ export default function UnifiedPluginCenter({
   // Handle Escape key specifically for the sub-modal to avoid closing parent
   useEffect(() => {
     function handleSubModalKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape' && (showAddMcp || showWebSearchSettings)) {
+      if (e.key === 'Escape' && (showAddMcp || showWebSearchSettings || showContextCompactorSettings)) {
         e.stopPropagation();
         if (showAddMcp) closeAddMcp();
-        else closeWebSearchSettings();
+        else if (showWebSearchSettings) closeWebSearchSettings();
+        else closeContextCompactorSettings();
       }
     }
-    if (showAddMcp || showWebSearchSettings) {
+    if (showAddMcp || showWebSearchSettings || showContextCompactorSettings) {
       window.addEventListener('keydown', handleSubModalKeyDown, true);
       return () => window.removeEventListener('keydown', handleSubModalKeyDown, true);
     }
-  }, [showAddMcp, showWebSearchSettings, closeAddMcp, closeWebSearchSettings]);
+  }, [showAddMcp, showWebSearchSettings, showContextCompactorSettings, closeAddMcp, closeWebSearchSettings, closeContextCompactorSettings]);
 
   async function handleToggle(p: UnifiedPlugin) {
     const nextState = p.status !== 'enabled';
@@ -297,6 +308,48 @@ export default function UnifiedPluginCenter({
     }
   }
 
+  async function openContextCompactorSettings() {
+    setContextCompactorError('');
+    setContextCompactorMessage('');
+    setContextCompactorBusy(true);
+    try {
+      const settings = await getContextCompactionSettings();
+      setContextCompactorDraft(settings);
+      setShowContextCompactorSettings(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '读取上下文压缩设置失败');
+    } finally {
+      setContextCompactorBusy(false);
+    }
+  }
+
+  async function handleSaveContextCompactorSettings(event: FormEvent) {
+    event.preventDefault();
+    if (!contextCompactorDraft) return;
+    setContextCompactorBusy(true);
+    setContextCompactorError('');
+    setContextCompactorMessage('');
+    try {
+      const saved = await saveContextCompactionSettings(contextCompactorDraft);
+      const readBack = await getContextCompactionSettings();
+      if (saved.mode !== readBack.mode || saved.triggerPercent !== readBack.triggerPercent || saved.minimumGrowthBeforeRecompactTokens !== readBack.minimumGrowthBeforeRecompactTokens || saved.recentContextTokens !== readBack.recentContextTokens || saved.compactionCallBudget !== readBack.compactionCallBudget) {
+        throw new Error('后端保存结果与运行时读回设置不一致');
+      }
+      setContextCompactorDraft(readBack);
+      const catalog = await loadPlugins();
+      const plugin = catalog.find((item) => item.id === 'core:context_compactor');
+      if (plugin?.metadata?.mode !== readBack.mode || plugin.metadata?.triggerPercent !== String(readBack.triggerPercent) || plugin.metadata?.minimumGrowthBeforeRecompactTokens !== String(readBack.minimumGrowthBeforeRecompactTokens) || plugin.metadata?.recentContextTokens !== String(readBack.recentContextTokens) || plugin.metadata?.compactionCallBudget !== String(readBack.compactionCallBudget)) {
+        throw new Error('压缩设置已写入，但插件运行目录未读回一致值');
+      }
+      setContextCompactorMessage('设置已保存，并由当前运行时读回确认。');
+      onPluginsChanged?.();
+    } catch (err) {
+      setContextCompactorError(err instanceof Error ? err.message : '保存上下文压缩设置失败');
+    } finally {
+      setContextCompactorBusy(false);
+    }
+  }
+
   const filteredPlugins = plugins.filter((p) => {
     if (filterType === 'all') return true;
     return p.type === filterType;
@@ -432,6 +485,7 @@ export default function UnifiedPluginCenter({
               {filteredPlugins.map((p) => {
                 const isEnabled = p.status === 'enabled';
                 const isWebSearch = p.id === 'core:web_search';
+                const isContextCompactor = p.id === 'core:context_compactor';
                 const webSearchConfigured = p.metadata?.configured === 'true';
                 const statusLabel = isWebSearch && !webSearchConfigured ? '待配置' : p.status === 'error' ? '运行异常' : isEnabled ? '已启用' : '已停用';
                 const typeLabel =
@@ -478,6 +532,17 @@ export default function UnifiedPluginCenter({
                         <button type="button" className="upc-btn-secondary" onClick={() => void openWebSearchSettings()} disabled={webSearchBusy === 'load'}>
                           <KeyRound size={13} aria-hidden="true" />
                           {webSearchConfigured ? '设置' : '配置'}
+                        </button>
+                      </div>
+                    )}
+
+                    {isContextCompactor && (
+                      <div className="upc-card-footer">
+                        <span style={{ fontSize: 11, color: '#9ca3af' }}>
+                          {p.metadata?.mode || 'auto'} · {p.metadata?.triggerPercent || '75'}% 上限
+                        </span>
+                        <button type="button" className="upc-btn-secondary" onClick={() => void openContextCompactorSettings()} disabled={contextCompactorBusy}>
+                          {contextCompactorBusy ? '读取中…' : '压缩策略'}
                         </button>
                       </div>
                     )}
@@ -540,6 +605,59 @@ export default function UnifiedPluginCenter({
             </div>
           )}
         </div>
+
+        {showContextCompactorSettings && contextCompactorDraft && (
+          <div className="upc-backdrop" style={{ zIndex: 110 }} onMouseDown={(event) => { if (event.target === event.currentTarget) closeContextCompactorSettings(); }}>
+            <section className="upc-modal" role="dialog" aria-modal="true" aria-labelledby="context-compactor-title" tabIndex={-1} style={{ width: 'min(520px, 95vw)', height: 'auto', maxHeight: '88vh', padding: 24, gap: 16 }}>
+              <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                  <div className="eyebrow">CONTEXT COMPACTION</div>
+                  <h3 id="context-compactor-title" className="upc-title" style={{ margin: 0 }}>上下文压缩策略</h3>
+                </div>
+                <button type="button" onClick={closeContextCompactorSettings} className="upc-btn-close" aria-label="关闭压缩策略设置"><X size={18} aria-hidden="true" /></button>
+              </header>
+              <p className="upc-subtitle" style={{ margin: 0 }}>
+                压缩阈值最高为 75%。system/developer 规则会从当前配置重建；语义摘要作为低信任历史资料，原始来源继续保留。
+              </p>
+              <form onSubmit={handleSaveContextCompactorSettings} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 }}>
+                  策略模式
+                  <select className="upc-input" value={contextCompactorDraft.mode} onChange={(event) => setContextCompactorDraft({ ...contextCompactorDraft, mode: event.target.value as ContextCompactionSettings['mode'] })}>
+                    <option value="auto">自动：Responses 原生优先，安全时使用语义摘要</option>
+                    <option value="semantic">语义摘要：引用来源并校验原文证据</option>
+                    <option value="provider_native">仅 provider 原生：不兼容时停止</option>
+                    <option value="extractive">确定性提取：不调用摘要模型</option>
+                  </select>
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 }}>
+                  自动触发上限：{contextCompactorDraft.triggerPercent}%
+                  <input type="range" min={10} max={75} step={1} value={contextCompactorDraft.triggerPercent} onChange={(event) => setContextCompactorDraft({ ...contextCompactorDraft, triggerPercent: Number(event.target.value) })} />
+                  <span style={{ color: '#9ca3af' }}>实际预算还会受 provider 窗口和 host 安全余量限制。</span>
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 }}>
+                  重新压缩前的最小新增 token 数
+                  <input className="upc-input" type="number" min={1000} max={200000} step={1000} value={contextCompactorDraft.minimumGrowthBeforeRecompactTokens} onChange={(event) => setContextCompactorDraft({ ...contextCompactorDraft, minimumGrowthBeforeRecompactTokens: Number(event.target.value) })} />
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 }}>
+                  保留最近历史上限（tokens）
+                  <input className="upc-input" type="number" min={1000} max={100000} step={1000} value={contextCompactorDraft.recentContextTokens} onChange={(event) => setContextCompactorDraft({ ...contextCompactorDraft, recentContextTokens: Number(event.target.value) })} />
+                  <span style={{ color: '#9ca3af' }}>优先保留最近完整对话和工具交互；实际上限还会按 context window 限制为 20%。当前用户请求单独保留。</span>
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 }}>
+                  每次压缩的模型调用上限
+                  <input className="upc-input" type="number" min={1} max={32} step={1} value={contextCompactorDraft.compactionCallBudget} onChange={(event) => setContextCompactorDraft({ ...contextCompactorDraft, compactionCallBudget: Number(event.target.value) })} />
+                  <span style={{ color: '#9ca3af' }}>摘要、证据审查和合并都会计入此上限，并另行给 Agent 下一次工作调用留额度。</span>
+                </label>
+                {contextCompactorError && <div className="upc-notice error" role="alert">{contextCompactorError}</div>}
+                {contextCompactorMessage && <div className="upc-notice" role="status">{contextCompactorMessage}</div>}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                  <button type="button" className="upc-btn-secondary" onClick={closeContextCompactorSettings} disabled={contextCompactorBusy}>取消</button>
+                  <button type="submit" className="upc-btn-primary" disabled={contextCompactorBusy}>{contextCompactorBusy ? '保存并读回中…' : '保存策略'}</button>
+                </div>
+              </form>
+            </section>
+          </div>
+        )}
 
         {/* Modal: Add MCP Server */}
         {showAddMcp && (

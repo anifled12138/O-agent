@@ -17,51 +17,100 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"axiom.local/agent/internal/agent"
+	"axiom.local/agent/internal/artifactstore"
 	"axiom.local/agent/internal/bootstrap"
 	"axiom.local/agent/internal/core"
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/evalharness"
 	"axiom.local/agent/internal/evolution"
+	"axiom.local/agent/internal/gitcredential"
 	"axiom.local/agent/internal/mcp"
 	"axiom.local/agent/internal/pluginforge"
 	"axiom.local/agent/internal/plugins"
+	"axiom.local/agent/internal/projectpolicy"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/storage"
 	"axiom.local/agent/internal/websearch"
 )
 
 type Server struct {
-	workspaceID    string
-	providers      *provider.Service
-	agent          *agent.Service
-	evolution      *evolution.Service
-	evals          *evalharness.Service
-	bootstrap      *bootstrap.Service
-	forge          *pluginforge.Service
-	store          *storage.Store
-	plugins        *core.Manager
-	webSearch      *websearch.Service
-	frontendOrigin string
+	workspaceID           string
+	providers             *provider.Service
+	agent                 *agent.Service
+	evolution             *evolution.Service
+	evals                 *evalharness.Service
+	bootstrap             *bootstrap.Service
+	forge                 *pluginforge.Service
+	store                 *storage.Store
+	artifacts             *artifactstore.Service
+	plugins               *core.Manager
+	webSearch             *websearch.Service
+	gitCredentials        *gitcredential.Service
+	frontendOrigin        string
+	authBootstrapToken    string
+	projectDeltas         projectDeltaSnapshotter
+	projectPublicationMu  sync.Mutex
+	projectPublicationOps map[string]struct{}
+	nodeWakeMu            sync.Mutex
+	nodeWakeSubs          map[string]map[*nodeWakeSubscription]struct{}
 }
+
+func (s *Server) beginProjectPublicationOperation(id string) bool {
+	s.projectPublicationMu.Lock()
+	defer s.projectPublicationMu.Unlock()
+	if s.projectPublicationOps == nil {
+		s.projectPublicationOps = make(map[string]struct{})
+	}
+	if _, active := s.projectPublicationOps[id]; active {
+		return false
+	}
+	s.projectPublicationOps[id] = struct{}{}
+	return true
+}
+
+func (s *Server) endProjectPublicationOperation(id string) {
+	s.projectPublicationMu.Lock()
+	defer s.projectPublicationMu.Unlock()
+	delete(s.projectPublicationOps, id)
+}
+
+type projectDeltaSnapshotter interface {
+	CreateProjectDeltaBundle(context.Context, domain.Project, string) (agent.ProjectDeltaBundle, error)
+}
+
+func (s *Server) SetGitCredentials(service *gitcredential.Service) { s.gitCredentials = service }
+func (s *Server) SetArtifactStore(service *artifactstore.Service)  { s.artifacts = service }
 
 func New(workspaceID string, providerService *provider.Service, agentService *agent.Service, evolutionService *evolution.Service, evalService *evalharness.Service, bootstrapService *bootstrap.Service, forgeService *pluginforge.Service, store *storage.Store, plugins *core.Manager, origin string, searchServices ...*websearch.Service) *Server {
 	var searchService *websearch.Service
 	if len(searchServices) > 0 {
 		searchService = searchServices[0]
 	}
-	return &Server{workspaceID: workspaceID, providers: providerService, agent: agentService, evolution: evolutionService, evals: evalService, bootstrap: bootstrapService, forge: forgeService, store: store, plugins: plugins, webSearch: searchService, frontendOrigin: strings.TrimRight(origin, "/")}
+	return &Server{workspaceID: workspaceID, providers: providerService, agent: agentService, evolution: evolutionService, evals: evalService, bootstrap: bootstrapService, forge: forgeService, store: store, plugins: plugins, webSearch: searchService, frontendOrigin: strings.TrimRight(origin, "/"), projectDeltas: agentService}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	s.authRoutes(mux)
+	s.executionNodeRoutes(mux)
+	s.artifactRoutes(mux)
 	mux.HandleFunc("GET /api/v1/health", s.health)
+	mux.HandleFunc("GET /api/v1/system/sandbox", s.sandboxConfigurationGet)
+	mux.HandleFunc("PUT /api/v1/system/sandbox", s.sandboxConfigurationPut)
+	mux.HandleFunc("POST /api/v1/system/sandbox/maintenance", s.sandboxMaintenance)
+	mux.HandleFunc("GET /api/v1/system/git-credentials", s.gitCredentialsList)
+	mux.HandleFunc("PUT /api/v1/system/git-credentials", s.gitCredentialsSave)
+	mux.HandleFunc("DELETE /api/v1/system/git-credentials/{id}", s.gitCredentialsDelete)
 	mux.HandleFunc("GET /api/v1/system/plugins", s.pluginList)
 	mux.HandleFunc("GET /api/v1/plugins", s.unifiedPluginList)
 	mux.HandleFunc("POST /api/v1/plugins/{id}/toggle", s.unifiedPluginToggle)
 	mux.HandleFunc("POST /api/v1/plugins/reload", s.unifiedPluginReload)
+	mux.HandleFunc("GET /api/v1/plugins/context-compactor/settings", s.contextCompactorSettingsGet)
+	mux.HandleFunc("PUT /api/v1/plugins/context-compactor/settings", s.contextCompactorSettingsPut)
 	mux.HandleFunc("GET /api/v1/plugins/web-search/settings", s.webSearchSettings)
 	mux.HandleFunc("PUT /api/v1/plugins/web-search/settings", s.webSearchSaveSettings)
 	mux.HandleFunc("DELETE /api/v1/plugins/web-search/settings", s.webSearchClearSettings)
@@ -71,6 +120,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/provider-kinds", s.providerKinds)
 	mux.HandleFunc("GET /api/v1/providers", s.providerList)
 	mux.HandleFunc("POST /api/v1/providers", s.providerCreate)
+	mux.HandleFunc("POST /api/v1/providers/batch", s.providerBatchCreate)
 	mux.HandleFunc("PUT /api/v1/providers/{id}", s.providerUpdate)
 	mux.HandleFunc("POST /api/v1/providers/{id}/test", s.providerTest)
 	mux.HandleFunc("GET /api/v1/providers/{id}/models", s.providerModels)
@@ -78,6 +128,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/projects", s.projectList)
 	mux.HandleFunc("POST /api/v1/projects", s.projectCreate)
 	mux.HandleFunc("POST /api/v1/projects/git-clone", s.projectGitClone)
+	mux.HandleFunc("GET /api/v1/projects/{id}/publications", s.projectPublicationList)
+	mux.HandleFunc("GET /api/v1/projects/{id}/publication-preview", s.projectPublicationPreview)
+	mux.HandleFunc("POST /api/v1/projects/{id}/publications", s.projectPublicationCreate)
+	mux.HandleFunc("POST /api/v1/projects/{id}/publications/{publicationId}/reconcile", s.projectPublicationReconcile)
 	mux.HandleFunc("POST /api/v1/system/select-directory", s.systemSelectDirectory)
 	mux.HandleFunc("GET /api/v1/projects/{id}", s.projectGet)
 	mux.HandleFunc("PUT /api/v1/projects/{id}", s.projectUpdate)
@@ -85,7 +139,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/projects/{id}", s.projectDelete)
 	mux.HandleFunc("GET /api/v1/conversations", s.conversationList)
 	mux.HandleFunc("POST /api/v1/conversations", s.conversationCreate)
+	mux.HandleFunc("DELETE /api/v1/conversations/{id}", s.conversationDelete)
 	mux.HandleFunc("GET /api/v1/conversations/{id}", s.conversationGet)
+	mux.HandleFunc("GET /api/v1/recovery/conversations", s.deletedConversationList)
+	mux.HandleFunc("POST /api/v1/recovery/conversations/{id}/restore", s.conversationRestore)
 	mux.HandleFunc("PATCH /api/v1/conversations/{id}", s.conversationUpdate)
 	mux.HandleFunc("PUT /api/v1/conversations/{id}", s.conversationUpdate)
 	mux.HandleFunc("PUT /api/v1/conversations/{id}/permissions", s.conversationPermissionUpdate)
@@ -142,10 +199,155 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v2/agent/conversations/{id}/inbox", s.inboxList)
 	mux.HandleFunc("POST /api/v2/agent/conversations/{id}/inbox", s.inboxQueue)
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/retry", s.turnRetry)
+	mux.HandleFunc("POST /api/v2/agent/turns/{id}/reconcile", s.turnReconcile)
+	mux.HandleFunc("GET /api/v2/agent/turns/{id}/reconciliations", s.turnReconciliations)
+	mux.HandleFunc("POST /api/v2/agent/turns/{id}/continue", s.turnContinue)
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/branch", s.turnBranch)
 	mux.HandleFunc("POST /api/v2/agent/turns/{id}/fork", s.turnFork)
 	mux.HandleFunc("GET /api/v2/agent/turns/{id}/events", s.turnEvents)
-	return s.recoverer(s.cors(s.logging(mux)))
+	return s.recoverer(s.cors(s.logging(s.requireAuthentication(mux))))
+}
+
+func (s *Server) sandboxConfigurationGet(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "Agent service is unavailable"})
+		return
+	}
+	configuration, err := s.agent.SandboxConfiguration(r.Context())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, configuration)
+}
+
+func (s *Server) gitCredentialsList(w http.ResponseWriter, _ *http.Request) {
+	if s.gitCredentials == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "Git credential service is unavailable"})
+		return
+	}
+	write(w, http.StatusOK, s.gitCredentials.List())
+}
+
+func (s *Server) gitCredentialsSave(w http.ResponseWriter, r *http.Request) {
+	if s.gitCredentials == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "Git credential service is unavailable"})
+		return
+	}
+	var credential gitcredential.Credential
+	if !decode(w, r, &credential) {
+		return
+	}
+	summary, err := s.gitCredentials.Save(r.Context(), credential)
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalid) {
+			write(w, http.StatusBadRequest, map[string]string{"error": "Git credential scope or value is invalid"})
+		} else {
+			fail(w, err)
+		}
+		return
+	}
+	for _, saved := range s.gitCredentials.List() {
+		if saved.ID == summary.ID && saved.Host == summary.Host && saved.Repository == summary.Repository && saved.Username == summary.Username && saved.Configured {
+			write(w, http.StatusOK, saved)
+			return
+		}
+	}
+	write(w, http.StatusInternalServerError, map[string]string{"error": "Git credential was saved but could not be read back"})
+}
+
+func (s *Server) gitCredentialsDelete(w http.ResponseWriter, r *http.Request) {
+	if s.gitCredentials == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "Git credential service is unavailable"})
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.gitCredentials.Delete(r.Context(), id); err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			write(w, http.StatusNotFound, map[string]string{"error": "Git credential was not found"})
+		} else {
+			fail(w, err)
+		}
+		return
+	}
+	for _, saved := range s.gitCredentials.List() {
+		if saved.ID == id {
+			write(w, http.StatusInternalServerError, map[string]string{"error": "Git credential remained after deletion"})
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) sandboxConfigurationPut(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "Agent service is unavailable"})
+		return
+	}
+	var request struct {
+		DefaultBackend string `json:"defaultBackend"`
+	}
+	if !decode(w, r, &request) {
+		return
+	}
+	if request.DefaultBackend == "windows-native" {
+		current, err := s.agent.SandboxConfiguration(r.Context())
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		if current.Native.Health != "healthy" {
+			write(w, http.StatusConflict, map[string]any{"error": "Windows native sandbox is not healthy", "configuration": current})
+			return
+		}
+	}
+	configuration, err := s.agent.SetSandboxDefaultBackend(r.Context(), request.DefaultBackend)
+	if err != nil {
+		write(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	readBack, err := s.agent.SandboxConfiguration(r.Context())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if readBack.DefaultBackend != configuration.DefaultBackend {
+		write(w, http.StatusConflict, map[string]string{"error": "sandbox backend setting read-back did not match"})
+		return
+	}
+	write(w, http.StatusOK, readBack)
+}
+
+func (s *Server) sandboxMaintenance(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil {
+		write(w, http.StatusServiceUnavailable, map[string]string{"error": "Agent service is unavailable"})
+		return
+	}
+	var request struct {
+		Operation string `json:"operation"`
+	}
+	if !decode(w, r, &request) {
+		return
+	}
+	if request.Operation != "install" && request.Operation != "repair" && request.Operation != "uninstall" {
+		write(w, http.StatusBadRequest, map[string]string{"error": "operation must be install, repair, or uninstall"})
+		return
+	}
+	configuration, err := s.agent.RunSandboxMaintenance(r.Context(), request.Operation)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	readBack, err := s.agent.SandboxConfiguration(r.Context())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if readBack.DefaultBackend != configuration.DefaultBackend || readBack.Native.Installation != configuration.Native.Installation || readBack.Native.Health != configuration.Native.Health {
+		write(w, http.StatusConflict, map[string]string{"error": "sandbox maintenance read-back did not match the completed operation"})
+		return
+	}
+	write(w, http.StatusOK, readBack)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +435,19 @@ func (s *Server) providerCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusCreated, p)
+}
+
+func (s *Server) providerBatchCreate(w http.ResponseWriter, r *http.Request) {
+	var in provider.BatchInput
+	if !decode(w, r, &in) {
+		return
+	}
+	items, err := s.providers.CreateBatch(r.Context(), s.workspaceID, in)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusCreated, items)
 }
 func (s *Server) providerUpdate(w http.ResponseWriter, r *http.Request) {
 	var in provider.Input
@@ -326,6 +541,16 @@ func (s *Server) projectCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, domain.ErrInvalid)
 		return
 	}
+	repoURL := ""
+	repoProvider := ""
+	if strings.TrimSpace(in.RemoteRepoURL) != "" {
+		var err error
+		repoProvider, repoURL, err = projectpolicy.ValidateRepositoryURL(in.RemoteRepoURL)
+		if err != nil {
+			fail(w, domain.ErrInvalid)
+			return
+		}
+	}
 	raw := make([]byte, 12)
 	_, _ = rand.Read(raw)
 	proj := domain.Project{
@@ -335,8 +560,9 @@ func (s *Server) projectCreate(w http.ResponseWriter, r *http.Request) {
 		Instructions:        strings.TrimSpace(in.Instructions),
 		InstructionsEnabled: in.InstructionsEnabled,
 		Workdir:             strings.TrimSpace(in.Workdir),
-		RemoteRepoURL:       strings.TrimSpace(in.RemoteRepoURL),
+		RemoteRepoURL:       repoURL,
 		RemoteBranch:        strings.TrimSpace(in.RemoteBranch),
+		RepositoryProvider:  repoProvider,
 		CreatedAt:           time.Now().UTC(),
 		UpdatedAt:           time.Now().UTC(),
 	}
@@ -344,7 +570,16 @@ func (s *Server) projectCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	write(w, http.StatusCreated, proj)
+	persisted, err := s.store.Project(r.Context(), s.workspaceID, proj.ID)
+	if err != nil {
+		fail(w, fmt.Errorf("read created project back: %w", err))
+		return
+	}
+	if persisted.Name != proj.Name || persisted.RemoteRepoURL != proj.RemoteRepoURL || persisted.RepositoryProvider != proj.RepositoryProvider || persisted.RemoteBranch != proj.RemoteBranch {
+		fail(w, fmt.Errorf("created project read-back mismatch: %w", domain.ErrConflict))
+		return
+	}
+	write(w, http.StatusCreated, persisted)
 }
 
 func (s *Server) projectGet(w http.ResponseWriter, r *http.Request) {
@@ -388,7 +623,24 @@ func (s *Server) projectUpdate(w http.ResponseWriter, r *http.Request) {
 		existing.Workdir = strings.TrimSpace(*in.Workdir)
 	}
 	if in.RemoteRepoURL != nil {
-		existing.RemoteRepoURL = strings.TrimSpace(*in.RemoteRepoURL)
+		if strings.TrimSpace(*in.RemoteRepoURL) == "" {
+			existing.RemoteRepoURL = ""
+			existing.RepositoryProvider = ""
+			existing.ResolvedCommit = ""
+			existing.MeasuredBytes = 0
+		} else {
+			providerName, normalized, validationErr := projectpolicy.ValidateRepositoryURL(*in.RemoteRepoURL)
+			if validationErr != nil {
+				fail(w, domain.ErrInvalid)
+				return
+			}
+			if normalized != existing.RemoteRepoURL {
+				existing.ResolvedCommit = ""
+				existing.MeasuredBytes = 0
+			}
+			existing.RemoteRepoURL = normalized
+			existing.RepositoryProvider = providerName
+		}
 	}
 	if in.RemoteBranch != nil {
 		existing.RemoteBranch = strings.TrimSpace(*in.RemoteBranch)
@@ -455,11 +707,16 @@ func (s *Server) projectGitClone(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	repoURL := strings.TrimSpace(in.RepoURL)
-	if repoURL == "" {
+	repoProvider, repoURL, err := projectpolicy.ValidateRepositoryURL(in.RepoURL)
+	if err != nil {
 		fail(w, domain.ErrInvalid)
 		return
 	}
+	if s.agent == nil {
+		fail(w, fmt.Errorf("local execution host is unavailable"))
+		return
+	}
+	branch := strings.TrimSpace(in.Branch)
 	targetDir := strings.TrimSpace(in.TargetDir)
 	if targetDir == "" {
 		base := path.Base(strings.TrimSuffix(repoURL, ".git"))
@@ -468,45 +725,95 @@ func (s *Server) projectGitClone(w http.ResponseWriter, r *http.Request) {
 		}
 		targetDir = filepath.Join(s.agent.WorkspaceRoot(), base)
 	}
-
-	args := []string{"clone"}
-	if in.Branch != "" {
-		args = append(args, "-b", strings.TrimSpace(in.Branch))
-	}
-	args = append(args, repoURL, targetDir)
-
-	cmd := exec.CommandContext(r.Context(), "git", args...)
-	out, err := cmd.CombinedOutput()
+	targetDir, err = filepath.Abs(filepath.Clean(targetDir))
 	if err != nil {
-		write(w, http.StatusBadRequest, map[string]any{
-			"error":  "git clone 失败: " + strings.TrimSpace(string(out)),
-			"output": string(out),
-		})
+		fail(w, fmt.Errorf("resolve clone destination: %w", err))
+		return
+	}
+	if _, statErr := os.Lstat(targetDir); statErr == nil {
+		write(w, http.StatusConflict, map[string]string{"error": "clone destination already exists"})
+		return
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		fail(w, fmt.Errorf("inspect clone destination: %w", statErr))
+		return
+	}
+	var existing domain.Project
+	if in.ProjectID != "" {
+		existing, err = s.store.Project(r.Context(), s.workspaceID, in.ProjectID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+	}
+	parent := filepath.Dir(targetDir)
+	if err = os.MkdirAll(parent, 0o755); err != nil {
+		fail(w, fmt.Errorf("create clone parent directory: %w", err))
+		return
+	}
+	stageRoot, err := os.MkdirTemp(parent, ".o-git-import-")
+	if err != nil {
+		fail(w, fmt.Errorf("create temporary clone directory: %w", err))
+		return
+	}
+	defer func() {
+		if cleanupErr := os.RemoveAll(stageRoot); cleanupErr != nil {
+			slog.Error("failed to remove temporary repository import", "error", cleanupErr)
+		}
+	}()
+	stageDir := filepath.Join(stageRoot, "repository")
+	if err = os.Mkdir(stageDir, 0o700); err != nil {
+		fail(w, fmt.Errorf("prepare temporary repository directory: %w", err))
+		return
+	}
+	_, _, resolvedCommit, branch, cloneErr := s.agent.CloneGitRepository(r.Context(), repoURL, stageDir, branch)
+	if cloneErr != nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": "repository clone failed; check that the public repository is reachable and sandbox execution is healthy"})
+		return
+	}
+	measuredBytes, err := projectpolicy.Measure(stageDir)
+	measurementStatus := "measured"
+	if err != nil {
+		// Measurement only selects a transfer strategy. It must never block
+		// importing or running a user's project.
+		measuredBytes = -1
+		measurementStatus = "unknown"
+	}
+	if err = os.Rename(stageDir, targetDir); err != nil {
+		fail(w, fmt.Errorf("publish cloned repository to destination: %w", err))
 		return
 	}
 
 	if in.ProjectID != "" {
-		existing, pErr := s.store.Project(r.Context(), s.workspaceID, in.ProjectID)
-		if pErr != nil {
-			fail(w, fmt.Errorf("repository cloned to %s but project metadata could not be loaded: %w", targetDir, pErr))
-			return
-		}
+		priorProject := existing
 		existing.Workdir = targetDir
 		existing.RemoteRepoURL = repoURL
-		if in.Branch != "" {
-			existing.RemoteBranch = in.Branch
+		existing.RemoteBranch = branch
+		existing.RepositoryProvider = repoProvider
+		existing.ResolvedCommit = resolvedCommit
+		existing.MeasuredBytes = measuredBytes
+		if err = s.store.UpdateProject(r.Context(), s.workspaceID, existing); err != nil {
+			cleanupErr := os.RemoveAll(targetDir)
+			if cleanupErr != nil {
+				fail(w, errors.Join(fmt.Errorf("project metadata could not be persisted after clone: %w", err), fmt.Errorf("remove unregistered clone: %w", cleanupErr)))
+				return
+			}
+			fail(w, fmt.Errorf("project metadata could not be persisted; cloned files were rolled back: %w", err))
+			return
 		}
-		if pErr = s.store.UpdateProject(r.Context(), s.workspaceID, existing); pErr != nil {
-			fail(w, fmt.Errorf("repository cloned to %s but project metadata could not be saved: %w", targetDir, pErr))
+		persisted, readErr := s.store.Project(r.Context(), s.workspaceID, in.ProjectID)
+		if readErr != nil || persisted.Workdir != targetDir || persisted.RemoteRepoURL != repoURL || persisted.ResolvedCommit != resolvedCommit || persisted.MeasuredBytes != measuredBytes {
+			rollbackErr := s.store.UpdateProject(r.Context(), s.workspaceID, priorProject)
+			cleanupErr := os.RemoveAll(targetDir)
+			fail(w, errors.Join(fmt.Errorf("project import read-back did not match persisted source identity: %w", domain.ErrConflict), readErr, rollbackErr, cleanupErr))
 			return
 		}
 	}
 
-	write(w, http.StatusOK, map[string]any{
-		"ok":        true,
-		"targetDir": targetDir,
-		"output":    string(out),
-	})
+	transferMode := "direct"
+	if measurementStatus == "unknown" || projectpolicy.NeedsChunkedTransfer(measuredBytes) {
+		transferMode = "incremental_or_artifact_link"
+	}
+	write(w, http.StatusOK, map[string]any{"targetDir": targetDir, "repositoryProvider": repoProvider, "resolvedCommit": resolvedCommit, "measuredBytes": measuredBytes, "measurementStatus": measurementStatus, "remoteBranch": branch, "recommendedTransferMode": transferMode, "directTransferBatchBytes": projectpolicy.DirectTransferBatchBytes})
 }
 
 func (s *Server) projectDelete(w http.ResponseWriter, r *http.Request) {
@@ -572,6 +879,58 @@ func (s *Server) conversationGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fail(w, errors.New("agent service not initialized"))
+}
+
+func (s *Server) conversationDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.agent != nil {
+		deleted, err := s.agent.DeleteConversation(r.Context(), s.workspaceID, id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		write(w, http.StatusOK, deleted)
+		return
+	}
+	if s.store != nil {
+		deleted, _, err := s.store.DeleteConversation(r.Context(), s.workspaceID, id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		write(w, http.StatusOK, deleted)
+		return
+	}
+	fail(w, errors.New("conversation storage not initialized"))
+}
+
+// The recovery routes intentionally have no current UI entry point. They retain
+// the ability to build a restore view without exposing deleted conversations in
+// the normal sidebar or conversation list.
+func (s *Server) deletedConversationList(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		fail(w, errors.New("conversation storage not initialized"))
+		return
+	}
+	items, err := s.store.ListDeletedConversations(r.Context(), s.workspaceID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, items)
+}
+
+func (s *Server) conversationRestore(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		fail(w, errors.New("conversation storage not initialized"))
+		return
+	}
+	conversation, err := s.store.RestoreConversation(r.Context(), s.workspaceID, r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, conversation)
 }
 
 func (s *Server) conversationUpdate(w http.ResponseWriter, r *http.Request) {
@@ -779,6 +1138,30 @@ func (s *Server) turnRetry(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusAccepted, receipt)
 }
 
+// turnContinue resumes only from a persisted, safe budget checkpoint. The
+// Idempotency-Key makes duplicate submissions return the same child Turn.
+func (s *Server) turnContinue(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Instruction   string `json:"instruction"`
+		MaxSteps      *int   `json:"maxSteps"`
+		MaxModelCalls *int   `json:"maxModelCalls"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		fail(w, domain.ErrInvalid)
+		return
+	}
+	receipt, err := s.agent.ContinueTurn(r.Context(), s.workspaceID, r.PathValue("id"), in.Instruction, key, in.MaxSteps, in.MaxModelCalls)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, receipt)
+}
+
 func (s *Server) turnBranch(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Content *string `json:"content"`
@@ -863,7 +1246,7 @@ func (s *Server) turnEvents(w http.ResponseWriter, r *http.Request) {
 				return writeErr
 			}
 			after = event.Sequence
-			terminal = event.Kind == "turn.completed" || event.Kind == "turn.incomplete" || event.Kind == "turn.failed" || event.Kind == "turn.cancelled" || event.Kind == "turn.needs_reconciliation" || event.Kind == "turn.interrupted"
+			terminal = event.Kind == "turn.completed" || event.Kind == "turn.incomplete" || event.Kind == "turn.failed" || event.Kind == "turn.cancelled" || event.Kind == "turn.interrupted"
 		}
 		flusher.Flush()
 		return nil
@@ -1213,9 +1596,10 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		if origin == s.frontendOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
 		if r.Method == http.MethodOptions {
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Last-Event-ID")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Last-Event-ID, Idempotency-Key, Authorization, X-O-Bootstrap-Token, X-O-Task-Lease, X-Chunk-SHA256")
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -1266,7 +1650,7 @@ func fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrBusy):
 		write(w, http.StatusTooManyRequests, map[string]string{"error": "运行容量已满，请稍后重试；已排队的输入会在容量空闲时继续"})
 	case errors.Is(err, domain.ErrConflict):
-		write(w, http.StatusConflict, map[string]string{"error": "资源已存在"})
+		write(w, http.StatusConflict, map[string]string{"error": "当前操作与资源状态冲突，请刷新后重试"})
 	case errors.Is(err, domain.ErrUnauthorized):
 		write(w, http.StatusUnauthorized, map[string]string{"error": "没有执行此操作的权限"})
 	case errors.Is(err, domain.ErrNotFound):
@@ -1326,6 +1710,36 @@ func (s *Server) unifiedPluginToggle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusConflict, map[string]string{"error": "插件状态读回失败"})
+}
+
+func (s *Server) contextCompactorSettingsGet(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil || s.agent.Plugins() == nil {
+		fail(w, errors.New("plugins manager not initialized"))
+		return
+	}
+	write(w, http.StatusOK, s.agent.Plugins().ContextCompactionSettings())
+}
+
+func (s *Server) contextCompactorSettingsPut(w http.ResponseWriter, r *http.Request) {
+	if s.agent == nil || s.agent.Plugins() == nil {
+		fail(w, errors.New("plugins manager not initialized"))
+		return
+	}
+	var requested plugins.CompactionSettings
+	if !decode(w, r, &requested) {
+		return
+	}
+	saved, err := s.agent.Plugins().SetContextCompactionSettings(requested)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	readBack := s.agent.Plugins().ContextCompactionSettings()
+	if saved != readBack {
+		write(w, http.StatusConflict, map[string]string{"error": "context compaction settings read-back did not match"})
+		return
+	}
+	write(w, http.StatusOK, readBack)
 }
 
 func (s *Server) unifiedPluginReload(w http.ResponseWriter, r *http.Request) {

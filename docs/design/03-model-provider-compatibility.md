@@ -83,6 +83,12 @@ response.completed | response.failed
 - Anthropic：content block 中的 `tool_use`，结果以 `tool_result` 返回；
 - 部分兼容服务返回 object arguments、空 call ID 或 legacy `function_call`。
 
+OpenAI Responses 适配器支持内部 Markdown 约定 `![alt](data:image/...;base64,...)`：普通消息转换为
+`input_image` content part，工具调用结果转换为 `function_call_output.output` 中的图像内容数组；每张内嵌图
+限制为 6 MiB，损坏的 data URL 或超限图像会明确报错，不静默降级成文本。浏览器截图可沿此路径进入
+支持视觉输入的模型；这只代表 provider 输入桥接，不代表浏览器运行时、持久会话或每种模型的视觉能力已接入。
+Responses 的图像及函数输出内容结构以[官方 API 参考](https://platform.openai.com/docs/api-reference/responses)为准。
+
 Adapter 可做有界兼容：object arguments 规范化为 JSON、空 ID 生成本 Attempt 内 ID、
 legacy 单调用映射到 Tool Call。任何修复都产生 compatibility warning event。
 

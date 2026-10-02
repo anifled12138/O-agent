@@ -1,21 +1,29 @@
 package coretools
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
+	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/runfiles"
+	"axiom.local/agent/internal/sandbox"
 )
 
 type Tool struct {
@@ -23,10 +31,43 @@ type Tool struct {
 	Handler    func(ctx context.Context, args json.RawMessage) (any, error)
 }
 
+type BrowserSessions interface {
+	Tool() Tool
+	Close() error
+}
+
+type SourceArchiver func(sourceType string, content []byte) (string, error)
+type StreamSourceArchiver func(ctx context.Context, sourceType string, reader io.Reader, size int64, sha256 string) (string, error)
+
+// ExecutionConfig is injected by the trusted Agent host, never tool arguments.
+type ExecutionConfig struct {
+	Backend                 sandbox.Backend
+	InstallDir              string
+	RunnerPath              string
+	SetupPath               string
+	RunnerSource            string
+	GitCredentials          sandbox.GitCredentialBroker
+	GitCredentialURLs       []string
+	ProtectedPaths          []string
+	TaskWorkspaceQuotaBytes int64
+	BrowserSessions         BrowserSessions
+}
+
 type processPolicy struct {
+	backend                     sandbox.Backend
+	installDir                  string
+	runnerPath                  string
 	readOnlyPaths               []string
+	writePaths                  []string
+	networkAccess               bool
+	networkAllowHosts           []string
+	gitCredentials              sandbox.GitCredentialBroker
+	gitCredentialURLs           []string
+	protectedPaths              []string
+	powershellExitWrapper       bool
 	privateTempWorkingDirectory bool
 	journalPath                 string
+	timeout                     time.Duration
 }
 
 func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
@@ -34,11 +75,40 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 	if len(runScopes) > 0 {
 		runScope = runScopes[0]
 	}
-	return []Tool{
+	return GetCoreToolsWithSourceArchive(workspaceRoot, runScope, nil)
+}
+
+// GetCoreToolsWithSourceArchive lets Agent runs retain immutable snapshots
+// before a tool applies its model-facing output limit.
+func GetCoreToolsWithSourceArchive(workspaceRoot string, runScope *runfiles.Scope, archive SourceArchiver, configs ...ExecutionConfig) []Tool {
+	return getCoreTools(workspaceRoot, runScope, archive, nil, configs...)
+}
+
+// GetCoreToolsWithStreamSourceArchive adds durable streaming snapshots for
+// files too large to keep inline while preserving the existing small-source API.
+func GetCoreToolsWithStreamSourceArchive(workspaceRoot string, runScope *runfiles.Scope, archive SourceArchiver, streamArchive StreamSourceArchiver, configs ...ExecutionConfig) []Tool {
+	return getCoreTools(workspaceRoot, runScope, archive, streamArchive, configs...)
+}
+
+func getCoreTools(workspaceRoot string, runScope *runfiles.Scope, archive SourceArchiver, streamArchive StreamSourceArchiver, configs ...ExecutionConfig) []Tool {
+	execution := ExecutionConfig{Backend: sandbox.PlatformDefaultBackend()}
+	if len(configs) > 0 {
+		execution = configs[0]
+		if execution.Backend == "" {
+			execution.Backend = sandbox.PlatformDefaultBackend()
+		}
+	}
+	sandboxDescription := "The host-selected Windows process sandbox and 128-process Job limit remain active; platforms without a native sandbox reject execution."
+	if execution.Backend == sandbox.BackendWindowsNative {
+		sandboxDescription = "Windows uses the installed Offline/Online low-privilege accounts, restricted-token runner, file ACLs, WFP network policy, and a 128-process Job limit. When Go, Node, or Python is installed in the host toolchain path, binary-version-separated Go build/module, npm/yarn, or pip caches persist in a protected local cache directory resolved for the current Windows user and are writable by sandbox commands. HTTPS Git credentials configured in Settings are encrypted at rest and brokered only for the selected repository URL over an authenticated per-command named pipe. SSH remotes can use identities loaded in the current Windows user's OpenSSH agent through an authenticated command-scoped broker; SSH is blocked with an explicit error if the Host agent is unavailable or has no usable identity. Private keys are not copied into command scratch. SSH-format signing uses command-scoped Git settings and the Host identity; OpenPGP signing configuration remains separate."
+	} else if runtime.GOOS == "linux" {
+		sandboxDescription = linuxSandboxDescription(execution.TaskWorkspaceQuotaBytes)
+	}
+	tools := []Tool{
 		{
 			Definition: toolDef(
 				"fs_read",
-				"Read workspace text files up to 32 MiB or page through a run-scoped temporary artifact by ID. Supports 1-based line offsets and line-numbered output.",
+				"Read workspace text files of any size or page through a run-scoped temporary artifact by ID. Reads are streamed and support 1-based line offsets; Agent runs return a full-file SHA-256. Large files are encrypted and archived through the chunked artifact store.",
 				`{"type":"object","properties":{"path":{"type":"string","description":"Relative path to a file in the workspace; use this or artifactId"},"artifactId":{"type":"string","description":"Opaque ID returned by grep_search or exec_script for a temporary artifact; use this or path"},"offset":{"type":"integer","description":"1-based starting line number (default 1)"},"limit":{"type":"integer","description":"Maximum number of lines to read (default 200)"},"withLineNumbers":{"type":"boolean","description":"Whether to prepend line numbers (default true)"}},"additionalProperties":false}`,
 			),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
@@ -55,29 +125,47 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 				if (p.Path == "") == (p.ArtifactID == "") {
 					return nil, fmt.Errorf("provide exactly one of path or artifactId")
 				}
-				var data []byte
+				var source *os.File
 				var err error
 				if p.ArtifactID != "" {
 					if runScope == nil {
 						return nil, fmt.Errorf("temporary artifacts are unavailable outside an Agent run")
 					}
-					data, err = runScope.ReadArtifact(p.ArtifactID)
+					source, err = runScope.OpenArtifact(p.ArtifactID)
 				} else {
 					var targetPath string
 					targetPath, err = safeResolve(workspaceRoot, p.Path)
 					if err == nil {
-						var info os.FileInfo
-						info, err = os.Stat(targetPath)
-						if err == nil && info.Size() > 32<<20 {
-							err = fmt.Errorf("file exceeds the 32 MiB read limit")
-						}
-						if err == nil {
-							data, err = os.ReadFile(targetPath)
-						}
+						source, err = os.Open(targetPath)
 					}
 				}
 				if err != nil {
 					return nil, err
+				}
+				defer source.Close()
+				snapshot, err := streamTextSnapshot(ctx, source, fsReadInlineArchiveBytes)
+				if err != nil {
+					return nil, fmt.Errorf("read file snapshot: %w", err)
+				}
+				sourceID := ""
+				sourceArchiveStatus := "not_configured"
+				if archive != nil && snapshot.inline != nil {
+					sourceID, err = archive("file_snapshot", snapshot.inline)
+					if err != nil {
+						return nil, fmt.Errorf("archive file snapshot: %w", err)
+					}
+					sourceArchiveStatus = "archived"
+				} else if streamArchive != nil && !snapshot.inlineAvailable {
+					if _, err := source.Seek(0, io.SeekStart); err != nil {
+						return nil, fmt.Errorf("rewind file for encrypted snapshot archive: %w", err)
+					}
+					sourceID, err = streamArchive(ctx, "file_snapshot", source, snapshot.fileInfo.Size(), snapshot.sha256)
+					if err != nil {
+						return nil, fmt.Errorf("archive large file snapshot: %w", err)
+					}
+					sourceArchiveStatus = "archived"
+				} else if archive != nil && !snapshot.inlineAvailable {
+					sourceArchiveStatus = "requires_chunked_snapshot_transfer"
 				}
 
 				withNumbers := true
@@ -85,69 +173,51 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 					withNumbers = *p.WithLineNumbers
 				}
 
-				rawLines := strings.Split(string(data), "\n")
-				totalLines := len(rawLines)
-
-				start := 0
-				if p.Offset > 1 {
-					start = p.Offset - 1
-					if start > totalLines {
-						start = totalLines
-					}
-				}
-
 				limit := p.Limit
 				if limit <= 0 {
 					limit = 200
 				}
-				end := start + limit
-				if end > totalLines {
-					end = totalLines
+				if p.Offset < 1 {
+					p.Offset = 1
 				}
-
-				var formatted []string
-				for i := start; i < end; i++ {
-					lineContent := rawLines[i]
-					// Remove trailing carriage return if Windows style
-					lineContent = strings.TrimSuffix(lineContent, "\r")
-					if withNumbers {
-						formatted = append(formatted, fmt.Sprintf("%6d | %s", i+1, lineContent))
-					} else {
-						formatted = append(formatted, lineContent)
-					}
+				content, startLine, endLine, pageTruncated, err := readTextPage(ctx, source, snapshot.totalLines, p.Offset, limit, withNumbers, 64*1024)
+				if err != nil {
+					return nil, fmt.Errorf("read requested file page: %w", err)
 				}
-
-				content := strings.Join(formatted, "\n")
-				truncated := false
-				const maxFileReadBytes = 64 * 1024
-				if len(content) > maxFileReadBytes {
-					content = content[:maxFileReadBytes] + fmt.Sprintf("\n... [truncated to %d KB; use smaller limit or offset]", maxFileReadBytes/1024)
-					truncated = true
+				pageInfo, err := source.Stat()
+				if err != nil {
+					return nil, fmt.Errorf("verify file after reading page: %w", err)
 				}
-
-				hasMore := end < totalLines
+				if !os.SameFile(snapshot.fileInfo, pageInfo) || snapshot.fileInfo.Size() != pageInfo.Size() || !snapshot.fileInfo.ModTime().Equal(pageInfo.ModTime()) {
+					return nil, fmt.Errorf("file changed while it was being read; retry to obtain one consistent snapshot")
+				}
+				truncated := pageTruncated
+				hasMore := endLine < snapshot.totalLines
 				var nextOffset any = nil
 				if hasMore {
-					nextOffset = end + 1
+					nextOffset = int(endLine + 1)
 				}
 
 				return map[string]any{
-					"path":       p.Path,
-					"artifactId": p.ArtifactID,
-					"startLine":  start + 1,
-					"endLine":    end,
-					"totalLines": totalLines,
-					"hasMore":    hasMore,
-					"nextOffset": nextOffset,
-					"content":    content,
-					"truncated":  truncated,
+					"path":                p.Path,
+					"artifactId":          p.ArtifactID,
+					"sourceId":            sourceID,
+					"sourceArchiveStatus": sourceArchiveStatus,
+					"contentSha256":       snapshot.sha256,
+					"startLine":           int(startLine),
+					"endLine":             int(endLine),
+					"totalLines":          int(snapshot.totalLines),
+					"hasMore":             hasMore,
+					"nextOffset":          nextOffset,
+					"content":             content,
+					"truncated":           truncated,
 				}, nil
 			},
 		},
 		{
 			Definition: toolDef(
 				"exec_script",
-				"Run a short-lived script from source stored as a turn-scoped artifact. The script can read the workspace; its working directory and temporary writes use a private per-command AppContainer directory that is removed when the command ends. On Windows it runs in an AppContainer with network access disabled and a 128-process limit; platforms without a native sandbox backend reject execution. Script source is capped at 1 MiB and execution at 180 seconds; each output stream captures at most 1 MiB. Use exec_command for intentional project commands.",
+				"Run a short-lived script from source stored as a turn-scoped artifact. The script can read the workspace; its working directory and temporary writes use a private per-command sandbox directory removed after the command ends. "+sandboxDescription+" Script source is capped at 1 MiB and execution at 180 seconds; each output stream captures at most 1 MiB. On Windows, PowerShell terminating errors and the last native command's exit code are reflected in exitCode. Captured output is archived before display truncation and returns captureSourceId; captureComplete is false if the capture cap was reached. Use exec_command for intentional project commands.",
 				`{"type":"object","required":["language","source"],"properties":{"language":{"type":"string","enum":["python","node","powershell","shell"],"description":"Installed interpreter to use"},"source":{"type":"string","description":"Script source; maximum 1 MiB"},"timeoutSeconds":{"type":"integer","description":"Execution timeout in seconds (default 30, max 180)"}},"additionalProperties":false}`,
 			),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
@@ -194,7 +264,7 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 				if err != nil {
 					return nil, fmt.Errorf("no interpreter found for %s script: tried %s", p.Language, strings.Join(candidates, ", "))
 				}
-				cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(p.TimeoutSeconds)*time.Second)
+				cmdCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 				cmdArgs := make([]string, 0, len(prefixArgs)+1)
 				if p.Language == "python" && runtime.GOOS == "windows" && strings.EqualFold(filepath.Base(interpreter), "py.exe") {
@@ -206,7 +276,7 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 				stdout, stderr := cappedBuffer{limit: 1 << 20}, cappedBuffer{limit: 1 << 20}
 				cmd.Stdout = &stdout
 				cmd.Stderr = &stderr
-				policy := processPolicy{readOnlyPaths: []string{workspaceRoot}, privateTempWorkingDirectory: true, journalPath: journalPath}
+				policy := processPolicy{backend: execution.Backend, installDir: execution.InstallDir, runnerPath: execution.RunnerPath, readOnlyPaths: []string{workspaceRoot}, gitCredentials: execution.GitCredentials, gitCredentialURLs: execution.GitCredentialURLs, protectedPaths: execution.ProtectedPaths, powershellExitWrapper: runtime.GOOS == "windows" && (p.Language == "powershell" || p.Language == "shell"), privateTempWorkingDirectory: true, journalPath: journalPath, timeout: time.Duration(p.TimeoutSeconds) * time.Second}
 				runErr, cleanupErr := runProcessTree(cmdCtx, cmd, []byte(p.Source), policy)
 				if cleanupErr != nil {
 					return nil, errors.Join(runErr, cleanupErr)
@@ -215,8 +285,21 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 				if runErr != nil {
 					var exited bool
 					exitCode, exited = processExitCode(runErr)
-					if !exited && cmdCtx.Err() == nil {
+					if !exited && cmdCtx.Err() == nil && !errors.Is(runErr, context.DeadlineExceeded) {
 						return nil, runErr
+					}
+				}
+				timedOut := errors.Is(runErr, context.DeadlineExceeded)
+				capture := map[string]any{"language": p.Language, "stdout": stdout.String(), "stderr": stderr.String(), "exitCode": exitCode, "timedOut": timedOut, "captureComplete": !stdout.truncated && !stderr.truncated}
+				captureBytes, marshalErr := json.Marshal(capture)
+				if marshalErr != nil {
+					return nil, fmt.Errorf("encode complete script output: %w", marshalErr)
+				}
+				captureSourceID := ""
+				if archive != nil {
+					captureSourceID, err = archive("process_output", captureBytes)
+					if err != nil {
+						return nil, fmt.Errorf("archive complete script output: %w", err)
 					}
 				}
 				outStr, outTruncated := balanceTruncate(stdout.String(), 24*1024)
@@ -224,10 +307,12 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 				return map[string]any{
 					"language":         p.Language,
 					"scriptArtifactId": artifact.ID,
+					"captureSourceId":  captureSourceID,
+					"captureComplete":  !stdout.truncated && !stderr.truncated,
 					"stdout":           outStr,
 					"stderr":           errStr,
 					"exitCode":         exitCode,
-					"timedOut":         errors.Is(cmdCtx.Err(), context.DeadlineExceeded),
+					"timedOut":         timedOut,
 					"outTruncated":     outTruncated || errTruncated || stdout.truncated || stderr.truncated,
 				}, nil
 			},
@@ -421,7 +506,7 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 		{
 			Definition: toolDef(
 				"grep_search",
-				"Search workspace files using a regular expression. Skips .git, node_modules, .pnpm-store, and symbolic links by default; explicitly targeted paths can include ignored directories but symbolic links are never followed. Large result sets are stored as run-scoped temporary artifacts and can be paged with fs_read; artifacts retain at most the first 10000 matches.",
+				"Search workspace files using a regular expression. Skips .git, node_modules, .pnpm-store, and symbolic links by default; explicitly targeted paths can include ignored directories but symbolic links are never followed. Large result sets are archived as a user-scoped source and a turn-local artifact; the archived result retains at most the first 10000 matches, while the artifact can be paged with fs_read during this turn.",
 				`{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Regex search pattern; maximum 4 KiB"},"path":{"type":"string","description":"Relative directory or specific file path to search"},"maxMatches":{"type":"integer","description":"Maximum snippets to return directly in context (default 30, max 100)"},"includeIgnored":{"type":"boolean","description":"Whether to include .git, node_modules, and .pnpm-store (default false)"}},"additionalProperties":false}`,
 			),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
@@ -580,9 +665,23 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 					if writeErr != nil {
 						return nil, fmt.Errorf("save large grep results: %w", writeErr)
 					}
+					resultSourceID := ""
+					if archive != nil {
+						resultSourceID, writeErr = archive("grep_results", dumpPayload)
+						if writeErr != nil {
+							return nil, fmt.Errorf("archive complete grep results: %w", writeErr)
+						}
+					}
 					res["artifactId"] = artifact.ID
+					if resultSourceID != "" {
+						res["sourceId"] = resultSourceID
+					}
 					res["artifactTruncated"] = totalFound > len(allMatches)
-					res["notice"] = fmt.Sprintf("Found %d matches. Returning the first %d snippets; read artifactId %s with fs_read to page through the retained results.", totalFound, len(matches), artifact.ID)
+					if resultSourceID != "" {
+						res["notice"] = fmt.Sprintf("Found %d matches. Returning the first %d snippets; the complete retained result is archived as sourceId %s and can be read with axiom_context_source_read. The turn-local artifactId %s is also available to fs_read during this turn.", totalFound, len(matches), resultSourceID, artifact.ID)
+					} else {
+						res["notice"] = fmt.Sprintf("Found %d matches. Returning the first %d snippets; read artifactId %s with fs_read to page through the retained results during this turn.", totalFound, len(matches), artifact.ID)
+					}
 				}
 
 				return res, nil
@@ -591,20 +690,26 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 		{
 			Definition: toolDef(
 				"exec_command",
-				"Execute a read-only project command with a timeout in the workspace or specified subdirectory. On Windows the process runs in an AppContainer with workspace read access, writes limited to its private per-command temporary storage, network access disabled, and a 128-process limit; platforms without a native sandbox backend reject execution. Use the workspace file tools for project changes. Process descendants are terminated with the command; output capture is capped at 1 MiB per stream and returned head/tail are bounded.",
-				`{"type":"object","required":["cmd"],"properties":{"cmd":{"type":"string","description":"Shell command to execute; maximum 1 MiB"},"workdir":{"type":"string","description":"Relative directory to run command in (default workspace root)"},"timeoutSeconds":{"type":"integer","description":"Command timeout in seconds (default 30, max 180)"}},"additionalProperties":false}`,
+				"Execute a bounded project command. By default it can read the workspace, write to private temporary storage and any tool cache provided by the selected backend, and has no network access. Set writeAccess=true to let it modify files inside the workspace; set networkAccess=true to request network capability. On Linux, include exact DNS names in networkHosts; only their resolved public IPs are allowed for this invocation. Any port on those IPs is reachable, and the host list is part of the permission request. Workspace-auto sessions allow the requested capabilities unless the operation is classified as destructive or sensitive; request-approval sessions ask before the command runs. "+sandboxDescription+" On Windows, PowerShell terminating errors and the last native command's exit code are reflected in exitCode. Process descendants are terminated; captured output is archived before display truncation and returns captureSourceId. Capture is capped at 1 MiB per stream; captureComplete is false if that cap was reached.",
+				`{"type":"object","required":["cmd"],"properties":{"cmd":{"type":"string","description":"Shell command to execute; maximum 1 MiB"},"workdir":{"type":"string","description":"Relative directory to run in (default workspace root)"},"timeoutSeconds":{"type":"integer","description":"Execution timeout in seconds (default 30, max 180)"},"writeAccess":{"type":"boolean","description":"Allow writes inside the workspace for this command; workspace-auto allows it unless classified as risky, request-approval asks first"},"networkAccess":{"type":"boolean","description":"Request network access; on Linux, egress is limited to networkHosts IPs, all ports on those IPs are reachable"},"networkHosts":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":253},"description":"Exact ASCII DNS hostnames (IDNA punycode allowed) allowed for this command on Linux. Required unless the selected repository provides a credential-scoped remote. IP literals, wildcards, private and local destinations are rejected. Any port at the resolved public IP is reachable."}},"additionalProperties":false}`,
 			),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				if runScope == nil {
 					return nil, fmt.Errorf("command execution is available only inside an Agent run")
 				}
 				var p struct {
-					Cmd            string `json:"cmd"`
-					Workdir        string `json:"workdir"`
-					TimeoutSeconds int    `json:"timeoutSeconds"`
+					Cmd            string   `json:"cmd"`
+					Workdir        string   `json:"workdir"`
+					TimeoutSeconds int      `json:"timeoutSeconds"`
+					WriteAccess    bool     `json:"writeAccess"`
+					NetworkAccess  bool     `json:"networkAccess"`
+					NetworkHosts   []string `json:"networkHosts"`
 				}
 				if err := json.Unmarshal(args, &p); err != nil {
 					return nil, err
+				}
+				if len(p.NetworkHosts) > 32 || (!p.NetworkAccess && len(p.NetworkHosts) > 0) {
+					return nil, errors.New("networkHosts requires networkAccess=true and may list at most 32 destinations")
 				}
 				if len(p.Cmd) > 1<<20 {
 					return nil, fmt.Errorf("command exceeds the 1 MiB limit")
@@ -615,7 +720,7 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 				if p.TimeoutSeconds > 180 {
 					p.TimeoutSeconds = 180
 				}
-				cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(p.TimeoutSeconds)*time.Second)
+				cmdCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 
 				targetWorkdir := workspaceRoot
@@ -641,7 +746,14 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 				stdout, stderr := cappedBuffer{limit: 1 << 20}, cappedBuffer{limit: 1 << 20}
 				cmd.Stdout = &stdout
 				cmd.Stderr = &stderr
-				policy := processPolicy{readOnlyPaths: []string{workspaceRoot}, journalPath: journalPath}
+				networkHosts := append(append([]string(nil), p.NetworkHosts...), NetworkHostsFromURLs(execution.GitCredentialURLs)...)
+				if err := validateNetworkHostRequest(runtime.GOOS, p.NetworkAccess, networkHosts); err != nil {
+					return nil, err
+				}
+				policy := processPolicy{backend: execution.Backend, installDir: execution.InstallDir, runnerPath: execution.RunnerPath, readOnlyPaths: []string{workspaceRoot}, gitCredentials: execution.GitCredentials, gitCredentialURLs: execution.GitCredentialURLs, protectedPaths: execution.ProtectedPaths, powershellExitWrapper: runtime.GOOS == "windows", journalPath: journalPath, networkAccess: p.NetworkAccess, networkAllowHosts: networkHosts, timeout: time.Duration(p.TimeoutSeconds) * time.Second}
+				if p.WriteAccess {
+					policy.writePaths = []string{workspaceRoot}
+				}
 				err, cleanupErr := runProcessTree(cmdCtx, cmd, []byte(p.Cmd), policy)
 				if cleanupErr != nil {
 					return nil, errors.Join(err, cleanupErr)
@@ -650,26 +762,306 @@ func GetCoreTools(workspaceRoot string, runScopes ...*runfiles.Scope) []Tool {
 				if err != nil {
 					var exited bool
 					exitCode, exited = processExitCode(err)
-					if !exited && cmdCtx.Err() == nil {
+					if !exited && cmdCtx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) {
 						return nil, err
 					}
 				}
 
+				timedOut := errors.Is(err, context.DeadlineExceeded)
+				capture := map[string]any{"cmd": p.Cmd, "workdir": p.Workdir, "stdout": stdout.String(), "stderr": stderr.String(), "exitCode": exitCode, "timedOut": timedOut, "captureComplete": !stdout.truncated && !stderr.truncated}
+				captureBytes, marshalErr := json.Marshal(capture)
+				if marshalErr != nil {
+					return nil, fmt.Errorf("encode complete command output: %w", marshalErr)
+				}
+				captureSourceID := ""
+				if archive != nil {
+					captureSourceID, err = archive("process_output", captureBytes)
+					if err != nil {
+						return nil, fmt.Errorf("archive complete command output: %w", err)
+					}
+				}
 				outStr, outTruncated := balanceTruncate(stdout.String(), 24*1024)
 				errStr, errTruncated := balanceTruncate(stderr.String(), 16*1024)
 
 				return map[string]any{
-					"cmd":          p.Cmd,
-					"workdir":      p.Workdir,
-					"stdout":       outStr,
-					"stderr":       errStr,
-					"exitCode":     exitCode,
-					"timedOut":     errors.Is(cmdCtx.Err(), context.DeadlineExceeded),
-					"outTruncated": outTruncated || errTruncated || stdout.truncated || stderr.truncated,
+					"cmd":             p.Cmd,
+					"workdir":         p.Workdir,
+					"captureSourceId": captureSourceID,
+					"captureComplete": !stdout.truncated && !stderr.truncated,
+					"stdout":          outStr,
+					"stderr":          errStr,
+					"exitCode":        exitCode,
+					"timedOut":        timedOut,
+					"outTruncated":    outTruncated || errTruncated || stdout.truncated || stderr.truncated,
 				}, nil
 			},
 		},
 	}
+	if execution.BrowserSessions != nil {
+		tools = append(tools, execution.BrowserSessions.Tool())
+	}
+	return tools
+}
+
+func linuxSandboxDescription(taskWorkspaceQuotaBytes int64) string {
+	memoryMiB := domain.CloudTaskSandboxMemoryLimitBytes / (1 << 20)
+	diskDescription := "This workspace has no O-managed per-task disk quota; the host filesystem controls its available space. The private tmpfs memory cap does not limit workspace files."
+	if taskWorkspaceQuotaBytes > 0 {
+		diskDescription = fmt.Sprintf("This cloud execution-task workspace is backed by an ext4/XFS project quota with a hard limit of %d bytes; the kernel rejects writes above that task limit. The quota applies to workspace files, not shared artifact storage, database, or logs. The private tmpfs memory cap remains a separate limit.", taskWorkspaceQuotaBytes)
+	}
+	return fmt.Sprintf("Linux uses Bubblewrap mount, user, PID, IPC, UTS, and network namespaces inside a per-command systemd user-scope cgroup v2 unit. Each command is limited to 100%% CPU (one core), %d MiB memory with swap disabled, 128 processes, and its requested timeout; each private tmpfs mount is capped at the same %d MiB task memory limit. Execution fails closed unless the systemd user manager, delegated cgroup v2 cpu/memory/pids controllers, systemd-run, systemctl, and the Bubblewrap isolation probe are available. The selected workspace is mounted inside the sandbox at /workspace. Host O service configuration and credentials under /etc/o-agent are hidden from sandbox commands. HTTPS Git credentials configured in Settings are brokered over a private per-command Unix socket only for the exact authorized repository; host Git credential helpers are not inherited. Network-enabled commands pin exact requested hostnames to resolved public IPs, use a private /etc/hosts map, and run under systemd IPAddressDeny=any with explicit per-address allows; O probes a loopback connection to verify the cgroup filter before the first such command and fails closed if the probe cannot prove it active. "+diskDescription, memoryMiB, memoryMiB)
+}
+
+const fsReadInlineArchiveBytes int64 = 32 << 20
+
+type streamedTextSnapshot struct {
+	sha256          string
+	totalLines      int64
+	inline          []byte
+	inlineAvailable bool
+	fileInfo        os.FileInfo
+}
+
+// streamTextSnapshot hashes a file without loading it into memory. Small files
+// are retained for inline source archival; larger files remain readable and
+// explicitly report that chunked archival is still required.
+func streamTextSnapshot(ctx context.Context, file *os.File, inlineLimit int64) (streamedTextSnapshot, error) {
+	if file == nil {
+		return streamedTextSnapshot{}, fmt.Errorf("file is required")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return streamedTextSnapshot{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return streamedTextSnapshot{}, fmt.Errorf("file is not a regular file")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return streamedTextSnapshot{}, err
+	}
+	h := sha256.New()
+	var inline []byte
+	inlineAvailable := info.Size() <= inlineLimit
+	if inlineAvailable {
+		inline = make([]byte, 0, info.Size())
+	}
+	buffer := make([]byte, 128*1024)
+	var newlines int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return streamedTextSnapshot{}, err
+		}
+		n, readErr := file.Read(buffer)
+		if n > 0 {
+			if _, err := h.Write(buffer[:n]); err != nil {
+				return streamedTextSnapshot{}, err
+			}
+			for _, value := range buffer[:n] {
+				if value == '\n' {
+					newlines++
+				}
+			}
+			if inlineAvailable {
+				inline = append(inline, buffer[:n]...)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return streamedTextSnapshot{}, readErr
+		}
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return streamedTextSnapshot{}, err
+	}
+	return streamedTextSnapshot{sha256: hex.EncodeToString(h.Sum(nil)), totalLines: newlines + 1, inline: inline, inlineAvailable: inlineAvailable, fileInfo: info}, nil
+}
+
+func readTextPage(ctx context.Context, file *os.File, totalLines int64, offset, limit int, withNumbers bool, maxBytes int) (string, int64, int64, bool, error) {
+	if file == nil || totalLines < 0 || offset < 1 || limit < 1 || maxBytes < 1 {
+		return "", 0, 0, false, fmt.Errorf("invalid text page request")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", 0, 0, false, err
+	}
+	start := int64(offset)
+	if start > totalLines {
+		return "", start, totalLines, false, nil
+	}
+	remainingLines := totalLines - start + 1
+	pageLines := int64(limit)
+	if pageLines > remainingLines {
+		pageLines = remainingLines
+	}
+	requestedEnd := start + pageLines - 1
+	reader := bufio.NewReaderSize(file, 64*1024)
+	var content strings.Builder
+	var lineNo int64 = 1
+	var endLine int64 = start - 1
+	truncated := false
+	for lineNo <= requestedEnd {
+		if err := ctx.Err(); err != nil {
+			return "", 0, 0, false, err
+		}
+		selected := lineNo >= start
+		prefix := ""
+		if selected && withNumbers {
+			prefix = fmt.Sprintf("%6d | ", lineNo)
+		}
+		remaining := maxBytes - content.Len() - len(prefix)
+		if content.Len() > 0 {
+			remaining--
+		}
+		if remaining < 0 {
+			truncated = true
+			break
+		}
+		line, lineTruncated, gotLine, err := readBoundedLine(ctx, reader, remaining, selected)
+		if err != nil {
+			return "", 0, 0, false, err
+		}
+		if !gotLine {
+			if lineNo != totalLines {
+				break
+			}
+			line = []byte{} // Preserve strings.Split's final empty line.
+		}
+		if selected {
+			line = bytes.TrimSuffix(line, []byte{'\r'})
+			if content.Len() > 0 {
+				content.WriteByte('\n')
+			}
+			content.WriteString(prefix)
+			content.Write(line)
+			endLine = lineNo
+			if lineTruncated {
+				truncated = true
+				break
+			}
+		}
+		if !gotLine {
+			break
+		}
+		lineNo++
+	}
+	if endLine < start {
+		endLine = start - 1
+	}
+	return content.String(), start, endLine, truncated, nil
+}
+
+// readBoundedLine drains one line while retaining at most keepBytes. This
+// prevents a very long generated/minified line from causing an unbounded allocation.
+func readBoundedLine(ctx context.Context, reader *bufio.Reader, keepBytes int, retain bool) ([]byte, bool, bool, error) {
+	if keepBytes < 0 {
+		keepBytes = 0
+	}
+	capacity := 0
+	if retain {
+		capacity = min(keepBytes, 64*1024)
+	}
+	line := make([]byte, 0, capacity)
+	truncated := false
+	seen := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, false, false, err
+		}
+		fragment, err := reader.ReadSlice('\n')
+		if len(fragment) > 0 {
+			seen = true
+		}
+		part := fragment
+		complete := err == nil
+		if complete {
+			part = part[:len(part)-1]
+		}
+		if retain && len(part) > 0 {
+			room := keepBytes - len(line)
+			if room > 0 {
+				if room > len(part) {
+					room = len(part)
+				}
+				line = append(line, part[:room]...)
+			}
+			if room < len(part) {
+				truncated = true
+			}
+		}
+		if complete {
+			return line, truncated, true, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			return line, truncated, seen, nil
+		}
+		return nil, false, false, err
+	}
+}
+
+// RunSandboxedCommand executes a host-initiated command through the same
+// backend and filesystem/network policy path used by exec_command. It is for
+// explicit product operations such as cloning a selected repository; model
+// tool arguments must never control the ExecutionConfig.
+func RunSandboxedCommand(ctx context.Context, execution ExecutionConfig, commandPath string, args []string, workdir string, readOnlyPaths, writePaths []string, networkAccess bool, timeout time.Duration) (stdout, stderr string, runErr, cleanupErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(commandPath) == "" || strings.TrimSpace(workdir) == "" {
+		return "", "", errors.New("sandbox command path and working directory are required"), nil
+	}
+	if timeout <= 0 || timeout > 180*time.Second {
+		return "", "", errors.New("sandbox command timeout must be between 1 ms and 180 seconds"), nil
+	}
+	command := exec.CommandContext(ctx, commandPath, args...)
+	command.Dir = workdir
+	stdoutCapture, stderrCapture := cappedBuffer{limit: 1 << 20}, cappedBuffer{limit: 1 << 20}
+	command.Stdout, command.Stderr = &stdoutCapture, &stderrCapture
+	policy := processPolicy{
+		backend: execution.Backend, installDir: execution.InstallDir, runnerPath: execution.RunnerPath,
+		readOnlyPaths: append([]string(nil), readOnlyPaths...), writePaths: append([]string(nil), writePaths...),
+		networkAccess: networkAccess, networkAllowHosts: NetworkHostsFromURLs(execution.GitCredentialURLs), timeout: timeout,
+		gitCredentials:    execution.GitCredentials,
+		gitCredentialURLs: append([]string(nil), execution.GitCredentialURLs...),
+		protectedPaths:    append([]string(nil), execution.ProtectedPaths...),
+	}
+	runErr, cleanupErr = runProcessTree(ctx, command, nil, policy)
+	return stdoutCapture.String(), stderrCapture.String(), runErr, cleanupErr
+}
+
+func NetworkHostsFromURLs(values []string) []string {
+	hosts := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		parsed, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || parsed == nil || parsed.Hostname() == "" {
+			continue
+		}
+		host := strings.ToLower(parsed.Hostname())
+		if _, exists := seen[host]; exists {
+			continue
+		}
+		seen[host] = struct{}{}
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	return hosts
+}
+
+func validateNetworkHostRequest(goos string, networkAccess bool, hosts []string) error {
+	if !networkAccess && len(hosts) > 0 {
+		return errors.New("networkHosts requires networkAccess=true")
+	}
+	if len(hosts) > 32 {
+		return errors.New("networkHosts may list at most 32 destinations")
+	}
+	if goos == "linux" && networkAccess && len(hosts) == 0 {
+		return errors.New("Linux network access requires at least one networkHosts destination or a selected repository remote")
+	}
+	return nil
 }
 
 func processExitCode(err error) (int, bool) {

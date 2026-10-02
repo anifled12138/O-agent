@@ -24,11 +24,11 @@ This package owns conversation turns, context construction, capability scopes, t
 - Agent tools must describe their real authority. Do not advertise a user-only
   approval boundary if the tool can grant or bypass it.
 - Every model tool call must pass through the session policy before
-  `turnScope.execute`. Read-only sessions reject mutations; workspace-auto asks
-  only for host-classified destructive actions and plugin code execution;
-  fully-auto skips per-call permission filtering. Unknown tools are allowed in
-  workspace-auto and fully-auto once available in the runtime. The OS sandbox
-  remains a separate boundary.
+  `turnScope.execute`. Read-only sessions reject mutations; request-approval
+  asks before workspace writes and external access; workspace-auto asks for
+  host-classified destructive actions and plugin code execution; fully-auto
+  skips per-call permission filtering. The OS sandbox remains a separate
+  boundary.
 - Approval requests bind the exact arguments and immutable plugin release shown
   to the user. Do not resolve an approval by looking up a moving `latest` target.
 - Treat tool metrics as evidence for investigation and proposals. They must not

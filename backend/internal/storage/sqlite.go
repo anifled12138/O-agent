@@ -5,15 +5,23 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"axiom.local/agent/internal/domain"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 type Store struct{ db *sql.DB }
+
+type ProviderRecord struct {
+	Provider domain.Provider
+	Cipher   []byte
+	Nonce    []byte
+}
 
 func Open(dataDir string) (*Store, error) {
 	path := filepath.Join(dataDir, "axiom.db")
@@ -28,10 +36,210 @@ func Open(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if _, err := s.PurgeExpiredConversations(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("purge expired deleted conversations: %w", err)
+	}
 	return s, nil
 }
 
+// OpenExisting attaches to an existing database without running migrations or
+// lifecycle cleanup. It is intended for read-only snapshot/backup workflows.
+func OpenExisting(dataDir string) (*Store, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil, domain.ErrInvalid
+	}
+	path, err := filepath.Abs(filepath.Join(dataDir, "axiom.db"))
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("SQLite database path is not a regular file")
+	}
+	dsn := "file:" + filepath.ToSlash(path) + "?mode=rw&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
 func (s *Store) Close() error { return s.db.Close() }
+
+// IntegrityCheck verifies that the attached SQLite database is internally
+// consistent. It is used when validating durable backups and restores.
+func (s *Store) IntegrityCheck(ctx context.Context) (retErr error) {
+	if s == nil || s.db == nil {
+		return domain.ErrInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.db.QueryContext(ctx, `PRAGMA integrity_check`)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, rows.Close()) }()
+	count := 0
+	for rows.Next() {
+		var result string
+		if err := rows.Scan(&result); err != nil {
+			return err
+		}
+		count++
+		if result != "ok" {
+			return fmt.Errorf("SQLite integrity_check returned %q", result)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if count != 1 {
+		return fmt.Errorf("SQLite integrity_check returned %d result rows", count)
+	}
+	return nil
+}
+
+// BackupDatabase creates a new, standalone SQLite snapshot while the live
+// database remains open. The destination must be new; partial destinations
+// are removed on failure so callers cannot mistake them for valid backups.
+func (s *Store) BackupDatabase(ctx context.Context, destination string) (retErr error) {
+	if s == nil || s.db == nil || strings.TrimSpace(destination) == "" {
+		return domain.ErrInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	absolute, err := filepath.Abs(destination)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
+		return err
+	}
+	reserved, err := os.OpenFile(absolute, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := reserved.Close(); err != nil {
+		removeErr := os.Remove(absolute)
+		return errors.Join(err, removeErr, syncStorageDirectory(filepath.Dir(absolute)))
+	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, os.Remove(absolute))
+			retErr = errors.Join(retErr, syncStorageDirectory(filepath.Dir(absolute)))
+		}
+	}()
+
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	rawErr := connection.Raw(func(raw any) (callbackErr error) {
+		source, ok := raw.(interface {
+			NewBackup(string) (*sqlite.Backup, error)
+		})
+		if !ok {
+			return fmt.Errorf("SQLite driver does not support online backups")
+		}
+		backup, err := source.NewBackup(filepath.ToSlash(absolute))
+		if err != nil {
+			return fmt.Errorf("open SQLite online backup: %w", err)
+		}
+		defer func() {
+			if backup != nil {
+				callbackErr = errors.Join(callbackErr, backup.Finish())
+			}
+		}()
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			more, err := backup.Step(128)
+			if err != nil {
+				return fmt.Errorf("copy SQLite online backup pages: %w", err)
+			}
+			if !more {
+				break
+			}
+		}
+		destinationConnection, err := backup.Commit()
+		backup = nil
+		if err != nil {
+			return fmt.Errorf("finalize SQLite online backup: %w", err)
+		}
+		if destinationConnection == nil {
+			return fmt.Errorf("finalize SQLite online backup returned no destination connection")
+		}
+		return destinationConnection.Close()
+	})
+	closeErr := connection.Close()
+	if err := errors.Join(rawErr, closeErr); err != nil {
+		return err
+	}
+	// Windows requires a writable handle for FlushFileBuffers; the file was
+	// created by this backup path, so opening it read/write does not widen the
+	// destination's access beyond its owner-only mode.
+	file, err := os.OpenFile(absolute, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open completed SQLite backup for durability sync: %w", err)
+	}
+	syncErr := file.Sync()
+	closeErr = file.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
+		return fmt.Errorf("sync completed SQLite backup: %w", err)
+	}
+	if err := syncStorageDirectory(filepath.Dir(absolute)); err != nil {
+		return fmt.Errorf("sync SQLite backup directory: %w", err)
+	}
+	if err := verifySQLiteBackup(ctx, absolute); err != nil {
+		return fmt.Errorf("verify completed SQLite backup: %w", err)
+	}
+	return nil
+}
+
+func verifySQLiteBackup(ctx context.Context, path string) (retErr error) {
+	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro&_pragma=query_only(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, db.Close()) }()
+	var status string
+	if err := db.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&status); err != nil {
+		return err
+	}
+	if status != "ok" {
+		return fmt.Errorf("SQLite integrity_check returned %q", status)
+	}
+	return nil
+}
+
+func syncStorageDirectory(directory string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	file, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	return errors.Join(syncErr, closeErr)
+}
 
 func (s *Store) RuntimeSetting(ctx context.Context, key string) (string, error) {
 	var value string
@@ -110,9 +318,111 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS runtime_settings (
  key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS auth_sessions (
+ token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS auth_login_limits (
+ bucket_hash TEXT PRIMARY KEY, window_started_at DATETIME NOT NULL,
+ attempts INTEGER NOT NULL, blocked_until DATETIME, updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
+CREATE TABLE IF NOT EXISTS execution_nodes (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, platform TEXT NOT NULL, capabilities_json BLOB NOT NULL,
+ resources_json BLOB NOT NULL DEFAULT '{}',
+ token_hash TEXT NOT NULL UNIQUE, last_seen DATETIME, revoked_at DATETIME,
+ created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execution_nodes_user ON execution_nodes(user_id, created_at);
+CREATE TABLE IF NOT EXISTS execution_tasks (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ logical_task_id TEXT NOT NULL DEFAULT '', parent_task_id TEXT NOT NULL DEFAULT '', segment_index INTEGER NOT NULL DEFAULT 0,
+ node_id TEXT NOT NULL REFERENCES execution_nodes(id), idempotency_key TEXT NOT NULL,
+ payload_json BLOB NOT NULL, result_json BLOB, status TEXT NOT NULL,
+ attempt INTEGER NOT NULL DEFAULT 0, sequence INTEGER NOT NULL DEFAULT 0,
+ lease_token_hash TEXT NOT NULL DEFAULT '', recovery_lease_token_hash TEXT NOT NULL DEFAULT '', lease_until DATETIME,
+ cancel_requested INTEGER NOT NULL DEFAULT 0, error_text TEXT NOT NULL DEFAULT '',
+ created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+ UNIQUE(user_id,idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_tasks_node_queue ON execution_tasks(node_id,status,created_at);
+CREATE INDEX IF NOT EXISTS idx_execution_tasks_user ON execution_tasks(user_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS execution_task_workspaces (
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ task_id TEXT NOT NULL,
+ source_project_id TEXT NOT NULL DEFAULT '',
+ workdir TEXT NOT NULL,
+ status TEXT NOT NULL,
+ quota_project_id INTEGER NOT NULL DEFAULT 0,
+ quota_limit_bytes INTEGER NOT NULL DEFAULT 0,
+ quota_state TEXT NOT NULL DEFAULT 'not_configured',
+ error_text TEXT NOT NULL DEFAULT '',
+ created_at DATETIME NOT NULL,
+ updated_at DATETIME NOT NULL,
+ PRIMARY KEY(user_id,task_id), UNIQUE(workdir)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_task_workspaces_quota_project
+ ON execution_task_workspaces(quota_project_id) WHERE quota_project_id != 0;
+CREATE TABLE IF NOT EXISTS execution_task_events (
+ task_id TEXT NOT NULL REFERENCES execution_tasks(id) ON DELETE CASCADE,
+ sequence INTEGER NOT NULL, kind TEXT NOT NULL, details_json BLOB NOT NULL,
+ created_at DATETIME NOT NULL, PRIMARY KEY(task_id,sequence)
+);
+CREATE TABLE IF NOT EXISTS artifact_uploads (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ idempotency_key TEXT NOT NULL, file_name TEXT NOT NULL, media_type TEXT NOT NULL,
+ expected_size INTEGER NOT NULL, expected_sha256 TEXT NOT NULL DEFAULT '',
+ chunk_size INTEGER NOT NULL, chunk_count INTEGER NOT NULL,
+ direct_upload INTEGER NOT NULL DEFAULT 0,
+ status TEXT NOT NULL, artifact_id TEXT NOT NULL DEFAULT '',
+ created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+ UNIQUE(user_id,idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS artifact_upload_chunks (
+ upload_id TEXT NOT NULL REFERENCES artifact_uploads(id) ON DELETE CASCADE,
+ chunk_index INTEGER NOT NULL, sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL,
+ created_at DATETIME NOT NULL, PRIMARY KEY(upload_id,chunk_index)
+);
+CREATE TABLE IF NOT EXISTS artifacts (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL,
+ file_name TEXT NOT NULL, media_type TEXT NOT NULL,
+ storage_key TEXT NOT NULL, upload_id TEXT NOT NULL UNIQUE REFERENCES artifact_uploads(id),
+ created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS artifact_share_links (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+ token_hash TEXT NOT NULL UNIQUE, created_at DATETIME NOT NULL,
+ expires_at DATETIME NOT NULL, revoked_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_artifact_share_links_artifact ON artifact_share_links(user_id,artifact_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS execution_task_artifacts (
+ task_id TEXT NOT NULL REFERENCES execution_tasks(id) ON DELETE CASCADE,
+ artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+ role TEXT NOT NULL, created_at DATETIME NOT NULL,
+ PRIMARY KEY(task_id,artifact_id,role)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_task_artifacts_artifact ON execution_task_artifacts(artifact_id);
+CREATE TABLE IF NOT EXISTS execution_task_handoff_checkpoints (
+ task_id TEXT PRIMARY KEY REFERENCES execution_tasks(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ node_id TEXT NOT NULL REFERENCES execution_nodes(id),
+ artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+ artifact_sha256 TEXT NOT NULL, artifact_byte_size INTEGER NOT NULL,
+ source_turn_id TEXT NOT NULL, source_conversation_id TEXT NOT NULL, source_input_message_id TEXT NOT NULL,
+ provider_id TEXT NOT NULL, generation_id TEXT NOT NULL, definition_digest TEXT NOT NULL,
+ permission_profile TEXT NOT NULL, project_id TEXT NOT NULL DEFAULT '', project_commit TEXT NOT NULL DEFAULT '',
+ content_sha256 TEXT NOT NULL, checkpoint_version INTEGER NOT NULL,
+ state_cipher BLOB NOT NULL, state_nonce BLOB NOT NULL,
+ created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+);
 CREATE TABLE IF NOT EXISTS providers (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL,
  kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, context_window INTEGER NOT NULL DEFAULT 0,
+ supports_vision INTEGER NULL DEFAULT NULL,
  api_key_cipher BLOB NOT NULL, api_key_nonce BLOB NOT NULL,
  created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
  UNIQUE(user_id, name)
@@ -125,12 +435,25 @@ CREATE TABLE IF NOT EXISTS projects (
  created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS project_publications (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+ idempotency_key TEXT NOT NULL, target_branch TEXT NOT NULL,
+ expected_remote_sha TEXT NOT NULL DEFAULT '', commit_sha TEXT NOT NULL,
+ remote_sha TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+ error_text TEXT NOT NULL DEFAULT '', submodules_json BLOB NOT NULL DEFAULT '[]', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+ UNIQUE(user_id,idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_project_publications_project ON project_publications(user_id,project_id,created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_publications_active_branch ON project_publications(user_id,project_id,target_branch) WHERE status IN ('publishing','needs_reconciliation');
 CREATE TABLE IF NOT EXISTS conversations (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), title TEXT NOT NULL,
  provider_id TEXT NOT NULL REFERENCES providers(id), project_id TEXT NOT NULL DEFAULT '',
  permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous',
  parent_conversation_id TEXT NOT NULL DEFAULT '', branch_from_message_id TEXT NOT NULL DEFAULT '',
  execution_paused INTEGER NOT NULL DEFAULT 0,
+ restore_execution_paused INTEGER NOT NULL DEFAULT 0,
+ deleted_at DATETIME, recover_until DATETIME,
  created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
@@ -139,6 +462,39 @@ CREATE TABLE IF NOT EXISTS messages (
  role TEXT NOT NULL, content TEXT NOT NULL, created_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
+CREATE TABLE IF NOT EXISTS context_sources (
+ conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ source_id TEXT NOT NULL, source_type TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+ content_cipher BLOB NOT NULL, content_nonce BLOB NOT NULL, created_at DATETIME NOT NULL,
+ PRIMARY KEY(conversation_id, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_context_sources_user ON context_sources(user_id, conversation_id, source_type);
+CREATE TABLE IF NOT EXISTS context_compaction_states (
+ conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ state_version INTEGER NOT NULL, strategy TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '',
+ model TEXT NOT NULL DEFAULT '', protocol_version TEXT NOT NULL DEFAULT '',
+ canonical_source_id TEXT NOT NULL, covered_sources_json BLOB NOT NULL,
+	tokens_at_last_compaction INTEGER NOT NULL DEFAULT 0,
+	updated_at DATETIME NOT NULL,
+ FOREIGN KEY(conversation_id, canonical_source_id) REFERENCES context_sources(conversation_id, source_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_context_compaction_states_user ON context_compaction_states(user_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS conversation_context_tails (
+ conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ source_ids_json BLOB NOT NULL, updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_context_tails_user ON conversation_context_tails(user_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS context_summary_cache (
+ conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ cache_key TEXT NOT NULL, config_sha256 TEXT NOT NULL, source_refs_json BLOB NOT NULL,
+ content_sha256 TEXT NOT NULL, content_cipher BLOB NOT NULL, content_nonce BLOB NOT NULL,
+ created_at DATETIME NOT NULL, PRIMARY KEY(conversation_id, cache_key)
+);
+CREATE INDEX IF NOT EXISTS idx_context_summary_cache_user ON context_summary_cache(user_id, conversation_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS agent_trace_events (
  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), turn_id TEXT NOT NULL,
  sequence INTEGER NOT NULL, kind TEXT NOT NULL, details_json BLOB NOT NULL, created_at DATETIME NOT NULL,
@@ -152,6 +508,8 @@ CREATE TABLE IF NOT EXISTS agent_turns (
  generation_id TEXT NOT NULL, definition_digest TEXT NOT NULL,
  permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous',
  retry_of_turn_id TEXT NOT NULL DEFAULT '', input_content_snapshot TEXT NOT NULL DEFAULT '', inbox_id TEXT NOT NULL DEFAULT '',
+ continued_from_turn_id TEXT NOT NULL DEFAULT '',
+ continuation_chain_id TEXT NOT NULL DEFAULT '',
  status TEXT NOT NULL, stop_reason TEXT NOT NULL DEFAULT '', recovery_class TEXT NOT NULL DEFAULT '',
  cancel_requested INTEGER NOT NULL DEFAULT 0, last_sequence INTEGER NOT NULL DEFAULT 0,
  started_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, completed_at DATETIME
@@ -188,6 +546,12 @@ CREATE TABLE IF NOT EXISTS agent_turn_reconciliations (
  decision TEXT NOT NULL, note TEXT NOT NULL, created_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_turn_reconciliations_user ON agent_turn_reconciliations(user_id,conversation_id,created_at);
+CREATE TABLE IF NOT EXISTS agent_turn_reconciliation_events (
+ id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id), conversation_id TEXT NOT NULL REFERENCES conversations(id),
+ decision TEXT NOT NULL, note TEXT NOT NULL, created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_turn_reconciliation_events_turn ON agent_turn_reconciliation_events(user_id,turn_id,created_at,id);
 CREATE TABLE IF NOT EXISTS conversation_lifecycle_events (
  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
  kind TEXT NOT NULL, details_json BLOB NOT NULL DEFAULT '{}', created_at DATETIME NOT NULL
@@ -215,6 +579,18 @@ CREATE TABLE IF NOT EXISTS agent_turn_checkpoints (
  event_sequence INTEGER NOT NULL,
  updated_at DATETIME NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agent_continuation_snapshots (
+ source_turn_id TEXT PRIMARY KEY REFERENCES agent_turns(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ snapshot_version INTEGER NOT NULL,
+ state_cipher BLOB NOT NULL DEFAULT X'', state_nonce BLOB NOT NULL DEFAULT X'',
+ content_sha256 TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+ unavailable_reason TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '',
+ consumed_turn_id TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_continuation_idempotency
+ ON agent_continuation_snapshots(user_id,source_turn_id,idempotency_key) WHERE idempotency_key<>'';
 CREATE TABLE IF NOT EXISTS agent_definitions (
  user_id TEXT NOT NULL REFERENCES users(id), digest TEXT NOT NULL,
  api_version TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL,
@@ -263,30 +639,78 @@ CREATE INDEX IF NOT EXISTS idx_eval_trials_experiment ON eval_trials(experiment_
 	if err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO agent_turn_reconciliation_events(id,turn_id,user_id,conversation_id,decision,note,created_at)
+SELECT current.id,current.turn_id,current.user_id,current.conversation_id,current.decision,current.note,current.created_at
+FROM agent_turn_reconciliations current
+WHERE NOT EXISTS (SELECT 1 FROM agent_turn_reconciliation_events event WHERE event.turn_id=current.turn_id AND event.user_id=current.user_id)`); err != nil {
+		return fmt.Errorf("backfill agent turn reconciliation audit events: %w", err)
+	}
 	for _, migration := range []string{
 		`ALTER TABLE conversations ADD COLUMN project_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE conversations ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous'`,
 		`ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE conversations ADD COLUMN branch_from_message_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE conversations ADD COLUMN execution_paused INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE conversations ADD COLUMN restore_execution_paused INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE conversations ADD COLUMN deleted_at DATETIME`,
+		`ALTER TABLE conversations ADD COLUMN recover_until DATETIME`,
 		`ALTER TABLE agent_turns ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous'`,
 		`ALTER TABLE agent_turns ADD COLUMN retry_of_turn_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE agent_turns ADD COLUMN input_content_snapshot TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE agent_turns ADD COLUMN inbox_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agent_turns ADD COLUMN continued_from_turn_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agent_turns ADD COLUMN continuation_chain_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE projects ADD COLUMN instructions_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE projects ADD COLUMN remote_repo_url TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE projects ADD COLUMN remote_branch TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE projects ADD COLUMN repository_provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE projects ADD COLUMN resolved_commit TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE projects ADD COLUMN measured_bytes INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE providers ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE providers ADD COLUMN supports_vision INTEGER NULL DEFAULT NULL`,
 		`ALTER TABLE agent_approvals ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'workspace_autonomous'`,
 		`ALTER TABLE agent_approvals ADD COLUMN impact TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE agent_approvals ADD COLUMN plugin_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE agent_approvals ADD COLUMN release_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE eval_trials ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'`,
 		`ALTER TABLE eval_trials ADD COLUMN failure_class TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE context_compaction_states ADD COLUMN tokens_at_last_compaction INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE execution_nodes ADD COLUMN resources_json BLOB NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE execution_tasks ADD COLUMN recovery_lease_token_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE execution_tasks ADD COLUMN recovery_result_json BLOB`,
+		`ALTER TABLE execution_tasks ADD COLUMN handoff_requested INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE execution_tasks ADD COLUMN logical_task_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE execution_tasks ADD COLUMN parent_task_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE execution_tasks ADD COLUMN segment_index INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE project_publications ADD COLUMN submodules_json BLOB NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE artifact_uploads ADD COLUMN direct_upload INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, migrationErr := s.db.ExecContext(ctx, migration); migrationErr != nil && !strings.Contains(strings.ToLower(migrationErr.Error()), "duplicate column name") {
 			return migrationErr
 		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE execution_tasks SET logical_task_id=id WHERE logical_task_id='';
+CREATE INDEX IF NOT EXISTS idx_execution_tasks_logical_task ON execution_tasks(user_id,logical_task_id,segment_index,created_at);`); err != nil {
+		return fmt.Errorf("backfill execution task lineage: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_conversations_recovery ON conversations(user_id, deleted_at, recover_until);
+CREATE TRIGGER IF NOT EXISTS trg_conversations_purge_children BEFORE DELETE ON conversations BEGIN
+ DELETE FROM agent_approvals WHERE conversation_id=OLD.id;
+ DELETE FROM agent_inbox WHERE conversation_id=OLD.id;
+ DELETE FROM conversation_lifecycle_events WHERE conversation_id=OLD.id;
+ DELETE FROM agent_trace_events WHERE conversation_id=OLD.id;
+ DELETE FROM agent_turn_reconciliations WHERE conversation_id=OLD.id;
+ DELETE FROM agent_turn_reconciliation_events WHERE conversation_id=OLD.id;
+ DELETE FROM conversation_agent_bindings WHERE conversation_id=OLD.id;
+ DELETE FROM message_revisions WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=OLD.id)
+   OR revised_by_turn_id IN (SELECT id FROM agent_turns WHERE conversation_id=OLD.id);
+ DELETE FROM agent_model_attempts WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversation_id=OLD.id);
+ DELETE FROM agent_steps WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversation_id=OLD.id);
+ DELETE FROM agent_turn_checkpoints WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversation_id=OLD.id);
+ DELETE FROM agent_turns WHERE conversation_id=OLD.id;
+ DELETE FROM messages WHERE conversation_id=OLD.id;
+END;`); err != nil {
+		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_agent_turns_one_active;
 CREATE UNIQUE INDEX idx_agent_turns_one_active ON agent_turns(conversation_id) WHERE status IN ('running','cancelling','awaiting_approval');`); err != nil {
@@ -302,22 +726,110 @@ WHERE recovery_class='' AND status IN ('completed','failed','cancelled','interru
 	if err := s.reclassifyLegacyReadOnlyTurns(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateConversationPermissionProfiles(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateLegacyReconciliationStatuses(ctx); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *Store) migrateLegacyReconciliationStatuses(ctx context.Context) error {
+// migrateConversationPermissionProfiles keeps existing workspace-autonomous
+// conversations on the more cautious request-approval profile while the new
+// workspace-autonomous profile adopts its clarified behavior.
+// It runs once: new conversations using workspace_autonomous must not be
+// rewritten on later startups.
+func (s *Store) migrateConversationPermissionProfiles(ctx context.Context) error {
+	const migrationKey = "migration.permission_profiles.request_approval.v1"
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var applied string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, migrationKey).Scan(&applied)
+	if err == nil {
+		if applied != "complete" {
+			return fmt.Errorf("permission profile migration has unexpected state %q", applied)
+		}
+		return tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	for _, table := range []string{"conversations", "agent_turns", "agent_approvals"} {
+		if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET permission_profile='request_approval' WHERE permission_profile='workspace_autonomous'`); err != nil {
+			return fmt.Errorf("migrate existing workspace-autonomous %s: %w", table, err)
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET permission_profile='workspace_autonomous' WHERE permission_profile='ask_on_sensitive'`); err != nil {
+			return fmt.Errorf("migrate legacy sensitive-approval %s: %w", table, err)
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO runtime_settings(key,value) VALUES(?, 'complete')`, migrationKey); err != nil {
+		return fmt.Errorf("record permission profile migration: %w", err)
+	}
+	var legacySensitiveProfiles int
+	for _, table := range []string{"conversations", "agent_turns", "agent_approvals"} {
+		var remaining int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table+` WHERE permission_profile='ask_on_sensitive'`).Scan(&remaining); err != nil {
+			return err
+		}
+		legacySensitiveProfiles += remaining
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, migrationKey).Scan(&applied); err != nil {
+		return err
+	}
+	if legacySensitiveProfiles != 0 || applied != "complete" {
+		return fmt.Errorf("permission profile migration read-back mismatch: legacy_profiles=%d state=%q", legacySensitiveProfiles, applied)
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if err = s.db.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, migrationKey).Scan(&applied); err != nil {
+		return err
+	}
+	if applied != "complete" {
+		return fmt.Errorf("permission profile migration state read-back mismatch: %q", applied)
+	}
+	return nil
+}
+
+func (s *Store) migrateLegacyReconciliationStatuses(ctx context.Context) error {
+	const migrationKey = "migration.needs_reconciliation_status.v1"
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var applied string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, migrationKey).Scan(&applied)
+	if err == nil {
+		if applied != "complete" {
+			return fmt.Errorf("legacy reconciliation migration has unexpected state %q", applied)
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		var persisted string
+		if err := s.db.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, migrationKey).Scan(&persisted); err != nil {
+			return err
+		}
+		if persisted != "complete" {
+			return fmt.Errorf("legacy reconciliation migration persistence mismatch: %q", persisted)
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE agent_turns SET status='interrupted' WHERE status='needs_reconciliation'`); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE agent_inbox SET status='interrupted' WHERE status='needs_reconciliation'`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runtime_settings(key,value) VALUES(?, 'complete')`, migrationKey); err != nil {
 		return err
 	}
 	var remainingTurns, remainingInbox int
@@ -330,6 +842,12 @@ func (s *Store) migrateLegacyReconciliationStatuses(ctx context.Context) error {
 	if remainingTurns != 0 || remainingInbox != 0 {
 		return fmt.Errorf("legacy interrupted turn migration read-back failed: turns=%d inbox=%d", remainingTurns, remainingInbox)
 	}
+	if err := tx.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, migrationKey).Scan(&applied); err != nil {
+		return err
+	}
+	if applied != "complete" {
+		return fmt.Errorf("legacy reconciliation migration read-back mismatch: %q", applied)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -341,6 +859,12 @@ func (s *Store) migrateLegacyReconciliationStatuses(ctx context.Context) error {
 	}
 	if remainingTurns != 0 || remainingInbox != 0 {
 		return fmt.Errorf("legacy interrupted turn migration did not persist: turns=%d inbox=%d", remainingTurns, remainingInbox)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM runtime_settings WHERE key=?`, migrationKey).Scan(&applied); err != nil {
+		return err
+	}
+	if applied != "complete" {
+		return fmt.Errorf("legacy reconciliation migration persistence mismatch: %q", applied)
 	}
 	return nil
 }
@@ -388,15 +912,47 @@ func (s *Store) EnsureLocalWorkspaceOwner(ctx context.Context) (string, error) {
 }
 
 func (s *Store) UpsertProvider(ctx context.Context, p domain.Provider, cipher, nonce []byte) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO providers(id,user_id,name,kind,base_url,model,context_window,api_key_cipher,api_key_nonce,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.UserID, p.Name, p.Kind, p.BaseURL, p.Model, p.ContextWindow, cipher, nonce, p.CreatedAt, p.UpdatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO providers(id,user_id,name,kind,base_url,model,context_window,supports_vision,api_key_cipher,api_key_nonce,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.UserID, p.Name, p.Kind, p.BaseURL, p.Model, p.ContextWindow, nullableVision(p.SupportsVision), cipher, nonce, p.CreatedAt, p.UpdatedAt)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return domain.ErrConflict
 	}
 	return err
 }
 
+func (s *Store) CreateProviders(ctx context.Context, records []ProviderRecord) error {
+	if len(records) == 0 {
+		return domain.ErrInvalid
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, record := range records {
+		p := record.Provider
+		_, err = tx.ExecContext(ctx, `INSERT INTO providers(id,user_id,name,kind,base_url,model,context_window,supports_vision,api_key_cipher,api_key_nonce,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.UserID, p.Name, p.Kind, p.BaseURL, p.Model, p.ContextWindow, nullableVision(p.SupportsVision), record.Cipher, record.Nonce, p.CreatedAt, p.UpdatedAt)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "unique") {
+				return domain.ErrConflict
+			}
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func nullableVision(vision *bool) any {
+	if vision == nil {
+		return nil
+	}
+	return *vision
+}
+
 func (s *Store) UpdateProvider(ctx context.Context, p domain.Provider, cipher, nonce []byte) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,kind=?,base_url=?,model=?,context_window=?,api_key_cipher=?,api_key_nonce=?,updated_at=? WHERE id=? AND user_id=?`, p.Name, p.Kind, p.BaseURL, p.Model, p.ContextWindow, cipher, nonce, p.UpdatedAt, p.ID, p.UserID)
+	result, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,kind=?,base_url=?,model=?,context_window=?,supports_vision=?,api_key_cipher=?,api_key_nonce=?,updated_at=? WHERE id=? AND user_id=?`, p.Name, p.Kind, p.BaseURL, p.Model, p.ContextWindow, nullableVision(p.SupportsVision), cipher, nonce, p.UpdatedAt, p.ID, p.UserID)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return domain.ErrConflict
 	}
@@ -414,7 +970,7 @@ func (s *Store) UpdateProvider(ctx context.Context, p domain.Provider, cipher, n
 }
 
 func (s *Store) ListProviders(ctx context.Context, userID string) ([]domain.Provider, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,kind,base_url,model,context_window,length(api_key_cipher)>0,created_at,updated_at FROM providers WHERE user_id=? ORDER BY updated_at DESC`, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,kind,base_url,model,context_window,supports_vision,length(api_key_cipher)>0,created_at,updated_at FROM providers WHERE user_id=? ORDER BY updated_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -422,9 +978,11 @@ func (s *Store) ListProviders(ctx context.Context, userID string) ([]domain.Prov
 	result := []domain.Provider{}
 	for rows.Next() {
 		var p domain.Provider
-		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &p.ContextWindow, &p.HasAPIKey, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		var vision sql.NullInt64
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &p.ContextWindow, &vision, &p.HasAPIKey, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
+		p.SupportsVision = visionPointer(vision)
 		result = append(result, p)
 	}
 	return result, rows.Err()
@@ -433,12 +991,22 @@ func (s *Store) ListProviders(ctx context.Context, userID string) ([]domain.Prov
 func (s *Store) ProviderSecret(ctx context.Context, userID, id string) (domain.Provider, []byte, []byte, error) {
 	var p domain.Provider
 	var cipher, nonce []byte
-	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,name,kind,base_url,model,context_window,api_key_cipher,api_key_nonce,created_at,updated_at FROM providers WHERE id=? AND user_id=?`, id, userID).Scan(&p.ID, &p.UserID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &p.ContextWindow, &cipher, &nonce, &p.CreatedAt, &p.UpdatedAt)
+	var vision sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,name,kind,base_url,model,context_window,supports_vision,api_key_cipher,api_key_nonce,created_at,updated_at FROM providers WHERE id=? AND user_id=?`, id, userID).Scan(&p.ID, &p.UserID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &p.ContextWindow, &vision, &cipher, &nonce, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, nil, nil, domain.ErrNotFound
 	}
+	p.SupportsVision = visionPointer(vision)
 	p.HasAPIKey = len(cipher) > 0
 	return p, cipher, nonce, err
+}
+
+func visionPointer(vision sql.NullInt64) *bool {
+	if !vision.Valid {
+		return nil
+	}
+	value := vision.Int64 != 0
+	return &value
 }
 
 func (s *Store) CreateConversation(ctx context.Context, c domain.Conversation) error {
@@ -487,7 +1055,10 @@ SELECT ?,?,?,?,? FROM agent_generations WHERE id=? AND user_id=? AND definition_
 }
 
 func (s *Store) ListConversations(ctx context.Context, userID string) ([]domain.Conversation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.permission_profile,COALESCE(c.parent_conversation_id,''),COALESCE(c.branch_from_message_id,''),c.execution_paused,c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.user_id=? ORDER BY c.updated_at DESC`, userID)
+	if _, err := s.PurgeExpiredConversations(ctx); err != nil {
+		return nil, fmt.Errorf("purge expired deleted conversations before list: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.permission_profile,COALESCE(c.parent_conversation_id,''),COALESCE(c.branch_from_message_id,''),c.execution_paused,c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.user_id=? AND c.deleted_at IS NULL ORDER BY c.updated_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -507,7 +1078,7 @@ func (s *Store) UpdateConversationPermissionProfile(ctx context.Context, userID,
 	if !profile.Valid() {
 		return domain.ErrInvalid
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET permission_profile=?,updated_at=? WHERE id=? AND user_id=?`, profile, time.Now().UTC(), id, userID)
+	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET permission_profile=?,updated_at=? WHERE id=? AND user_id=? AND deleted_at IS NULL`, profile, time.Now().UTC(), id, userID)
 	if err != nil {
 		return err
 	}
@@ -527,7 +1098,7 @@ func (s *Store) UpdateConversationTitle(ctx context.Context, userID, id, title s
 		return domain.ErrInvalid
 	}
 	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET title=?, updated_at=? WHERE id=? AND (user_id=? OR ?='')`, title, now, id, userID, userID)
+	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET title=?, updated_at=? WHERE id=? AND deleted_at IS NULL AND (user_id=? OR ?='')`, title, now, id, userID, userID)
 	if err != nil {
 		return err
 	}
@@ -551,7 +1122,7 @@ func (s *Store) UpdateConversationProject(ctx context.Context, userID, id, proje
 		}
 	}
 	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET project_id=?, updated_at=? WHERE id=? AND (user_id=? OR ?='')`, projectID, now, id, userID, userID)
+	result, err := s.db.ExecContext(ctx, `UPDATE conversations SET project_id=?, updated_at=? WHERE id=? AND deleted_at IS NULL AND (user_id=? OR ?='')`, projectID, now, id, userID, userID)
 	if err != nil {
 		return err
 	}
@@ -574,13 +1145,54 @@ func (s *Store) CreateProject(ctx context.Context, p domain.Project) error {
 	if p.InstructionsEnabled {
 		instrEnabled = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO projects(id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		p.ID, p.UserID, p.Name, p.Instructions, instrEnabled, p.Workdir, p.RemoteRepoURL, p.RemoteBranch, p.CreatedAt, p.UpdatedAt)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := ensureProjectWorkdirNotReleasing(ctx, tx, p.Workdir); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO projects(id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,repository_provider,resolved_commit,measured_bytes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.ID, p.UserID, p.Name, p.Instructions, instrEnabled, p.Workdir, p.RemoteRepoURL, p.RemoteBranch, p.RepositoryProvider, p.ResolvedCommit, p.MeasuredBytes, p.CreatedAt, p.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	persisted, err := projectTx(ctx, tx, p.UserID, p.ID)
+	if err != nil {
+		return err
+	}
+	if !sameProjectSource(persisted, p) {
+		return fmt.Errorf("created project read-back mismatch: %w", domain.ErrConflict)
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	readBack, err := s.Project(ctx, p.UserID, p.ID)
+	if err != nil {
+		return err
+	}
+	if !sameProjectSource(readBack, p) {
+		return fmt.Errorf("created project durable read-back mismatch: %w", domain.ErrConflict)
+	}
+	return nil
+}
+
+func projectTx(ctx context.Context, tx *sql.Tx, userID, id string) (domain.Project, error) {
+	var p domain.Project
+	var instructionsEnabled int
+	err := tx.QueryRowContext(ctx, `SELECT id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,repository_provider,resolved_commit,measured_bytes,created_at,updated_at FROM projects WHERE id=? AND user_id=?`, id, userID).
+		Scan(&p.ID, &p.UserID, &p.Name, &p.Instructions, &instructionsEnabled, &p.Workdir, &p.RemoteRepoURL, &p.RemoteBranch, &p.RepositoryProvider, &p.ResolvedCommit, &p.MeasuredBytes, &p.CreatedAt, &p.UpdatedAt)
+	p.InstructionsEnabled = instructionsEnabled != 0
+	return p, err
+}
+
+func sameProjectSource(a, b domain.Project) bool {
+	return a.ID == b.ID && a.UserID == b.UserID && a.Name == strings.TrimSpace(b.Name) && a.Instructions == b.Instructions && a.InstructionsEnabled == b.InstructionsEnabled && a.Workdir == b.Workdir && a.RemoteRepoURL == b.RemoteRepoURL && a.RemoteBranch == b.RemoteBranch && a.RepositoryProvider == b.RepositoryProvider && a.ResolvedCommit == b.ResolvedCommit && a.MeasuredBytes == b.MeasuredBytes
 }
 
 func (s *Store) ListProjects(ctx context.Context, userID string) ([]domain.Project, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,created_at,updated_at FROM projects WHERE user_id=? ORDER BY updated_at DESC`, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,repository_provider,resolved_commit,measured_bytes,created_at,updated_at FROM projects WHERE user_id=? ORDER BY updated_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -589,7 +1201,7 @@ func (s *Store) ListProjects(ctx context.Context, userID string) ([]domain.Proje
 	for rows.Next() {
 		var p domain.Project
 		var instrEnabled int
-		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Instructions, &instrEnabled, &p.Workdir, &p.RemoteRepoURL, &p.RemoteBranch, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Instructions, &instrEnabled, &p.Workdir, &p.RemoteRepoURL, &p.RemoteBranch, &p.RepositoryProvider, &p.ResolvedCommit, &p.MeasuredBytes, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		p.InstructionsEnabled = instrEnabled != 0
@@ -601,8 +1213,8 @@ func (s *Store) ListProjects(ctx context.Context, userID string) ([]domain.Proje
 func (s *Store) Project(ctx context.Context, userID, id string) (domain.Project, error) {
 	var p domain.Project
 	var instrEnabled int
-	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,created_at,updated_at FROM projects WHERE id=? AND user_id=?`, id, userID).
-		Scan(&p.ID, &p.UserID, &p.Name, &p.Instructions, &instrEnabled, &p.Workdir, &p.RemoteRepoURL, &p.RemoteBranch, &p.CreatedAt, &p.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,name,instructions,instructions_enabled,workdir,remote_repo_url,remote_branch,repository_provider,resolved_commit,measured_bytes,created_at,updated_at FROM projects WHERE id=? AND user_id=?`, id, userID).
+		Scan(&p.ID, &p.UserID, &p.Name, &p.Instructions, &instrEnabled, &p.Workdir, &p.RemoteRepoURL, &p.RemoteBranch, &p.RepositoryProvider, &p.ResolvedCommit, &p.MeasuredBytes, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, domain.ErrNotFound
 	}
@@ -620,8 +1232,16 @@ func (s *Store) UpdateProject(ctx context.Context, userID string, p domain.Proje
 		instrEnabled = 1
 	}
 	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `UPDATE projects SET name=?, instructions=?, instructions_enabled=?, workdir=?, remote_repo_url=?, remote_branch=?, updated_at=? WHERE id=? AND (user_id=? OR ?='')`,
-		p.Name, p.Instructions, instrEnabled, p.Workdir, p.RemoteRepoURL, p.RemoteBranch, now, p.ID, userID, userID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := ensureProjectWorkdirNotReleasing(ctx, tx, p.Workdir); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE projects SET name=?, instructions=?, instructions_enabled=?, workdir=?, remote_repo_url=?, remote_branch=?, repository_provider=?, resolved_commit=?, measured_bytes=?, updated_at=? WHERE id=? AND (user_id=? OR ?='')`,
+		p.Name, p.Instructions, instrEnabled, p.Workdir, p.RemoteRepoURL, p.RemoteBranch, p.RepositoryProvider, p.ResolvedCommit, p.MeasuredBytes, now, p.ID, userID, userID)
 	if err != nil {
 		return err
 	}
@@ -631,6 +1251,38 @@ func (s *Store) UpdateProject(ctx context.Context, userID string, p domain.Proje
 	}
 	if rows == 0 {
 		return domain.ErrNotFound
+	}
+	p.UserID = userID
+	persisted, err := projectTx(ctx, tx, userID, p.ID)
+	if err != nil {
+		return err
+	}
+	if !sameProjectSource(persisted, p) {
+		return fmt.Errorf("updated project read-back mismatch: %w", domain.ErrConflict)
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	readBack, err := s.Project(ctx, userID, p.ID)
+	if err != nil {
+		return err
+	}
+	if !sameProjectSource(readBack, p) {
+		return fmt.Errorf("updated project durable read-back mismatch: %w", domain.ErrConflict)
+	}
+	return nil
+}
+
+func ensureProjectWorkdirNotReleasing(ctx context.Context, tx *sql.Tx, workdir string) error {
+	if strings.TrimSpace(workdir) == "" || !filepath.IsAbs(workdir) {
+		return nil
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM execution_task_workspaces WHERE workdir=? AND status IN ('releasing','released')`, filepath.Clean(workdir)).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("project cannot reference a task workspace during or after release: %w", domain.ErrConflict)
 	}
 	return nil
 }
@@ -668,7 +1320,7 @@ func (s *Store) DeleteProject(ctx context.Context, userID, id string) error {
 
 func (s *Store) Conversation(ctx context.Context, userID, id string) (domain.ConversationDetail, error) {
 	var d domain.ConversationDetail
-	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.permission_profile,COALESCE(c.parent_conversation_id,''),COALESCE(c.branch_from_message_id,''),c.execution_paused,c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.id=? AND c.user_id=?`, id, userID).Scan(&d.ID, &d.UserID, &d.Title, &d.ProviderID, &d.AgentGenerationID, &d.AgentDefinitionDigest, &d.ProjectID, &d.PermissionProfile, &d.ParentConversationID, &d.BranchFromMessageID, &d.ExecutionPaused, &d.CreatedAt, &d.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.user_id,c.title,c.provider_id,COALESCE(b.generation_id,''),COALESCE(b.definition_digest,''),COALESCE(c.project_id,''),c.permission_profile,COALESCE(c.parent_conversation_id,''),COALESCE(c.branch_from_message_id,''),c.execution_paused,c.created_at,c.updated_at FROM conversations c LEFT JOIN conversation_agent_bindings b ON b.conversation_id=c.id WHERE c.id=? AND c.user_id=? AND c.deleted_at IS NULL`, id, userID).Scan(&d.ID, &d.UserID, &d.Title, &d.ProviderID, &d.AgentGenerationID, &d.AgentDefinitionDigest, &d.ProjectID, &d.PermissionProfile, &d.ParentConversationID, &d.BranchFromMessageID, &d.ExecutionPaused, &d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, domain.ErrNotFound
 	}
@@ -713,7 +1365,7 @@ func (s *Store) Conversation(ctx context.Context, userID, id string) (domain.Con
 }
 
 func (s *Store) AddMessage(ctx context.Context, userID string, m domain.Message) error {
-	result, err := s.db.ExecContext(ctx, `INSERT INTO messages(id,conversation_id,role,content,created_at) SELECT ?,?,?,?,? FROM conversations WHERE id=? AND user_id=?`, m.ID, m.ConversationID, m.Role, m.Content, m.CreatedAt, m.ConversationID, userID)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO messages(id,conversation_id,role,content,created_at) SELECT ?,?,?,?,? FROM conversations WHERE id=? AND user_id=? AND deleted_at IS NULL`, m.ID, m.ConversationID, m.Role, m.Content, m.CreatedAt, m.ConversationID, userID)
 	if err != nil {
 		return err
 	}
@@ -726,7 +1378,7 @@ func (s *Store) AddMessage(ctx context.Context, userID string, m domain.Message)
 }
 
 func (s *Store) AddTraceEvent(ctx context.Context, userID string, event domain.TraceEvent) error {
-	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) SELECT ?,?,?,?,?,?,? FROM conversations WHERE id=? AND user_id=?`, event.ID, event.ConversationID, event.TurnID, event.Sequence, event.Kind, []byte(event.Details), event.CreatedAt, event.ConversationID, userID)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) SELECT ?,?,?,?,?,?,? FROM conversations WHERE id=? AND user_id=? AND deleted_at IS NULL`, event.ID, event.ConversationID, event.TurnID, event.Sequence, event.Kind, []byte(event.Details), event.CreatedAt, event.ConversationID, userID)
 	if err != nil {
 		return err
 	}

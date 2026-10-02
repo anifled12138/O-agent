@@ -3,7 +3,9 @@ module axiom.local/agent
 go 1.27.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/dop251/goja v0.0.0-20260911104922-fabc3b8078ad
+	github.com/mark3labs/mcp-go v0.8.5
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.57.0
 )
@@ -14,7 +16,6 @@ require (
 	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/mark3labs/mcp-go v0.8.5 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect

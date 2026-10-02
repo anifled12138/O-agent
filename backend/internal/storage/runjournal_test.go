@@ -2,10 +2,13 @@ package storage_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +24,8 @@ func TestRunJournalCommitsInputEventsAndOutputAtomically(t *testing.T) {
 	now := time.Now().UTC()
 	input := domain.Message{ID: "msg_input", ConversationID: conversation.ID, Role: "user", Content: "work", CreatedAt: now}
 	turn := domain.AgentTurn{ID: "turn_atomic", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
-	if err := store.StartAgentTurn(ctx, userID, turn, input, json.RawMessage(`{"generationId":"gen"}`)); err != nil {
+	startDetails, _ := json.Marshal(map[string]string{"generationId": "gen", "inputSourceRef": runJournalMessageSourceID(input.ID, input.Content)})
+	if err := store.StartAgentTurn(ctx, userID, turn, input, startDetails); err != nil {
 		t.Fatal(err)
 	}
 
@@ -42,7 +46,7 @@ func TestRunJournalCommitsInputEventsAndOutputAtomically(t *testing.T) {
 	if err := store.AppendTurnEvent(ctx, userID, turn.ID, "model.completed", json.RawMessage(`{"step":1,"model":"fake","usage":{"totalTokens":7}}`), now.Add(3*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	output := domain.Message{ID: "msg_output", ConversationID: conversation.ID, Role: "assistant", Content: "done", CreatedAt: now.Add(4 * time.Second)}
+	output := domain.Message{ID: "msg_output", ConversationID: conversation.ID, Role: "assistant", Content: "All tests passed.", CreatedAt: now.Add(4 * time.Second)}
 	if err := store.FinishAgentTurn(ctx, userID, turn.ID, "completed", "assistant_response", &output, json.RawMessage(`{"ok":true}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +54,12 @@ func TestRunJournalCommitsInputEventsAndOutputAtomically(t *testing.T) {
 	turns, err := store.AgentTurns(ctx, userID, conversation.ID)
 	if err != nil || len(turns) != 1 || turns[0].Status != "completed" || turns[0].LastSequence != 4 || turns[0].ResultMessageID != output.ID {
 		t.Fatalf("turn projection = %#v, %v", turns, err)
+	}
+	if turns[0].CompletionAssessment.Status != "unverified" || !strings.HasPrefix(turns[0].CompletionAssessment.AssistantSourceRef, "message:"+output.ID+"#") || len(turns[0].CompletionAssessment.EvidenceRefs) != 0 {
+		t.Fatalf("assistant final text was treated as verified completion: %#v", turns[0].CompletionAssessment)
+	}
+	if turns[0].RunState.CurrentRequest == nil || turns[0].RunState.CurrentRequest.Statement != input.Content || turns[0].RunState.CurrentRequest.Verification != "source_available" || turns[0].RunState.AssistantResponse == nil || turns[0].RunState.AssistantResponse.Verification != "unverified" {
+		t.Fatalf("run state did not reconstruct source-linked input and unverified assistant report: %#v", turns[0].RunState)
 	}
 	events, err := store.TraceEvents(ctx, userID, conversation.ID)
 	if err != nil || len(events) != 4 || events[0].Kind != "turn.started" || events[3].Kind != "turn.completed" {
@@ -63,6 +73,189 @@ func TestRunJournalCommitsInputEventsAndOutputAtomically(t *testing.T) {
 	if err != nil || len(detail.Messages) != 2 || detail.Messages[1].ID != output.ID {
 		t.Fatalf("output was not committed with the turn: %#v, %v", detail.Messages, err)
 	}
+}
+
+func TestContinuationIntentDecisionIsDurableAndKeepsCheckpointAvailable(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, userID, conversation, generation := runJournalFixtureAt(t, root, "continuation_intent")
+	now := time.Now().UTC()
+	input := domain.Message{ID: "msg_intent_input", ConversationID: conversation.ID, Role: "user", Content: "finish the implementation", CreatedAt: now}
+	turn := domain.AgentTurn{ID: "turn_intent", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
+	if err := store.StartAgentTurn(ctx, userID, turn, input, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	output := domain.Message{ID: "msg_intent_output", ConversationID: conversation.ID, Role: "assistant", Content: "I stopped at the step limit.", CreatedAt: now.Add(time.Second)}
+	continuation := &storage.ContinuationState{Version: 1, Ciphertext: []byte("encrypted-checkpoint"), Nonce: []byte("nonce"), ContentHash: "checkpoint-hash"}
+	if err := store.FinishAgentTurnWithContinuation(ctx, userID, turn.ID, "incomplete", "step_limit", &output, json.RawMessage(`{}`), continuation); err != nil {
+		t.Fatal(err)
+	}
+	details := json.RawMessage(`{"decision":"resume","inputSha256":"abc","planHash":"plan","usage":{"promptTokens":4,"completionTokens":5,"totalTokens":9},"durationMillis":12}`)
+	if err := store.RecordContinuationIntent(ctx, userID, turn.ID, details); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	turns, err := store.AgentTurns(ctx, userID, conversation.ID)
+	if err != nil || len(turns) != 1 || turns[0].Status != "incomplete" || !turns[0].ContinuationAvailable {
+		t.Fatalf("continuation state after route decision = %#v, %v", turns, err)
+	}
+	events, err := store.TurnEvents(ctx, userID, turn.ID, 0)
+	if err != nil || len(events) != 4 || events[3].Kind != "continuation.intent_classified" || string(events[3].Details) != string(details) {
+		t.Fatalf("intent decision event after restart = %#v, %v", events, err)
+	}
+	snapshot, err := store.AgentContinuationSnapshot(ctx, userID, turn.ID)
+	if err != nil || snapshot.Status != "available" || string(snapshot.Ciphertext) != "encrypted-checkpoint" {
+		t.Fatalf("checkpoint after route decision = %#v, %v", snapshot, err)
+	}
+	metrics, err := store.ContinuationChainMetrics(ctx, userID, turn.ID)
+	if err != nil || metrics.ModelCalls != 1 || metrics.PromptTokens != 4 || metrics.CompletionTokens != 5 || metrics.TotalTokens != 9 || metrics.DurationMillis != 12 {
+		t.Fatalf("intent classifier usage missing from continuation metrics: %#v, %v", metrics, err)
+	}
+}
+
+func TestDecliningContinuationInvalidatesCheckpointDurably(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, userID, conversation, generation := runJournalFixtureAt(t, root, "continuation_declined")
+	defer store.Close()
+	now := time.Now().UTC()
+	input := domain.Message{ID: "msg_declined_input", ConversationID: conversation.ID, Role: "user", Content: "finish the task", CreatedAt: now}
+	turn := domain.AgentTurn{ID: "turn_declined", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
+	if err := store.StartAgentTurn(ctx, userID, turn, input, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	output := domain.Message{ID: "msg_declined_output", ConversationID: conversation.ID, Role: "assistant", Content: "The task stopped at its step limit.", CreatedAt: now.Add(time.Second)}
+	continuation := &storage.ContinuationState{Version: 1, Ciphertext: []byte("encrypted-checkpoint"), Nonce: []byte("nonce"), ContentHash: "checkpoint-hash"}
+	if err := store.FinishAgentTurnWithContinuation(ctx, userID, turn.ID, "incomplete", "step_limit", &output, json.RawMessage(`{}`), continuation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InvalidateAgentContinuationSnapshot(ctx, userID, turn.ID, "user_started_new_task"); err != nil {
+		t.Fatal(err)
+	}
+	turns, err := store.AgentTurns(ctx, userID, conversation.ID)
+	if err != nil || len(turns) != 1 || turns[0].ContinuationAvailable || turns[0].ContinuationUnavailableReason != "user_started_new_task" {
+		t.Fatalf("declined checkpoint state = %#v, %v", turns, err)
+	}
+	snapshot, err := store.AgentContinuationSnapshot(ctx, userID, turn.ID)
+	if err != nil || snapshot.Status != "invalidated" || len(snapshot.Ciphertext) != 0 {
+		t.Fatalf("declined checkpoint snapshot = %#v, %v", snapshot, err)
+	}
+	events, err := store.TurnEvents(ctx, userID, turn.ID, 0)
+	if err != nil || len(events) != 4 || events[3].Kind != "turn.continuation_invalidated" {
+		t.Fatalf("declined checkpoint event = %#v, %v", events, err)
+	}
+}
+
+func TestContinuationIntentWriteRollsBackEventWhenTurnUpdateFails(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, userID, conversation, generation := runJournalFixtureAt(t, root, "continuation_intent_rollback")
+	now := time.Now().UTC()
+	input := domain.Message{ID: "msg_intent_rollback_input", ConversationID: conversation.ID, Role: "user", Content: "finish the task", CreatedAt: now}
+	turn := domain.AgentTurn{ID: "turn_intent_rollback", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
+	if err := store.StartAgentTurn(ctx, userID, turn, input, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	output := domain.Message{ID: "msg_intent_rollback_output", ConversationID: conversation.ID, Role: "assistant", Content: "stopped", CreatedAt: now.Add(time.Second)}
+	continuation := &storage.ContinuationState{Version: 1, Ciphertext: []byte("encrypted-checkpoint"), Nonce: []byte("nonce"), ContentHash: "checkpoint-hash"}
+	if err := store.FinishAgentTurnWithContinuation(ctx, userID, turn.ID, "incomplete", "step_limit", &output, json.RawMessage(`{}`), continuation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := openRunJournalDB(t, root)
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_continuation_route_update BEFORE UPDATE OF last_sequence ON agent_turns WHEN NEW.id='turn_intent_rollback' BEGIN SELECT RAISE(ABORT,'forced continuation route failure'); END`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.RecordContinuationIntent(ctx, userID, turn.ID, json.RawMessage(`{"decision":"resume"}`)); err == nil {
+		t.Fatal("route write unexpectedly succeeded despite the forced turn update failure")
+	}
+	events, err := store.TurnEvents(ctx, userID, turn.ID, 0)
+	if err != nil || len(events) != 3 || events[2].Kind != "turn.continuation_saved" {
+		t.Fatalf("route event was not rolled back: %#v, %v", events, err)
+	}
+	turns, err := store.AgentTurns(ctx, userID, conversation.ID)
+	if err != nil || len(turns) != 1 || turns[0].LastSequence != 3 || !turns[0].ContinuationAvailable {
+		t.Fatalf("turn/checkpoint state changed after rollback: %#v, %v", turns, err)
+	}
+}
+
+func TestRunStateRebuildsToolObservationsAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, userID, conversation, generation := runJournalFixtureAt(t, root, "run_state")
+	now := time.Now().UTC()
+	input := domain.Message{ID: "msg_run_state_input", ConversationID: conversation.ID, Role: "user", Content: "run tests and report the result", CreatedAt: now}
+	turn := domain.AgentTurn{ID: "turn_run_state", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
+	startDetails, err := json.Marshal(map[string]string{"inputSourceRef": runJournalMessageSourceID(input.ID, input.Content)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartAgentTurn(ctx, userID, turn, input, startDetails); err != nil {
+		t.Fatal(err)
+	}
+	started, _ := json.Marshal(map[string]any{"toolCallId": "call_tests", "name": "exec_command"})
+	if err := store.AppendTurnEvent(ctx, userID, turn.ID, "tool.started", started, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	result := []byte(`{"ok":true,"exitCode":0,"summary":"tests passed"}`)
+	digest := sha256.Sum256(result)
+	sourceID := "tool_result:call_tests"
+	if err := store.SaveContextSource(ctx, userID, conversation.ID, storage.ContextSourceCiphertext{SourceID: sourceID, SourceType: "tool_result", ContentHash: hex.EncodeToString(digest[:]), Ciphertext: []byte("encrypted-result"), Nonce: []byte("nonce")}); err != nil {
+		t.Fatal(err)
+	}
+	completed, _ := json.Marshal(map[string]any{"toolCallId": "call_tests", "name": "exec_command", "sourceRef": sourceID, "ok": true})
+	if err := store.AppendTurnEvent(ctx, userID, turn.ID, "tool.completed", completed, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	output := domain.Message{ID: "msg_run_state_output", ConversationID: conversation.ID, Role: "assistant", Content: "Tests passed.", CreatedAt: now.Add(3 * time.Second)}
+	if err := store.FinishAgentTurn(ctx, userID, turn.ID, "completed", "assistant_response", &output, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = storage.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	got, err := store.AgentTurn(ctx, userID, turn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RunState.CurrentRequest == nil || got.RunState.CurrentRequest.SourceRef != runJournalMessageSourceID(input.ID, input.Content) {
+		t.Fatalf("current request source did not survive restart: %#v", got.RunState)
+	}
+	if len(got.RunState.Actions) != 1 || got.RunState.Actions[0].ToolCallID != "call_tests" || got.RunState.Actions[0].Status != "tool_reported_ok" || got.RunState.Actions[0].SourceRef != sourceID || got.RunState.Actions[0].SourceHash != hex.EncodeToString(digest[:]) || got.RunState.Actions[0].SourceAvailable != "available" {
+		t.Fatalf("tool observation did not rebuild from durable trace/source: %#v", got.RunState.Actions)
+	}
+	if got.RunState.AssistantResponse == nil || got.RunState.AssistantResponse.Verification != "unverified" || got.CompletionAssessment.Status != "unverified" {
+		t.Fatalf("assistant statement was incorrectly promoted to verified completion: run=%#v completion=%#v", got.RunState.AssistantResponse, got.CompletionAssessment)
+	}
+}
+
+func runJournalMessageSourceID(messageID, content string) string {
+	digest := sha256.Sum256([]byte(content))
+	return "message:" + messageID + "#" + hex.EncodeToString(digest[:])
 }
 
 func TestRunJournalPersistsStepLimitAsIncomplete(t *testing.T) {
@@ -112,6 +305,158 @@ func TestRunJournalRecoveryDoesNotReplayUnknownToolEffects(t *testing.T) {
 	turns, err := store.AgentTurns(ctx, userID, conversation.ID)
 	if err != nil || turns[0].Status != "needs_reconciliation" || turns[0].RecoveryClass != "unknown_external_effect" {
 		t.Fatalf("unsafe recovery projection = %#v, %v", turns, err)
+	}
+	if len(turns[0].RunState.PendingActions) != 1 || turns[0].RunState.PendingActions[0].ToolCallID != "call_1" {
+		t.Fatalf("pending external effect was not reconstructed from the durable start event: %#v", turns[0].RunState.PendingActions)
+	}
+}
+
+func TestNeedsReconciliationStatusAndRunStateSurviveRestart(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, userID, conversation, generation := runJournalFixtureAt(t, root, "reconcile_restart")
+	now := time.Now().UTC()
+	input := domain.Message{ID: "msg_reconcile_restart", ConversationID: conversation.ID, Role: "user", Content: "apply the requested change", CreatedAt: now}
+	turn := domain.AgentTurn{ID: "turn_reconcile_restart", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
+	startDetails, err := json.Marshal(map[string]string{"inputSourceRef": runJournalMessageSourceID(input.ID, input.Content)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartAgentTurn(ctx, userID, turn, input, startDetails); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendTurnEvent(ctx, userID, turn.ID, "tool.started", json.RawMessage(`{"toolCallId":"call_unresolved","name":"exec_command"}`), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = storage.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, err := store.RecoverInterruptedAgentTurns(ctx); err != nil || count != 1 {
+		t.Fatalf("recovered count = %d, %v", count, err)
+	}
+	got, err := store.AgentTurn(ctx, userID, turn.ID)
+	if err != nil || got.Status != "needs_reconciliation" || got.RecoveryClass != "unknown_external_effect" || len(got.RunState.PendingActions) != 1 {
+		t.Fatalf("unknown external effect projection = %#v, %v", got, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = storage.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	got, err = store.AgentTurn(ctx, userID, turn.ID)
+	if err != nil || got.Status != "needs_reconciliation" || len(got.RunState.PendingActions) != 1 || got.RunState.PendingActions[0].ToolCallID != "call_unresolved" {
+		t.Fatalf("reconciliation status or pending action was lost on restart: %#v, %v", got, err)
+	}
+}
+
+func TestLegacyReconciliationMigrationRollsBackStatusesWithMarker(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, userID, conversation, generation := runJournalFixtureAt(t, root, "reconcile_migration_rollback")
+	now := time.Now().UTC()
+	input := domain.Message{ID: "msg_reconcile_migration", ConversationID: conversation.ID, Role: "user", Content: "work", CreatedAt: now}
+	turn := domain.AgentTurn{ID: "turn_reconcile_migration", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
+	if err := store.StartAgentTurn(ctx, userID, turn, input, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	inbox := domain.InboxInput{ID: "inbox_reconcile_migration", ConversationID: conversation.ID, Content: "queued", CreatedAt: now}
+	if err := store.QueueAgentInput(ctx, userID, inbox); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := openRunJournalDB(t, root)
+	if _, err := db.ExecContext(ctx, `UPDATE agent_turns SET status='needs_reconciliation' WHERE id=?`, turn.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE agent_inbox SET status='needs_reconciliation' WHERE id=?`, inbox.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM runtime_settings WHERE key='migration.needs_reconciliation_status.v1'`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_reconciliation_migration_marker BEFORE INSERT ON runtime_settings WHEN NEW.key='migration.needs_reconciliation_status.v1' BEGIN SELECT RAISE(ABORT,'forced reconciliation migration failure'); END`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, openErr := storage.Open(root)
+	if openErr == nil {
+		if err := opened.Close(); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("database opened even though the reconciliation migration marker write failed")
+	}
+	db = openRunJournalDB(t, root)
+	defer db.Close()
+	var turnStatus, inboxStatus string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM agent_turns WHERE id=?`, turn.ID).Scan(&turnStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT status FROM agent_inbox WHERE id=?`, inbox.ID).Scan(&inboxStatus); err != nil {
+		t.Fatal(err)
+	}
+	var markerCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_settings WHERE key='migration.needs_reconciliation_status.v1'`).Scan(&markerCount); err != nil {
+		t.Fatal(err)
+	}
+	if turnStatus != "needs_reconciliation" || inboxStatus != "needs_reconciliation" || markerCount != 0 {
+		t.Fatalf("failed migration left partial state: turn=%q inbox=%q marker=%d", turnStatus, inboxStatus, markerCount)
+	}
+}
+
+func TestAgentTurnReconciliationRollsBackWhenAuditAppendFails(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, userID, conversation, generation := runJournalFixtureAt(t, root, "reconcile_rollback")
+	defer store.Close()
+	now := time.Now().UTC()
+	input := domain.Message{ID: "msg_reconcile_rollback", ConversationID: conversation.ID, Role: "user", Content: "uncertain action", CreatedAt: now}
+	turn := domain.AgentTurn{ID: "turn_reconcile_rollback", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now, UpdatedAt: now}
+	if err := store.StartAgentTurn(ctx, userID, turn, input, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendTurnEvent(ctx, userID, turn.ID, "tool.started", json.RawMessage(`{"toolCallId":"call_rollback","effect":"external_write"}`), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishAgentTurn(ctx, userID, turn.ID, "failed", "runtime_error", nil, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	db := openRunJournalDB(t, root)
+	if _, err := db.ExecContext(ctx, `UPDATE agent_turns SET status='needs_reconciliation',recovery_class='unknown_external_effect' WHERE id=?`, turn.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER fail_reconciliation_audit BEFORE INSERT ON agent_turn_reconciliation_events BEGIN SELECT RAISE(ABORT,'injected audit failure'); END`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordAgentTurnReconciliation(ctx, userID, turn.ID, "no_effect_applied", "test evidence", now.Add(2*time.Second)); err == nil || !strings.Contains(err.Error(), "injected audit failure") {
+		t.Fatalf("reconciliation did not return the injected audit insert failure: %v", err)
+	}
+	readBack, err := store.AgentTurn(ctx, userID, turn.ID)
+	if err != nil || readBack.Status != "needs_reconciliation" || readBack.RecoveryClass != "unknown_external_effect" || readBack.ReconciliationNote != "" {
+		t.Fatalf("failed reconciliation partially changed the turn: turn=%+v err=%v", readBack, err)
+	}
+	history, err := store.AgentTurnReconciliations(ctx, userID, turn.ID)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("failed reconciliation left an audit record: history=%+v err=%v", history, err)
 	}
 }
 
@@ -220,7 +565,7 @@ func TestRunJournalManualReconciliationUnlocksFailedToolRetryAndSurvivesRestart(
 	if err := store.StartAgentTurn(ctx, userID, turn, input, json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AppendTurnEvent(ctx, userID, turn.ID, "tool.started", json.RawMessage(`{"toolCallId":"call_reconcile"}`), now.Add(time.Second)); err != nil {
+	if err := store.AppendTurnEvent(ctx, userID, turn.ID, "tool.started", json.RawMessage(`{"toolCallId":"call_reconcile","effect":"external_write"}`), now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.FinishAgentTurn(ctx, userID, turn.ID, "failed", "runtime_error", nil, json.RawMessage(`{}`)); err != nil {
@@ -254,12 +599,15 @@ func TestRunJournalManualReconciliationUnlocksFailedToolRetryAndSurvivesRestart(
 	if err := store.StartRetryAgentTurn(ctx, userID, failedEdit, domain.Message{ID: input.ID, ConversationID: input.ConversationID, Role: "user", Content: revised, CreatedAt: now.Add(3 * time.Second)}, turn.ID, &revised, json.RawMessage(`{}`)); !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("edited retry before reconciliation error = %v", err)
 	}
+	if _, _, err := store.AgentTurnSeedForBranch(ctx, userID, turn.ID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("branch retry bypassed unresolved external effect: %v", err)
+	}
 	detail, err := store.Conversation(ctx, userID, conversation.ID)
 	if err != nil || detail.Messages[0].Content != input.Content {
 		t.Fatalf("blocked edit changed source message: %#v, %v", detail.Messages, err)
 	}
-	recorded, err := store.RecordAgentTurnReconciliation(ctx, userID, turn.ID, "verified the external effect and its current state", now.Add(4*time.Second))
-	if err != nil || recorded.Note == "" || recorded.Decision != "retry_authorized" {
+	recorded, err := store.RecordAgentTurnReconciliation(ctx, userID, turn.ID, "no_effect_applied", "checked the target system; no effect was applied", now.Add(4*time.Second))
+	if err != nil || recorded.Note == "" || recorded.Decision != "no_effect_applied" {
 		t.Fatalf("reconciliation = %#v, %v", recorded, err)
 	}
 	retry = domain.AgentTurn{ID: "turn_retry_allowed", ConversationID: conversation.ID, ProviderID: conversation.ProviderID, AgentGenerationID: generation.ID, AgentDefinitionDigest: generation.DefinitionDigest, StartedAt: now.Add(5 * time.Second), UpdatedAt: now.Add(5 * time.Second)}
@@ -274,6 +622,10 @@ func TestRunJournalManualReconciliationUnlocksFailedToolRetryAndSurvivesRestart(
 		t.Fatal(err)
 	}
 	defer store.Close()
+	history, err := store.AgentTurnReconciliations(ctx, userID, turn.ID)
+	if err != nil || len(history) != 1 || history[0].Decision != "no_effect_applied" || history[0].Note != recorded.Note {
+		t.Fatalf("reconciliation audit history after restart = %#v, %v", history, err)
+	}
 	if count, err := store.RecoverInterruptedAgentTurns(ctx); err != nil || count != 1 {
 		t.Fatalf("recovered retry count = %d, %v", count, err)
 	}
@@ -383,6 +735,9 @@ func TestRunJournalRecoveryUpdatesClaimedInboxWithoutReplaying(t *testing.T) {
 	if err != nil || len(turns) != 1 || turns[0].Status != "needs_reconciliation" || turns[0].RecoveryClass != "unknown_external_effect" {
 		t.Fatalf("recovered turn = %#v, %v", turns, err)
 	}
+	if len(turns[0].RunState.PendingActions) != 1 || turns[0].RunState.PendingActions[0].ToolCallID != "call_1" {
+		t.Fatalf("pending inbox effect was not reconstructed after restart: %#v", turns[0].RunState.PendingActions)
+	}
 	item, err = store.AgentInboxItem(ctx, userID, item.ID)
 	if err != nil || item.Status != "needs_reconciliation" || item.TurnID != turn.ID {
 		t.Fatalf("recovered inbox item = %#v, %v", item, err)
@@ -394,7 +749,7 @@ func TestRunJournalRecoveryUpdatesClaimedInboxWithoutReplaying(t *testing.T) {
 	}
 	detail, err := store.Conversation(ctx, userID, conversation.ID)
 	if err != nil || len(detail.Messages) != 1 || detail.Messages[0].ID != input.ID {
-		t.Fatalf("blocked direct input changed conversation state: %#v, %v", detail.Messages, err)
+		t.Fatalf("blocked direct input changed the durable transcript: %#v, %v", detail.Messages, err)
 	}
 	completedItem := domain.InboxInput{ID: "inbox_recovery_completed", ConversationID: conversation.ID, Content: "follow-up after recovery", CreatedAt: now.Add(2 * time.Second)}
 	if err := store.QueueAgentInput(ctx, userID, completedItem); err != nil {
@@ -409,8 +764,14 @@ func TestRunJournalRecoveryUpdatesClaimedInboxWithoutReplaying(t *testing.T) {
 	if err != nil || queuedReadback.Status != "queued" || queuedReadback.TurnID != "" {
 		t.Fatalf("blocked queued item changed state: %#v, %v", queuedReadback, err)
 	}
-	if _, err := store.RecordAgentTurnReconciliation(ctx, userID, turn.ID, "reviewed the uncertain external effect", now.Add(time.Second)); err != nil {
+	if _, err := store.RecordAgentTurnReconciliation(ctx, userID, turn.ID, "effect_applied", "confirmed the remote operation succeeded; do not repeat", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	if _, _, err := store.RetryAgentTurnSeed(ctx, userID, turn.ID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("retry replayed a confirmed external effect: %v", err)
+	}
+	if _, _, err := store.AgentTurnSeedForBranch(ctx, userID, turn.ID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("branch retry replayed a confirmed external effect: %v", err)
 	}
 	if err := store.StartQueuedAgentTurn(ctx, userID, completedTurn, completedInput, completedItem.ID, json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,8 +61,19 @@ func TestProjectAPIAndMoveConversation(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &createdProj); err != nil {
 		t.Fatalf("failed to decode created project: %v", err)
 	}
-	if createdProj.Name != "电商后端重构" || createdProj.ID == "" || !createdProj.InstructionsEnabled || createdProj.RemoteRepoURL != "https://github.com/example/ecommerce.git" || createdProj.RemoteBranch != "main" {
+	if createdProj.Name != "电商后端重构" || createdProj.ID == "" || !createdProj.InstructionsEnabled || createdProj.RemoteRepoURL != "https://github.com/example/ecommerce.git" || createdProj.RemoteBranch != "main" || createdProj.RepositoryProvider != "github" {
 		t.Fatalf("unexpected created project: %+v", createdProj)
+	}
+	invalidRepoBody, _ := json.Marshal(map[string]string{"name": "invalid", "remoteRepoUrl": "https://user:secret@github.com/example/repo.git"})
+	invalidRepoRequest := httptest.NewRequest("POST", "/api/v1/projects", bytes.NewReader(invalidRepoBody))
+	invalidRepoResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidRepoResponse, invalidRepoRequest)
+	if invalidRepoResponse.Code != http.StatusBadRequest {
+		t.Fatalf("credential-bearing repository URL returned %d, want 400", invalidRepoResponse.Code)
+	}
+	projectsAfterInvalidRepo, err := store.ListProjects(context.Background(), "ws_test")
+	if err != nil || len(projectsAfterInvalidRepo) != 1 {
+		t.Fatalf("invalid repository URL changed persisted projects: count=%d err=%v", len(projectsAfterInvalidRepo), err)
 	}
 
 	// 2. List projects
@@ -160,7 +172,8 @@ func TestProjectAPIAndMoveConversation(t *testing.T) {
 	}
 
 	// 7. Delete project (conversations within it should be unlinked, not deleted)
-	req = httptest.NewRequest("DELETE", "/api/v1/projects/"+createdProj.ID, nil)
+	deleteBody, _ := json.Marshal(map[string]bool{"confirmDelete": true})
+	req = httptest.NewRequest("DELETE", "/api/v1/projects/"+createdProj.ID, bytes.NewReader(deleteBody))
 	w = httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -176,4 +189,44 @@ func TestProjectAPIAndMoveConversation(t *testing.T) {
 	if detailAfter.ProjectID != "" {
 		t.Fatalf("expected convo projectId to be cleared after project delete, got %q", detailAfter.ProjectID)
 	}
+}
+
+func TestProjectPublicationRoutesExposeDurableHistoryAndRequireIdempotency(t *testing.T) {
+	server, store := setupProjectTestServer(t)
+	project := domain.Project{ID: "proj_publication_routes", UserID: "ws_test", Name: "repo", Workdir: t.TempDir(), RemoteRepoURL: "https://github.com/acme/repo.git", RemoteBranch: "main", RepositoryProvider: "github", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := store.CreateProject(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/v1/projects/"+project.ID+"/publications", nil))
+	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
+		t.Fatalf("publication history response = %d %s", list.Code, list.Body.String())
+	}
+	requestBody := bytes.NewBufferString(`{"targetBranch":"main","expectedRemoteSha":"0123456789012345678901234567890123456789","commitSha":"abcdefabcdefabcdefabcdefabcdefabcdefabcd"}`)
+	create := httptest.NewRecorder()
+	handler.ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/v1/projects/"+project.ID+"/publications", requestBody))
+	if create.Code != http.StatusBadRequest {
+		t.Fatalf("missing Idempotency-Key returned %d: %s", create.Code, create.Body.String())
+	}
+	publications, err := store.ListProjectPublications(context.Background(), "ws_test", project.ID)
+	if err != nil || len(publications) != 0 {
+		t.Fatalf("invalid request created durable publication: %+v, %v", publications, err)
+	}
+}
+
+func TestProjectPublicationOperationLockSerializesPushAndReconciliation(t *testing.T) {
+	server := &Server{}
+	if !server.beginProjectPublicationOperation("pub_active") {
+		t.Fatal("first publication operation was rejected")
+	}
+	if server.beginProjectPublicationOperation("pub_active") {
+		server.endProjectPublicationOperation("pub_active")
+		t.Fatal("concurrent operation was allowed for the same publication")
+	}
+	server.endProjectPublicationOperation("pub_active")
+	if !server.beginProjectPublicationOperation("pub_active") {
+		t.Fatal("publication operation remained locked after release")
+	}
+	server.endProjectPublicationOperation("pub_active")
 }

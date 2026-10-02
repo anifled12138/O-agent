@@ -2,9 +2,13 @@ package coretools
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,8 +17,202 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/runfiles"
+	"axiom.local/agent/internal/sandbox"
 )
+
+func TestLinuxSandboxToolDescriptionMatchesEnforcedMemoryAndTmpfsLimit(t *testing.T) {
+	memoryMiB := domain.CloudTaskSandboxMemoryLimitBytes / (1 << 20)
+	description := linuxSandboxDescription(0)
+	if !strings.Contains(description, fmt.Sprintf("%d MiB memory with swap disabled", memoryMiB)) {
+		t.Fatalf("tool description does not use the enforced task memory limit (%d MiB): %s", memoryMiB, description)
+	}
+	if !strings.Contains(description, fmt.Sprintf("each private tmpfs mount is capped at the same %d MiB task memory limit", memoryMiB)) {
+		t.Fatalf("tool description does not explain the enforced tmpfs limit (%d MiB): %s", memoryMiB, description)
+	}
+	if !strings.Contains(description, "Host O service configuration and credentials under /etc/o-agent are hidden") {
+		t.Fatalf("tool description must describe host O credential isolation: %s", description)
+	}
+	if !strings.Contains(description, "This workspace has no O-managed per-task disk quota") {
+		t.Fatalf("unmetered local workspace must not claim a cloud disk quota: %s", description)
+	}
+	cloudDescription := linuxSandboxDescription(8 << 30)
+	if !strings.Contains(cloudDescription, "ext4/XFS project quota with a hard limit of 8589934592 bytes") || !strings.Contains(cloudDescription, "not shared artifact storage, database, or logs") {
+		t.Fatalf("cloud task workspace description does not match its enforced quota: %s", cloudDescription)
+	}
+}
+
+func TestWindowsNativeSandboxToolContractDescribesSSHBroker(t *testing.T) {
+	tools := GetCoreToolsWithSourceArchive(t.TempDir(), nil, nil, ExecutionConfig{Backend: sandbox.BackendWindowsNative})
+	for _, name := range []string{"exec_command", "exec_script"} {
+		var description string
+		for _, tool := range tools {
+			if tool.Definition.Function.Name == name {
+				description = tool.Definition.Function.Description
+				break
+			}
+		}
+		if description == "" {
+			t.Fatalf("core tool %q is missing", name)
+		}
+		if !strings.Contains(description, "OpenSSH agent") || !strings.Contains(description, "command-scoped broker") || !strings.Contains(description, "Private keys are not copied") {
+			t.Errorf("%s does not describe the Windows SSH credential boundary: %s", name, description)
+		}
+		if strings.Contains(description, "until an SSH identity broker is available") {
+			t.Errorf("%s still advertises SSH as unsupported: %s", name, description)
+		}
+	}
+}
+
+func TestFSReadArchivesImmutableBytesBeforeDisplayTruncation(t *testing.T) {
+	workspace := tempDirWithinWorkspace(t, "coretools-archive-")
+	original := strings.Repeat("原始文件行\n", 12000)
+	if err := os.WriteFile(filepath.Join(workspace, "large.txt"), []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var archived []byte
+	tools := GetCoreToolsWithSourceArchive(workspace, nil, func(sourceType string, content []byte) (string, error) {
+		if sourceType != "file_snapshot" {
+			t.Fatalf("unexpected source type %q", sourceType)
+		}
+		archived = append([]byte(nil), content...)
+		return "file_snapshot:test", nil
+	})
+	var read Tool
+	for _, candidate := range tools {
+		if candidate.Definition.Function.Name == "fs_read" {
+			read = candidate
+		}
+	}
+	args, _ := json.Marshal(map[string]any{"path": "large.txt", "limit": 12000, "withLineNumbers": false})
+	result, err := read.Handler(context.Background(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.(map[string]any)
+	if string(archived) != original || got["sourceId"] != "file_snapshot:test" || got["truncated"] != true {
+		t.Fatalf("archive did not preserve the full source before response truncation: archived=%d result=%#v", len(archived), got)
+	}
+	digest := sha256.Sum256([]byte(original))
+	if got["contentSha256"] != hex.EncodeToString(digest[:]) {
+		t.Fatalf("file snapshot hash mismatch: got %v", got["contentSha256"])
+	}
+}
+
+func TestFSReadStreamsWorkspaceFilesLargerThanInlineArchiveThreshold(t *testing.T) {
+	workspace := tempDirWithinWorkspace(t, "coretools-large-stream-")
+	path := filepath.Join(workspace, "large-sparse.txt")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate((32 << 20) + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archiveCalled := false
+	tools := GetCoreToolsWithSourceArchive(workspace, nil, func(string, []byte) (string, error) { archiveCalled = true; return "", nil })
+	var read Tool
+	for _, candidate := range tools {
+		if candidate.Definition.Function.Name == "fs_read" {
+			read = candidate
+			break
+		}
+	}
+	args, _ := json.Marshal(map[string]any{"path": "large-sparse.txt", "limit": 1})
+	result, err := read.Handler(context.Background(), args)
+	if err != nil {
+		t.Fatalf("large workspace file was rejected instead of streamed: %v", err)
+	}
+	got := result.(map[string]any)
+	if got["sourceArchiveStatus"] != "requires_chunked_snapshot_transfer" || got["totalLines"] != 1 || got["truncated"] != true || len(got["content"].(string)) > 64*1024 {
+		t.Fatalf("large file stream did not return bounded page and explicit archive state: %#v", got)
+	}
+	if archiveCalled {
+		t.Fatal("large file was passed to the inline-only source archive")
+	}
+}
+
+func TestFSReadStreamsLargeSnapshotIntoChunkedArchiver(t *testing.T) {
+	workspace := tempDirWithinWorkspace(t, "coretools-chunked-archive-")
+	path := filepath.Join(workspace, "large-sparse.txt")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const size = (32 << 20) + 17
+	if err := file.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	tools := GetCoreToolsWithStreamSourceArchive(workspace, nil, nil, func(ctx context.Context, sourceType string, source io.Reader, expectedSize int64, expectedHash string) (string, error) {
+		called = true
+		if sourceType != "file_snapshot" || expectedSize != size {
+			t.Fatalf("unexpected stream archive metadata: type=%q size=%d", sourceType, expectedSize)
+		}
+		hasher := sha256.New()
+		read, err := io.Copy(hasher, source)
+		if err != nil {
+			return "", err
+		}
+		if read != expectedSize || hex.EncodeToString(hasher.Sum(nil)) != expectedHash {
+			t.Fatalf("stream archive received inconsistent snapshot: bytes=%d expected=%d", read, expectedSize)
+		}
+		return "file_snapshot:streamed", nil
+	})
+	var read Tool
+	for _, candidate := range tools {
+		if candidate.Definition.Function.Name == "fs_read" {
+			read = candidate
+			break
+		}
+	}
+	args, _ := json.Marshal(map[string]any{"path": "large-sparse.txt", "limit": 1})
+	result, err := read.Handler(context.Background(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.(map[string]any)
+	if !called || got["sourceArchiveStatus"] != "archived" || got["sourceId"] != "file_snapshot:streamed" {
+		t.Fatalf("large snapshot did not complete the chunked archive path: %#v", got)
+	}
+}
+
+func TestValidateNetworkHostRequestRequiresBoundedLinuxTargets(t *testing.T) {
+	if err := validateNetworkHostRequest("linux", true, nil); err == nil {
+		t.Fatal("Linux network access without any named destination was accepted")
+	}
+	if err := validateNetworkHostRequest("linux", true, []string{"github.com"}); err != nil {
+		t.Fatalf("Linux request with an exact destination was rejected: %v", err)
+	}
+	if err := validateNetworkHostRequest("windows", true, nil); err != nil {
+		t.Fatalf("Windows request with its platform network policy was rejected: %v", err)
+	}
+	if err := validateNetworkHostRequest("linux", false, []string{"github.com"}); err == nil {
+		t.Fatal("network destination was accepted without networkAccess")
+	}
+	if err := validateNetworkHostRequest("linux", true, make([]string, 33)); err == nil {
+		t.Fatal("network host list above the shared maximum was accepted")
+	}
+}
+
+func TestNetworkHostsFromURLsDeduplicatesHostsCaseInsensitively(t *testing.T) {
+	got := NetworkHostsFromURLs([]string{
+		"https://GitHub.com/acme/agent.git",
+		"https://github.com/acme/submodule.git",
+		"https://gitee.com/acme/mirror.git",
+		"not a URL",
+	})
+	if len(got) != 2 || got[0] != "gitee.com" || got[1] != "github.com" {
+		t.Fatalf("deduplicated network hosts = %#v, want [gitee.com github.com]", got)
+	}
+}
 
 func TestCoreToolsExecution(t *testing.T) {
 	tempDir := tempDirWithinWorkspace(t, "coretools-workspace-")
@@ -219,6 +417,32 @@ func TestCoreToolsExecution(t *testing.T) {
 		time.Sleep(2200 * time.Millisecond)
 		if _, err := os.Stat(orphanMarker); !os.IsNotExist(err) {
 			t.Fatalf("script child survived run cancellation: stat error=%v", err)
+		}
+
+		// Expanded command access changes a real workspace file only when the
+		// host constructed a write-enabled AppContainer policy.
+		commandPath := filepath.Join(tempDir, "command-write.txt")
+		quotedCommandPath := strings.ReplaceAll(commandPath, "'", "''")
+		commandTool := tools["exec_command"]
+		readOnlyArgs, _ := json.Marshal(map[string]any{"cmd": "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '" + quotedCommandPath + "' -Value denied -ErrorAction Stop"})
+		_, err = commandTool.Handler(ctx, readOnlyArgs)
+		if err != nil {
+			t.Fatalf("read-only command did not return its bounded result: %v", err)
+		}
+		if _, err := os.Stat(commandPath); !os.IsNotExist(err) {
+			t.Fatalf("read-only command changed the workspace: stat error=%v", err)
+		}
+		writeArgs, _ := json.Marshal(map[string]any{"cmd": "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '" + quotedCommandPath + "' -Value approved -ErrorAction Stop", "writeAccess": true})
+		writeResult, err := commandTool.Handler(ctx, writeArgs)
+		if err != nil {
+			t.Fatalf("workspace-write command failed: %v", err)
+		}
+		if writeResult.(map[string]any)["exitCode"] != 0 {
+			t.Fatalf("workspace-write command exited unsuccessfully: %#v", writeResult)
+		}
+		written, err := os.ReadFile(commandPath)
+		if err != nil || strings.TrimSpace(string(written)) != "approved" {
+			t.Fatalf("workspace-write command did not persist its effect: content=%q err=%v", written, err)
 		}
 	}
 

@@ -65,10 +65,10 @@ func normalizeCompletion(completion Completion) (Completion, error) {
 		call := &completion.ToolCalls[index]
 		if strings.TrimSpace(call.ID) == "" {
 			call.ID = fmt.Sprintf("call_%d", index+1)
-			completion.Warnings = append(completion.Warnings, CompatibilityWarning{Code: "provider.missing_tool_call_id", Message: "The provider omitted a tool call ID; Axiom generated an attempt-local ID."})
+			completion.Warnings = append(completion.Warnings, CompatibilityWarning{Code: "provider.missing_tool_call_id", Message: "The provider omitted a tool call ID; O generated an attempt-local ID."})
 		}
 		if call.Function.normalizedObjectArguments {
-			completion.Warnings = append(completion.Warnings, CompatibilityWarning{Code: "provider.object_tool_arguments", Message: "The provider returned tool arguments as an object; Axiom normalized them to a JSON string."})
+			completion.Warnings = append(completion.Warnings, CompatibilityWarning{Code: "provider.object_tool_arguments", Message: "The provider returned tool arguments as an object; O normalized them to a JSON string."})
 		}
 		if call.Type == "" {
 			call.Type = "function"

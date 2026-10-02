@@ -1081,9 +1081,9 @@ func newID(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(raw)
 }
 func findGo() (string, error) {
-	candidates := []string{"go"}
+	candidates := []string{strings.TrimSpace(os.Getenv("O_GO_BINARY")), "go"}
 	if runtime.GOOS == "windows" {
-		candidates = []string{`D:\DevTools\go\bin\go.exe`, "go.exe"}
+		candidates = []string{strings.TrimSpace(os.Getenv("O_GO_BINARY")), "go.exe", `D:\DevTools\go\bin\go.exe`}
 	}
 	for _, candidate := range candidates {
 		if path, err := exec.LookPath(candidate); err == nil {

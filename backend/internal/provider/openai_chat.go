@@ -19,7 +19,17 @@ func formatMessages(messages []ChatMessage) []any {
 	for _, m := range messages {
 		matches := imageMarkdownRegex.FindAllStringSubmatchIndex(m.Content, -1)
 		if len(matches) == 0 {
-			out = append(out, m)
+			item := map[string]any{"role": m.Role}
+			if m.Content != "" {
+				item["content"] = m.Content
+			}
+			if m.ToolCallID != "" {
+				item["tool_call_id"] = m.ToolCallID
+			}
+			if len(m.ToolCalls) > 0 {
+				item["tool_calls"] = m.ToolCalls
+			}
+			out = append(out, item)
 			continue
 		}
 

@@ -14,12 +14,12 @@ type RunLimits struct {
 }
 
 func DefaultRunLimits() RunLimits {
-	return RunLimits{MaxModelCalls: 300}
+	return RunLimits{MaxModelCalls: 0}
 }
 
 func (limits RunLimits) normalized() RunLimits {
 	if limits.MaxModelCalls < 0 {
-		limits.MaxModelCalls = DefaultRunLimits().MaxModelCalls
+		limits.MaxModelCalls = 0
 	}
 	return limits
 }

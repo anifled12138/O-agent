@@ -16,10 +16,9 @@ import (
 )
 
 const (
-	markerName       = ".axiom-agent-run.json"
-	markerVersion    = 1
-	staleAfter       = 24 * time.Hour
-	maxArtifactBytes = 32 << 20
+	markerName    = ".axiom-agent-run.json"
+	markerVersion = 1
+	staleAfter    = 24 * time.Hour
 )
 
 type ownershipMarker struct {
@@ -265,9 +264,6 @@ func (s *Scope) WriteArtifact(prefix, extension string, data []byte) (Artifact, 
 	if s == nil {
 		return Artifact{}, fmt.Errorf("agent run scope is unavailable")
 	}
-	if len(data) > maxArtifactBytes {
-		return Artifact{}, fmt.Errorf("agent artifact exceeds the %d MiB limit", maxArtifactBytes>>20)
-	}
 	if prefix == "" {
 		prefix = "artifact"
 	}
@@ -313,6 +309,25 @@ func (s *Scope) WriteArtifact(prefix, extension string, data []byte) (Artifact, 
 }
 
 func (s *Scope) ReadArtifact(id string) ([]byte, error) {
+	file, err := s.OpenArtifact(id)
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, errors.Join(fmt.Errorf("read agent artifact: %w", readErr), closeErr)
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return data, nil
+}
+
+// OpenArtifact returns a validated regular file for bounded, streaming reads.
+// Its size is not capped; callers should avoid loading large artifacts wholly
+// into memory.
+func (s *Scope) OpenArtifact(id string) (*os.File, error) {
 	if s == nil {
 		return nil, fmt.Errorf("agent run scope is unavailable")
 	}
@@ -337,14 +352,14 @@ func (s *Scope) ReadArtifact(id string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("inspect agent artifact: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Size() > maxArtifactBytes {
-		return nil, fmt.Errorf("agent artifact is not a regular file within the size limit")
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("agent artifact is not a regular file")
 	}
-	data, err := os.ReadFile(resolved)
+	file, err := os.Open(resolved)
 	if err != nil {
-		return nil, fmt.Errorf("read agent artifact: %w", err)
+		return nil, fmt.Errorf("open agent artifact: %w", err)
 	}
-	return data, nil
+	return file, nil
 }
 
 func (s *Scope) Close() error {

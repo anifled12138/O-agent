@@ -17,8 +17,8 @@ func (s *Service) findGo() (string, error) {
 		candidates = []string{
 			strings.TrimSpace(os.Getenv("O_GO_BINARY")),
 			filepath.Join(s.workspaceRoot, "work", "toolchains", "go", "bin", "go.exe"),
-			`D:\DevTools\go\bin\go.exe`,
 			"go.exe",
+			`D:\DevTools\go\bin\go.exe`,
 		}
 	}
 	for _, candidate := range candidates {

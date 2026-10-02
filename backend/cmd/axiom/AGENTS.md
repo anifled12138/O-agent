@@ -1,4 +1,4 @@
-# Axiom Host entry point
+# O Host entry point
 
 This package is the composition root: it loads configuration, registers and starts backend components, wires the HTTP API, handles readiness, and shuts services down.
 

@@ -48,6 +48,13 @@ export default defineConfig(async () => {
     css: { postcss: { plugins: [tailwindcss()] } },
     server: {
       host: '127.0.0.1',
+      proxy: {
+        '/api': {
+          target: process.env.O_WEB_API_PROXY || 'http://127.0.0.1:9171',
+          // Preserve browser Origin so the Host still enforces its CORS policy.
+          changeOrigin: false,
+        },
+      },
       ...(isCodexSeatbeltSandbox
         ? { watch: { useFsEvents: false, usePolling: true } }
         : {}),

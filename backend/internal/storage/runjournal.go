@@ -6,11 +6,33 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"axiom.local/agent/internal/domain"
 )
+
+type ContinuationState struct {
+	Version           int
+	Ciphertext        []byte
+	Nonce             []byte
+	ContentHash       string
+	UnavailableReason string
+}
+
+type AgentContinuationSnapshot struct {
+	SourceTurnID      string
+	ConversationID    string
+	Version           int
+	Ciphertext        []byte
+	Nonce             []byte
+	ContentHash       string
+	Status            string
+	UnavailableReason string
+	IdempotencyKey    string
+	ConsumedTurnID    string
+}
 
 func (s *Store) StartAgentTurn(ctx context.Context, userID string, turn domain.AgentTurn, input domain.Message, details json.RawMessage) error {
 	return s.startAgentTurn(ctx, userID, turn, input, details, "", "", false, false)
@@ -128,7 +150,17 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,'running',1,?,?)`, turn.ID, turn.ConversationID, us
 	if _, err := tx.ExecContext(ctx, `UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?`, input.CreatedAt, branch.ID, userID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	readBack, err := s.Conversation(ctx, userID, branch.ID)
+	if err != nil {
+		return fmt.Errorf("read branched conversation back: %w", err)
+	}
+	if readBack.ID != branch.ID || readBack.ParentConversationID != sourceConversationID || len(readBack.Messages) != len(prefix)+1 || readBack.Messages[len(readBack.Messages)-1].ID != input.ID || readBack.Messages[len(readBack.Messages)-1].Content != input.Content {
+		return fmt.Errorf("branched conversation read-back mismatch: %w", domain.ErrConflict)
+	}
+	return nil
 }
 
 // ForkCompletedConversation copies the message prefix through a completed
@@ -224,13 +256,12 @@ SELECT ?,user_id,generation_id,definition_digest,? FROM conversation_agent_bindi
 	return tx.Commit()
 }
 
-func (s *Store) RecordAgentTurnReconciliation(ctx context.Context, userID, turnID, note string, at time.Time) (domain.AgentTurnReconciliation, error) {
-	var result domain.AgentTurnReconciliation
-	result.ID = "reconcile_" + turnID
-	result.TurnID = turnID
-	result.Decision = "retry_authorized"
-	result.Note = strings.TrimSpace(note)
-	result.CreatedAt = at
+func (s *Store) RecordAgentTurnReconciliation(ctx context.Context, userID, turnID, outcome, note string, at time.Time) (domain.AgentTurnReconciliation, error) {
+	decision, recoveryClass, nextStatus, err := reconciliationState(outcome)
+	if err != nil {
+		return domain.AgentTurnReconciliation{}, err
+	}
+	result := domain.AgentTurnReconciliation{ID: "reconcile_" + turnID, TurnID: turnID, Decision: decision, Note: strings.TrimSpace(note), CreatedAt: at.UTC()}
 	if result.Note == "" || len([]rune(result.Note)) > 2000 {
 		return domain.AgentTurnReconciliation{}, domain.ErrInvalid
 	}
@@ -239,34 +270,61 @@ func (s *Store) RecordAgentTurnReconciliation(ctx context.Context, userID, turnI
 		return domain.AgentTurnReconciliation{}, err
 	}
 	defer tx.Rollback()
-	var status, recoveryClass, inputMessageID string
+	var status, currentRecovery string
 	var sequence int
-	if err := tx.QueryRowContext(ctx, `SELECT conversation_id,status,recovery_class,input_message_id,last_sequence FROM agent_turns WHERE id=? AND user_id=?`, turnID, userID).Scan(&result.ConversationID, &status, &recoveryClass, &inputMessageID, &sequence); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT conversation_id,status,recovery_class,last_sequence FROM agent_turns WHERE id=? AND user_id=?`, turnID, userID).Scan(&result.ConversationID, &status, &currentRecovery, &sequence); errors.Is(err, sql.ErrNoRows) {
 		return domain.AgentTurnReconciliation{}, domain.ErrNotFound
 	} else if err != nil {
 		return domain.AgentTurnReconciliation{}, err
 	}
-	if status != "needs_reconciliation" && status != "completed" && status != "failed" && status != "cancelled" && status != "interrupted" && status != "incomplete" {
+	if status != "completed" && status != "failed" && status != "cancelled" && status != "interrupted" && status != "incomplete" && status != "needs_reconciliation" {
 		return domain.AgentTurnReconciliation{}, domain.ErrConflict
 	}
-	if recoveryClass != "unknown_external_effect" {
-		return domain.AgentTurnReconciliation{}, fmt.Errorf("%w: turn has no tool effect to reconcile", domain.ErrConflict)
+	if currentRecovery != "unknown_external_effect" && currentRecovery != "safe_to_retry" && currentRecovery != "external_effect_confirmed" {
+		return domain.AgentTurnReconciliation{}, fmt.Errorf("%w: turn has no unresolved external effect", domain.ErrConflict)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_turn_reconciliations(id,turn_id,user_id,conversation_id,decision,note,created_at) VALUES(?,?,?,?,?,?,?)`, result.ID, turnID, userID, result.ConversationID, result.Decision, result.Note, at); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
-			return domain.AgentTurnReconciliation{}, domain.ErrConflict
-		}
-		return domain.AgentTurnReconciliation{}, err
-	}
-	sequence++
-	details, err := json.Marshal(map[string]string{"reconciliationId": result.ID, "decision": result.Decision})
+	_, _, malformedJournal, _, completedExternalEffect, _, err := inspectToolJournal(ctx, tx, turnID)
 	if err != nil {
 		return domain.AgentTurnReconciliation{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turnID, sequence), result.ConversationID, turnID, sequence, "turn.reconciled", details, at); err != nil {
+	if outcome == "no_effect_applied" && (malformedJournal || completedExternalEffect) {
+		return domain.AgentTurnReconciliation{}, fmt.Errorf("%w: the turn contains completed or unverifiable tool effects and cannot be replayed safely", domain.ErrConflict)
+	}
+	var existing domain.AgentTurnReconciliation
+	readErr := tx.QueryRowContext(ctx, `SELECT id,turn_id,conversation_id,decision,note,created_at FROM agent_turn_reconciliations WHERE turn_id=? AND user_id=?`, turnID, userID).
+		Scan(&existing.ID, &existing.TurnID, &existing.ConversationID, &existing.Decision, &existing.Note, &existing.CreatedAt)
+	if readErr != nil && !errors.Is(readErr, sql.ErrNoRows) {
+		return domain.AgentTurnReconciliation{}, readErr
+	}
+	if readErr == nil {
+		result.ID = existing.ID
+		if existing.Decision == result.Decision && existing.Note == result.Note && currentRecovery == recoveryClass && status == nextStatus {
+			if err := tx.Commit(); err != nil {
+				return domain.AgentTurnReconciliation{}, err
+			}
+			return existing, nil
+		}
+	}
+	sequence++
+	traceEventID := eventID(turnID, sequence)
+	details, err := json.Marshal(map[string]string{"reconciliationId": result.ID, "decision": result.Decision, "eventId": traceEventID})
+	if err != nil {
 		return domain.AgentTurnReconciliation{}, err
 	}
-	updatedTurn, err := tx.ExecContext(ctx, `UPDATE agent_turns SET recovery_class='manually_reconciled',last_sequence=?,updated_at=? WHERE id=? AND user_id=?`, sequence, at, turnID, userID)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_turn_reconciliation_events(id,turn_id,user_id,conversation_id,decision,note,created_at) VALUES(?,?,?,?,?,?,?)`, traceEventID, turnID, userID, result.ConversationID, result.Decision, result.Note, result.CreatedAt); err != nil {
+		return domain.AgentTurnReconciliation{}, err
+	}
+	if errors.Is(readErr, sql.ErrNoRows) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO agent_turn_reconciliations(id,turn_id,user_id,conversation_id,decision,note,created_at) VALUES(?,?,?,?,?,?,?)`, result.ID, turnID, userID, result.ConversationID, result.Decision, result.Note, result.CreatedAt); err != nil {
+			return domain.AgentTurnReconciliation{}, err
+		}
+	} else if _, err := tx.ExecContext(ctx, `UPDATE agent_turn_reconciliations SET decision=?,note=?,created_at=? WHERE turn_id=? AND user_id=?`, result.Decision, result.Note, result.CreatedAt, turnID, userID); err != nil {
+		return domain.AgentTurnReconciliation{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, traceEventID, result.ConversationID, turnID, sequence, "turn.reconciled", details, result.CreatedAt); err != nil {
+		return domain.AgentTurnReconciliation{}, err
+	}
+	updatedTurn, err := tx.ExecContext(ctx, `UPDATE agent_turns SET recovery_class=?,status=?,last_sequence=?,updated_at=? WHERE id=? AND user_id=?`, recoveryClass, nextStatus, sequence, result.CreatedAt, turnID, userID)
 	if err != nil {
 		return domain.AgentTurnReconciliation{}, err
 	}
@@ -277,7 +335,7 @@ func (s *Store) RecordAgentTurnReconciliation(ctx context.Context, userID, turnI
 	if turnCount != 1 {
 		return domain.AgentTurnReconciliation{}, domain.ErrNotFound
 	}
-	updated, err := tx.ExecContext(ctx, `UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?`, at, result.ConversationID, userID)
+	updated, err := tx.ExecContext(ctx, `UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?`, result.CreatedAt, result.ConversationID, userID)
 	if err != nil {
 		return domain.AgentTurnReconciliation{}, err
 	}
@@ -292,12 +350,57 @@ func (s *Store) RecordAgentTurnReconciliation(ctx context.Context, userID, turnI
 		return domain.AgentTurnReconciliation{}, err
 	}
 	var persisted domain.AgentTurnReconciliation
-	err = s.db.QueryRowContext(ctx, `SELECT id,turn_id,conversation_id,decision,note,created_at FROM agent_turn_reconciliations WHERE id=? AND user_id=?`, result.ID, userID).
-		Scan(&persisted.ID, &persisted.TurnID, &persisted.ConversationID, &persisted.Decision, &persisted.Note, &persisted.CreatedAt)
-	if err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id,turn_id,conversation_id,decision,note,created_at FROM agent_turn_reconciliations WHERE id=? AND user_id=?`, result.ID, userID).
+		Scan(&persisted.ID, &persisted.TurnID, &persisted.ConversationID, &persisted.Decision, &persisted.Note, &persisted.CreatedAt); err != nil {
 		return domain.AgentTurnReconciliation{}, err
 	}
+	var persistedRecovery, persistedStatus string
+	if err := s.db.QueryRowContext(ctx, `SELECT recovery_class,status FROM agent_turns WHERE id=? AND user_id=?`, turnID, userID).Scan(&persistedRecovery, &persistedStatus); err != nil {
+		return domain.AgentTurnReconciliation{}, err
+	}
+	if persisted.Decision != decision || persisted.Note != result.Note || persistedRecovery != recoveryClass || persistedStatus != nextStatus {
+		return domain.AgentTurnReconciliation{}, fmt.Errorf("agent turn reconciliation did not read back as the requested outcome")
+	}
 	return persisted, nil
+}
+
+func reconciliationState(outcome string) (decision, recoveryClass, status string, err error) {
+	switch strings.TrimSpace(outcome) {
+	case "no_effect_applied":
+		return "no_effect_applied", "safe_to_retry", "interrupted", nil
+	case "effect_applied":
+		return "effect_applied", "external_effect_confirmed", "interrupted", nil
+	case "still_unknown":
+		return "still_unknown", "unknown_external_effect", "needs_reconciliation", nil
+	default:
+		return "", "", "", domain.ErrInvalid
+	}
+}
+
+func (s *Store) AgentTurnReconciliations(ctx context.Context, userID, turnID string) ([]domain.AgentTurnReconciliation, error) {
+	if _, err := s.AgentTurn(ctx, userID, turnID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,turn_id,conversation_id,decision,note,created_at FROM agent_turn_reconciliation_events WHERE user_id=? AND turn_id=? ORDER BY created_at,id`, userID, turnID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]domain.AgentTurnReconciliation, 0)
+	for rows.Next() {
+		var item domain.AgentTurnReconciliation
+		if err := rows.Scan(&item.ID, &item.TurnID, &item.ConversationID, &item.Decision, &item.Note, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func (s *Store) startAgentTurn(ctx context.Context, userID string, turn domain.AgentTurn, input domain.Message, details json.RawMessage, retryOf, inboxID string, existingInput, editInput bool) error {
@@ -312,6 +415,13 @@ func (s *Store) startAgentTurn(ctx context.Context, userID string, turn domain.A
 	} else if err != nil {
 		return err
 	}
+	var unresolvedReconciliations int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_turns WHERE conversation_id=? AND user_id=? AND status='needs_reconciliation'`, turn.ConversationID, userID).Scan(&unresolvedReconciliations); err != nil {
+		return err
+	}
+	if unresolvedReconciliations > 0 {
+		return fmt.Errorf("%w: conversation has an external effect that requires reconciliation", domain.ErrConflict)
+	}
 	if inboxID != "" {
 		if wasPaused {
 			return fmt.Errorf("%w: conversation execution is paused", domain.ErrConflict)
@@ -319,15 +429,18 @@ func (s *Store) startAgentTurn(ctx context.Context, userID string, turn domain.A
 	}
 	var revisionPrior *string
 	if existingInput {
-		var currentStatus string
+		var currentStatus, currentRecoveryClass string
 		var conversationID string
 		var inputMessageID string
-		if err := tx.QueryRowContext(ctx, `SELECT conversation_id,status,input_message_id FROM agent_turns WHERE id=? AND user_id=?`, retryOf, userID).Scan(&conversationID, &currentStatus, &inputMessageID); errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(ctx, `SELECT conversation_id,status,input_message_id,recovery_class FROM agent_turns WHERE id=? AND user_id=?`, retryOf, userID).Scan(&conversationID, &currentStatus, &inputMessageID, &currentRecoveryClass); errors.Is(err, sql.ErrNoRows) {
 			return domain.ErrNotFound
 		} else if err != nil {
 			return err
 		}
-		if conversationID != input.ConversationID || inputMessageID != input.ID || (currentStatus != "cancelled" && currentStatus != "failed" && currentStatus != "interrupted" && currentStatus != "incomplete" && currentStatus != "needs_reconciliation") {
+		if currentRecoveryClass == "unknown_external_effect" || currentRecoveryClass == "external_effect_confirmed" {
+			return fmt.Errorf("%w: retry requires reconciliation of the previous external effect", domain.ErrConflict)
+		}
+		if conversationID != input.ConversationID || inputMessageID != input.ID || (currentStatus != "cancelled" && currentStatus != "failed" && currentStatus != "interrupted" && currentStatus != "incomplete") {
 			return domain.ErrConflict
 		}
 		var latestMessageID string
@@ -432,7 +545,31 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,'running',1,?,?)`, turn.ID, turn.ConversationID, us
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	readBack, err := s.AgentTurn(ctx, userID, turn.ID)
+	if err != nil {
+		return fmt.Errorf("read started Turn back: %w", err)
+	}
+	if readBack.Status != "running" || readBack.ConversationID != turn.ConversationID || readBack.InputMessageID != input.ID {
+		return fmt.Errorf("started Turn read-back mismatch: %w", domain.ErrConflict)
+	}
+	detail, err := s.Conversation(ctx, userID, input.ConversationID)
+	if err != nil {
+		return fmt.Errorf("read started Turn input back: %w", err)
+	}
+	foundInput := false
+	for _, message := range detail.Messages {
+		if message.ID == input.ID && message.Role == "user" && message.Content == input.Content {
+			foundInput = true
+			break
+		}
+	}
+	if !foundInput {
+		return fmt.Errorf("started Turn input was not read back: %w", domain.ErrConflict)
+	}
+	return nil
 }
 
 func (s *Store) AppendTurnEvent(ctx context.Context, userID, turnID, kind string, details json.RawMessage, at time.Time) error {
@@ -549,15 +686,15 @@ func (s *Store) ResumeAgentTurn(ctx context.Context, userID, turnID string, at t
 		return err
 	}
 	defer tx.Rollback()
-	var conversationID, status, recoveryClass, inboxID string
+	var conversationID, status, inboxID string
 	var sequence int
-	if err := tx.QueryRowContext(ctx, `SELECT conversation_id,status,recovery_class,last_sequence,inbox_id FROM agent_turns WHERE id=? AND user_id=?`, turnID, userID).Scan(&conversationID, &status, &recoveryClass, &sequence, &inboxID); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT conversation_id,status,last_sequence,inbox_id FROM agent_turns WHERE id=? AND user_id=?`, turnID, userID).Scan(&conversationID, &status, &sequence, &inboxID); errors.Is(err, sql.ErrNoRows) {
 		return domain.ErrNotFound
 	} else if err != nil {
 		return err
 	}
-	if status != "interrupted" || recoveryClass != "checkpoint_resumable" {
-		return fmt.Errorf("turn %s is not checkpoint-resumable: %w", turnID, domain.ErrConflict)
+	if status != "interrupted" {
+		return fmt.Errorf("turn %s is not interrupted: %w", turnID, domain.ErrConflict)
 	}
 	var version int
 	var resumeAllowed, checkpointStored bool
@@ -569,14 +706,14 @@ func (s *Store) ResumeAgentTurn(ctx context.Context, userID, turnID string, at t
 		return fmt.Errorf("turn %s uses an unsupported checkpoint version: %w", turnID, domain.ErrConflict)
 	}
 	sequence++
-	details, err := json.Marshal(map[string]string{"reason": "host_restart", "recoveryClass": "checkpoint_resumable"})
+	details, err := json.Marshal(map[string]string{"reason": "host_restart"})
 	if err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turnID, sequence), conversationID, turnID, sequence, "turn.resumed", details, at); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE agent_turns SET status='running',recovery_class='',stop_reason='',completed_at=NULL,last_sequence=?,updated_at=? WHERE id=? AND user_id=? AND status='interrupted' AND recovery_class='checkpoint_resumable'`, sequence, at, turnID, userID)
+	result, err := tx.ExecContext(ctx, `UPDATE agent_turns SET status='running',recovery_class='',stop_reason='',completed_at=NULL,last_sequence=?,updated_at=? WHERE id=? AND user_id=? AND status='interrupted'`, sequence, at, turnID, userID)
 	if err != nil {
 		return err
 	}
@@ -654,8 +791,19 @@ ON CONFLICT(turn_id,ordinal) DO UPDATE SET status='running',attempt_count=agent_
 }
 
 func (s *Store) FinishAgentTurn(ctx context.Context, userID, turnID, status, stopReason string, output *domain.Message, details json.RawMessage) error {
+	return s.FinishAgentTurnWithContinuation(ctx, userID, turnID, status, stopReason, output, details, nil)
+}
+
+// FinishAgentTurnWithContinuation atomically closes a Turn and persists its
+// encrypted budget continuation state, when the runtime has a safe checkpoint.
+func (s *Store) FinishAgentTurnWithContinuation(ctx context.Context, userID, turnID, status, stopReason string, output *domain.Message, details json.RawMessage, continuation *ContinuationState) error {
 	if status != "completed" && status != "incomplete" && status != "failed" && status != "cancelled" {
 		return domain.ErrInvalid
+	}
+	if continuation != nil {
+		if status != "incomplete" || continuation.Version != 1 || (len(continuation.Ciphertext) == 0) != (len(continuation.Nonce) == 0) || (len(continuation.Ciphertext) > 0 && continuation.ContentHash == "") || (len(continuation.Ciphertext) == 0 && continuation.UnavailableReason == "") {
+			return domain.ErrInvalid
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -673,6 +821,16 @@ func (s *Store) FinishAgentTurn(ctx context.Context, userID, turnID, status, sto
 		return fmt.Errorf("turn %s is already %s", turnID, current)
 	}
 	now := time.Now().UTC()
+	if continuation != nil {
+		continuationStatus := "available"
+		if len(continuation.Ciphertext) == 0 {
+			continuationStatus = "unavailable"
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO agent_continuation_snapshots(source_turn_id,user_id,conversation_id,snapshot_version,state_cipher,state_nonce,content_sha256,status,unavailable_reason,created_at,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)`, turnID, userID, conversationID, continuation.Version, continuation.Ciphertext, continuation.Nonce, continuation.ContentHash, continuationStatus, continuation.UnavailableReason, now, now); err != nil {
+			return err
+		}
+	}
 	resultMessageID := ""
 	if output != nil {
 		resultMessageID = output.ID
@@ -681,23 +839,24 @@ func (s *Store) FinishAgentTurn(ctx context.Context, userID, turnID, status, sto
 		}
 	}
 	terminalRecoveryClass := ""
-	if status == "completed" {
-		terminalRecoveryClass = "not_replayable"
-	} else if status == "failed" || status == "cancelled" || status == "incomplete" {
-		_, _, malformedToolJournal, unsafeToolEffect, _, inspectErr := inspectToolJournal(ctx, tx, turnID)
-		if inspectErr != nil {
-			return inspectErr
-		}
-		if malformedToolJournal || unsafeToolEffect {
-			terminalRecoveryClass = "unknown_external_effect"
-		} else {
-			terminalRecoveryClass = "safe_to_retry"
-		}
-	}
 	sequence++
 	kind := "turn." + status
 	if _, err = tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turnID, sequence), conversationID, turnID, sequence, kind, []byte(details), now); err != nil {
 		return err
+	}
+	if continuation != nil {
+		continuationStatus := "available"
+		if len(continuation.Ciphertext) == 0 {
+			continuationStatus = "unavailable"
+		}
+		continuationDetails, marshalErr := json.Marshal(map[string]string{"status": continuationStatus, "reason": continuation.UnavailableReason})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		sequence++
+		if _, err = tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turnID, sequence), conversationID, turnID, sequence, "turn.continuation_saved", continuationDetails, now); err != nil {
+			return err
+		}
 	}
 	childStatus := status
 	if status == "completed" {
@@ -710,8 +869,7 @@ func (s *Store) FinishAgentTurn(ctx context.Context, userID, turnID, status, sto
 		return err
 	}
 	updatedTurn, err := tx.ExecContext(ctx, `UPDATE agent_turns SET status=?,stop_reason=?,result_message_id=NULLIF(?,''),
-recovery_class=CASE WHEN ?<>'' THEN ? ELSE recovery_class END,
-	last_sequence=?,updated_at=?,completed_at=? WHERE id=? AND user_id=? AND status IN ('running','cancelling','awaiting_approval')`, status, stopReason, resultMessageID, terminalRecoveryClass, terminalRecoveryClass, sequence, now, now, turnID, userID)
+	recovery_class=?,last_sequence=?,updated_at=?,completed_at=? WHERE id=? AND user_id=? AND status IN ('running','cancelling','awaiting_approval')`, status, stopReason, resultMessageID, terminalRecoveryClass, sequence, now, now, turnID, userID)
 	if err != nil {
 		return err
 	}
@@ -742,7 +900,318 @@ recovery_class=CASE WHEN ?<>'' THEN ? ELSE recovery_class END,
 	if updatedCount != 1 {
 		return domain.ErrNotFound
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if continuation != nil {
+		var persistedStatus, persistedHash string
+		if err := s.db.QueryRowContext(ctx, `SELECT status,content_sha256 FROM agent_continuation_snapshots WHERE source_turn_id=? AND user_id=?`, turnID, userID).Scan(&persistedStatus, &persistedHash); err != nil {
+			return err
+		}
+		expectedStatus := "available"
+		if len(continuation.Ciphertext) == 0 {
+			expectedStatus = "unavailable"
+		}
+		if persistedStatus != expectedStatus || persistedHash != continuation.ContentHash {
+			return fmt.Errorf("continuation snapshot read-back mismatch for turn %q", turnID)
+		}
+	}
+	return nil
+}
+
+func (s *Store) AgentContinuationSnapshot(ctx context.Context, userID, turnID string) (AgentContinuationSnapshot, error) {
+	var snapshot AgentContinuationSnapshot
+	err := s.db.QueryRowContext(ctx, `SELECT source_turn_id,conversation_id,snapshot_version,state_cipher,state_nonce,content_sha256,status,unavailable_reason,idempotency_key,consumed_turn_id
+FROM agent_continuation_snapshots WHERE source_turn_id=? AND user_id=?`, turnID, userID).
+		Scan(&snapshot.SourceTurnID, &snapshot.ConversationID, &snapshot.Version, &snapshot.Ciphertext, &snapshot.Nonce, &snapshot.ContentHash, &snapshot.Status, &snapshot.UnavailableReason, &snapshot.IdempotencyKey, &snapshot.ConsumedTurnID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return snapshot, domain.ErrNotFound
+	}
+	return snapshot, err
+}
+
+// RecordContinuationIntent persists the model's routing decision against the
+// checkpoint it inspected. The checkpoint remains available until the
+// continuation transaction consumes it.
+func (s *Store) RecordContinuationIntent(ctx context.Context, userID, turnID string, details json.RawMessage) error {
+	if userID == "" || turnID == "" || !json.Valid(details) {
+		return domain.ErrInvalid
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var conversationID, turnStatus, snapshotStatus string
+	var sequence int
+	err = tx.QueryRowContext(ctx, `SELECT t.conversation_id,t.status,t.last_sequence,s.status
+FROM agent_turns t JOIN agent_continuation_snapshots s ON s.source_turn_id=t.id AND s.user_id=t.user_id
+WHERE t.id=? AND t.user_id=?`, turnID, userID).Scan(&conversationID, &turnStatus, &sequence, &snapshotStatus)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if turnStatus != "incomplete" || snapshotStatus != "available" {
+		return domain.ErrConflict
+	}
+	now := time.Now().UTC()
+	sequence++
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turnID, sequence), conversationID, turnID, sequence, "continuation.intent_classified", []byte(details), now); err != nil {
+		return err
+	}
+	updated, err := tx.ExecContext(ctx, `UPDATE agent_turns SET last_sequence=?,updated_at=? WHERE id=? AND user_id=? AND status='incomplete'`, sequence, now, turnID, userID)
+	if err != nil {
+		return err
+	}
+	count, err := updated.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return domain.ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	var persistedKind string
+	var persistedDetails []byte
+	var persistedSequence int
+	err = s.db.QueryRowContext(ctx, `SELECT e.kind,e.details_json,e.sequence FROM agent_trace_events e JOIN agent_turns t ON t.id=e.turn_id WHERE e.turn_id=? AND t.user_id=? AND e.sequence=?`, turnID, userID, sequence).Scan(&persistedKind, &persistedDetails, &persistedSequence)
+	if err != nil {
+		return err
+	}
+	if persistedKind != "continuation.intent_classified" || persistedSequence != sequence || string(persistedDetails) != string(details) {
+		return fmt.Errorf("continuation intent event read-back mismatch for turn %q", turnID)
+	}
+	return nil
+}
+
+func (s *Store) InvalidateAgentContinuationSnapshot(ctx context.Context, userID, turnID, reason string) error {
+	if userID == "" || turnID == "" || reason == "" || len(reason) > 120 {
+		return domain.ErrInvalid
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var conversationID, status string
+	var sequence int
+	if err := tx.QueryRowContext(ctx, `SELECT s.conversation_id,s.status,t.last_sequence FROM agent_continuation_snapshots s JOIN agent_turns t ON t.id=s.source_turn_id WHERE s.source_turn_id=? AND s.user_id=?`, turnID, userID).Scan(&conversationID, &status, &sequence); errors.Is(err, sql.ErrNoRows) {
+		return domain.ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if status == "invalidated" {
+		var persistedReason string
+		if err := tx.QueryRowContext(ctx, `SELECT unavailable_reason FROM agent_continuation_snapshots WHERE source_turn_id=? AND user_id=?`, turnID, userID).Scan(&persistedReason); err != nil {
+			return err
+		}
+		if persistedReason != reason {
+			return domain.ErrConflict
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return s.verifyInvalidatedContinuation(ctx, userID, turnID, reason)
+	}
+	if status != "available" {
+		return domain.ErrConflict
+	}
+	sequence++
+	details, err := json.Marshal(map[string]string{"reason": reason})
+	if err != nil {
+		return err
+	}
+	updated, err := tx.ExecContext(ctx, `UPDATE agent_continuation_snapshots SET status='invalidated',unavailable_reason=?,state_cipher=X'',state_nonce=X'',updated_at=? WHERE source_turn_id=? AND user_id=? AND status='available'`, reason, time.Now().UTC(), turnID, userID)
+	if err != nil {
+		return err
+	}
+	updatedCount, err := updated.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updatedCount != 1 {
+		return domain.ErrConflict
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turnID, sequence), conversationID, turnID, sequence, "turn.continuation_invalidated", details, time.Now().UTC()); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_turns SET last_sequence=?,updated_at=? WHERE id=? AND user_id=?`, sequence, time.Now().UTC(), turnID, userID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.verifyInvalidatedContinuation(ctx, userID, turnID, reason)
+}
+
+func (s *Store) verifyInvalidatedContinuation(ctx context.Context, userID, turnID, reason string) error {
+	var persistedStatus, persistedReason string
+	if err := s.db.QueryRowContext(ctx, `SELECT status,unavailable_reason FROM agent_continuation_snapshots WHERE source_turn_id=? AND user_id=?`, turnID, userID).Scan(&persistedStatus, &persistedReason); err != nil {
+		return err
+	}
+	if persistedStatus != "invalidated" || persistedReason != reason {
+		return fmt.Errorf("continuation invalidation read-back mismatch for turn %q", turnID)
+	}
+	return nil
+}
+
+// StartContinuationAgentTurn consumes one available snapshot and creates the
+// child Turn, input message, initial encrypted checkpoint, and events in one
+// transaction. Repeating the same idempotency key returns the existing child.
+func (s *Store) StartContinuationAgentTurn(ctx context.Context, userID, sourceTurnID, idempotencyKey string, turn domain.AgentTurn, input domain.Message, details json.RawMessage, checkpointCipher, checkpointNonce []byte) (domain.TurnReceipt, bool, error) {
+	if userID == "" || sourceTurnID == "" || idempotencyKey == "" || len(idempotencyKey) > 200 || turn.ID == "" || turn.UserID != userID || turn.InputMessageID != input.ID || input.ConversationID != turn.ConversationID || input.ID == "" || input.Role != "user" || strings.TrimSpace(input.Content) == "" || !json.Valid(details) || len(checkpointCipher) == 0 || len(checkpointNonce) == 0 || len(checkpointCipher) > (16<<20)+(1<<10) {
+		return domain.TurnReceipt{}, false, domain.ErrInvalid
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	defer tx.Rollback()
+	var conversationID, status, snapshotStatus, snapshotKey, consumedTurnID string
+	var sourceProvider, sourceGeneration, sourceDigest, sourceProfile, sourceChainID string
+	var sourceSequence int
+	err = tx.QueryRowContext(ctx, `SELECT s.conversation_id,t.status,s.status,s.idempotency_key,s.consumed_turn_id,t.provider_id,t.generation_id,t.definition_digest,t.permission_profile,t.continuation_chain_id,t.last_sequence
+FROM agent_continuation_snapshots s JOIN agent_turns t ON t.id=s.source_turn_id
+WHERE s.source_turn_id=? AND s.user_id=?`, sourceTurnID, userID).
+		Scan(&conversationID, &status, &snapshotStatus, &snapshotKey, &consumedTurnID, &sourceProvider, &sourceGeneration, &sourceDigest, &sourceProfile, &sourceChainID, &sourceSequence)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.TurnReceipt{}, false, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	if snapshotStatus == "consumed" {
+		if snapshotKey != idempotencyKey || consumedTurnID == "" {
+			return domain.TurnReceipt{}, false, domain.ErrConflict
+		}
+		var receipt domain.TurnReceipt
+		err = tx.QueryRowContext(ctx, `SELECT id,conversation_id,input_message_id,status,continued_from_turn_id,continuation_chain_id FROM agent_turns WHERE id=? AND user_id=?`, consumedTurnID, userID).
+			Scan(&receipt.TurnID, &receipt.ConversationID, &receipt.InputMessageID, &receipt.Status, &receipt.ContinuedFromTurnID, &receipt.ContinuationChainID)
+		if err != nil {
+			return domain.TurnReceipt{}, false, err
+		}
+		return receipt, false, nil
+	}
+	if snapshotStatus != "available" || status != "incomplete" || conversationID != turn.ConversationID || turn.ProviderID != sourceProvider || turn.AgentGenerationID != sourceGeneration || turn.AgentDefinitionDigest != sourceDigest || string(turn.PermissionProfile) != sourceProfile {
+		return domain.TurnReceipt{}, false, fmt.Errorf("%w: continuation snapshot is unavailable or its execution binding changed", domain.ErrConflict)
+	}
+	var latestMessageID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM messages WHERE conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1`, conversationID).Scan(&latestMessageID); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	var sourceResultID string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(result_message_id,'') FROM agent_turns WHERE id=? AND user_id=?`, sourceTurnID, userID).Scan(&sourceResultID); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	if sourceResultID == "" || latestMessageID != sourceResultID {
+		reason := "conversation_changed"
+		details, marshalErr := json.Marshal(map[string]string{"reason": reason})
+		if marshalErr != nil {
+			return domain.TurnReceipt{}, false, marshalErr
+		}
+		now := time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_continuation_snapshots SET status='invalidated',unavailable_reason=?,state_cipher=X'',state_nonce=X'',updated_at=? WHERE source_turn_id=? AND user_id=? AND status='available'`, reason, now, sourceTurnID, userID); err != nil {
+			return domain.TurnReceipt{}, false, err
+		}
+		sourceSequence++
+		if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(sourceTurnID, sourceSequence), conversationID, sourceTurnID, sourceSequence, "turn.continuation_invalidated", details, now); err != nil {
+			return domain.TurnReceipt{}, false, err
+		}
+		updatedSource, err := tx.ExecContext(ctx, `UPDATE agent_turns SET last_sequence=?,updated_at=? WHERE id=? AND user_id=?`, sourceSequence, now, sourceTurnID, userID)
+		if err != nil {
+			return domain.TurnReceipt{}, false, err
+		}
+		updatedCount, err := updatedSource.RowsAffected()
+		if err != nil {
+			return domain.TurnReceipt{}, false, err
+		}
+		if updatedCount != 1 {
+			return domain.TurnReceipt{}, false, domain.ErrConflict
+		}
+		if err := tx.Commit(); err != nil {
+			return domain.TurnReceipt{}, false, err
+		}
+		if err := s.verifyInvalidatedContinuation(ctx, userID, sourceTurnID, reason); err != nil {
+			return domain.TurnReceipt{}, false, err
+		}
+		return domain.TurnReceipt{}, false, fmt.Errorf("%w: conversation changed after the incomplete Turn", domain.ErrConflict)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?)`, input.ID, conversationID, input.Role, input.Content, input.CreatedAt); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	profile := turn.PermissionProfile
+	if !profile.Valid() {
+		return domain.TurnReceipt{}, false, domain.ErrInvalid
+	}
+	chainID := sourceChainID
+	if chainID == "" {
+		chainID = sourceTurnID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_turns(id,conversation_id,user_id,input_message_id,provider_id,generation_id,definition_digest,permission_profile,retry_of_turn_id,continued_from_turn_id,continuation_chain_id,input_content_snapshot,inbox_id,status,last_sequence,started_at,updated_at)
+VALUES(?,?,?,?,?,?,?,?,'',?,?,?,?,'running',2,?,?)`, turn.ID, conversationID, userID, input.ID, turn.ProviderID, turn.AgentGenerationID, turn.AgentDefinitionDigest, profile, sourceTurnID, chainID, input.Content, "", turn.StartedAt, turn.UpdatedAt); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return domain.TurnReceipt{}, false, domain.ErrConflict
+		}
+		return domain.TurnReceipt{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turn.ID, 1), conversationID, turn.ID, 1, "turn.started", []byte(details), turn.StartedAt); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	continuedDetails, err := json.Marshal(map[string]string{"continuedFromTurnId": sourceTurnID})
+	if err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(turn.ID, 2), conversationID, turn.ID, 2, "turn.continued", continuedDetails, turn.StartedAt); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_turn_checkpoints(turn_id,checkpoint_version,state_cipher,state_nonce,resume_allowed,event_sequence,updated_at) VALUES(?,1,?,?,1,2,?)`, turn.ID, checkpointCipher, checkpointNonce, turn.StartedAt); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	updated, err := tx.ExecContext(ctx, `UPDATE agent_continuation_snapshots SET status='consumed',idempotency_key=?,consumed_turn_id=?,updated_at=? WHERE source_turn_id=? AND user_id=? AND status='available'`, idempotencyKey, turn.ID, turn.StartedAt, sourceTurnID, userID)
+	if err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	count, err := updated.RowsAffected()
+	if err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	if count != 1 {
+		return domain.TurnReceipt{}, false, domain.ErrConflict
+	}
+	conversationUpdate, err := tx.ExecContext(ctx, `UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?`, turn.StartedAt, conversationID, userID)
+	if err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	conversationCount, err := conversationUpdate.RowsAffected()
+	if err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	if conversationCount != 1 {
+		return domain.TurnReceipt{}, false, domain.ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	var persistedStatus, persistedChild string
+	if err := s.db.QueryRowContext(ctx, `SELECT s.status,s.consumed_turn_id FROM agent_continuation_snapshots s WHERE s.source_turn_id=? AND s.user_id=?`, sourceTurnID, userID).Scan(&persistedStatus, &persistedChild); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	if persistedStatus != "consumed" || persistedChild != turn.ID {
+		return domain.TurnReceipt{}, false, fmt.Errorf("continuation consumption read-back mismatch")
+	}
+	var receipt domain.TurnReceipt
+	if err := s.db.QueryRowContext(ctx, `SELECT id,conversation_id,input_message_id,status,continued_from_turn_id,continuation_chain_id FROM agent_turns WHERE id=? AND user_id=?`, turn.ID, userID).
+		Scan(&receipt.TurnID, &receipt.ConversationID, &receipt.InputMessageID, &receipt.Status, &receipt.ContinuedFromTurnID, &receipt.ContinuationChainID); err != nil {
+		return domain.TurnReceipt{}, false, err
+	}
+	if receipt.Status != "running" || receipt.ConversationID != conversationID || receipt.InputMessageID != input.ID || receipt.ContinuedFromTurnID != sourceTurnID || receipt.ContinuationChainID != chainID {
+		return domain.TurnReceipt{}, false, fmt.Errorf("continued Turn read-back mismatch for source %q", sourceTurnID)
+	}
+	return receipt, true, nil
 }
 
 func (s *Store) RequestAgentTurnCancel(ctx context.Context, userID, turnID, reason string) error {
@@ -878,8 +1347,8 @@ func (s *Store) CancelConversationAgentWork(ctx context.Context, userID, convers
 }
 
 func (s *Store) AgentTurns(ctx context.Context, userID, conversationID string) ([]domain.AgentTurn, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.id,t.conversation_id,t.user_id,t.input_message_id,COALESCE(t.result_message_id,''),t.provider_id,t.generation_id,t.definition_digest,t.permission_profile,t.status,t.stop_reason,t.recovery_class,t.cancel_requested,t.last_sequence,t.started_at,t.updated_at,t.completed_at,COALESCE(t.retry_of_turn_id,''),COALESCE(r.note,'')
-FROM agent_turns t LEFT JOIN agent_turn_reconciliations r ON r.turn_id=t.id AND r.user_id=t.user_id WHERE t.user_id=? AND t.conversation_id=? ORDER BY t.started_at DESC`, userID, conversationID)
+	rows, err := s.db.QueryContext(ctx, `SELECT t.id,t.conversation_id,t.user_id,t.input_message_id,COALESCE(t.result_message_id,''),COALESCE(output.role,''),COALESCE(output.content,''),t.provider_id,t.generation_id,t.definition_digest,t.permission_profile,t.status,t.stop_reason,t.recovery_class,t.cancel_requested,t.last_sequence,t.started_at,t.updated_at,t.completed_at,COALESCE(t.retry_of_turn_id,''),COALESCE(r.note,''),COALESCE(t.continued_from_turn_id,''),COALESCE(NULLIF(t.continuation_chain_id,''),CASE WHEN s.source_turn_id IS NOT NULL THEN t.id ELSE '' END),COALESCE(s.status='available',0),COALESCE(s.unavailable_reason,'')
+FROM agent_turns t LEFT JOIN messages output ON output.id=t.result_message_id AND output.conversation_id=t.conversation_id LEFT JOIN agent_turn_reconciliations r ON r.turn_id=t.id AND r.user_id=t.user_id LEFT JOIN agent_continuation_snapshots s ON s.source_turn_id=t.id AND s.user_id=t.user_id WHERE t.user_id=? AND t.conversation_id=? ORDER BY t.started_at DESC`, userID, conversationID)
 	if err != nil {
 		return nil, err
 	}
@@ -888,23 +1357,51 @@ FROM agent_turns t LEFT JOIN agent_turn_reconciliations r ON r.turn_id=t.id AND 
 	for rows.Next() {
 		var turn domain.AgentTurn
 		var completed sql.NullTime
-		if err := rows.Scan(&turn.ID, &turn.ConversationID, &turn.UserID, &turn.InputMessageID, &turn.ResultMessageID, &turn.ProviderID, &turn.AgentGenerationID, &turn.AgentDefinitionDigest, &turn.PermissionProfile, &turn.Status, &turn.StopReason, &turn.RecoveryClass, &turn.CancelRequested, &turn.LastSequence, &turn.StartedAt, &turn.UpdatedAt, &completed, &turn.RetryOfTurnID, &turn.ReconciliationNote); err != nil {
+		var outputRole, outputContent string
+		if err := rows.Scan(&turn.ID, &turn.ConversationID, &turn.UserID, &turn.InputMessageID, &turn.ResultMessageID, &outputRole, &outputContent, &turn.ProviderID, &turn.AgentGenerationID, &turn.AgentDefinitionDigest, &turn.PermissionProfile, &turn.Status, &turn.StopReason, &turn.RecoveryClass, &turn.CancelRequested, &turn.LastSequence, &turn.StartedAt, &turn.UpdatedAt, &completed, &turn.RetryOfTurnID, &turn.ReconciliationNote, &turn.ContinuedFromTurnID, &turn.ContinuationChainID, &turn.ContinuationAvailable, &turn.ContinuationUnavailableReason); err != nil {
 			return nil, err
 		}
+		turn.CompletionAssessment = completionAssessmentFromOutput(turn.ResultMessageID, outputRole, outputContent)
 		if completed.Valid {
 			turn.CompletedAt = &completed.Time
 		}
 		result = append(result, turn)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range result {
+		evidenceRefs, err := s.agentTurnToolEvidenceRefs(ctx, result[index].ID)
+		if err != nil {
+			return nil, err
+		}
+		result[index].CompletionAssessment.EvidenceRefs = evidenceRefs
+		result[index].RunState, err = s.agentTurnRunState(ctx, result[index])
+		if err != nil {
+			return nil, err
+		}
+		if result[index].ContinuationChainID == "" {
+			continue
+		}
+		metrics, err := s.ContinuationChainMetrics(ctx, userID, result[index].ContinuationChainID)
+		if err != nil {
+			return nil, err
+		}
+		result[index].CumulativeMetrics = metrics
+	}
+	return result, nil
 }
 
 func (s *Store) AgentTurn(ctx context.Context, userID, turnID string) (domain.AgentTurn, error) {
 	var turn domain.AgentTurn
 	var completed sql.NullTime
-	err := s.db.QueryRowContext(ctx, `SELECT t.id,t.conversation_id,t.user_id,t.input_message_id,COALESCE(t.result_message_id,''),t.provider_id,t.generation_id,t.definition_digest,t.permission_profile,t.status,t.stop_reason,t.recovery_class,t.cancel_requested,t.last_sequence,t.started_at,t.updated_at,t.completed_at,COALESCE(t.retry_of_turn_id,''),COALESCE(r.note,'')
-FROM agent_turns t LEFT JOIN agent_turn_reconciliations r ON r.turn_id=t.id AND r.user_id=t.user_id WHERE t.id=? AND t.user_id=?`, turnID, userID).
-		Scan(&turn.ID, &turn.ConversationID, &turn.UserID, &turn.InputMessageID, &turn.ResultMessageID, &turn.ProviderID, &turn.AgentGenerationID, &turn.AgentDefinitionDigest, &turn.PermissionProfile, &turn.Status, &turn.StopReason, &turn.RecoveryClass, &turn.CancelRequested, &turn.LastSequence, &turn.StartedAt, &turn.UpdatedAt, &completed, &turn.RetryOfTurnID, &turn.ReconciliationNote)
+	var outputRole, outputContent string
+	err := s.db.QueryRowContext(ctx, `SELECT t.id,t.conversation_id,t.user_id,t.input_message_id,COALESCE(t.result_message_id,''),COALESCE(output.role,''),COALESCE(output.content,''),t.provider_id,t.generation_id,t.definition_digest,t.permission_profile,t.status,t.stop_reason,t.recovery_class,t.cancel_requested,t.last_sequence,t.started_at,t.updated_at,t.completed_at,COALESCE(t.retry_of_turn_id,''),COALESCE(r.note,''),COALESCE(t.continued_from_turn_id,''),COALESCE(NULLIF(t.continuation_chain_id,''),CASE WHEN s.source_turn_id IS NOT NULL THEN t.id ELSE '' END),COALESCE(s.status='available',0),COALESCE(s.unavailable_reason,'')
+FROM agent_turns t LEFT JOIN messages output ON output.id=t.result_message_id AND output.conversation_id=t.conversation_id LEFT JOIN agent_turn_reconciliations r ON r.turn_id=t.id AND r.user_id=t.user_id LEFT JOIN agent_continuation_snapshots s ON s.source_turn_id=t.id AND s.user_id=t.user_id WHERE t.id=? AND t.user_id=?`, turnID, userID).
+		Scan(&turn.ID, &turn.ConversationID, &turn.UserID, &turn.InputMessageID, &turn.ResultMessageID, &outputRole, &outputContent, &turn.ProviderID, &turn.AgentGenerationID, &turn.AgentDefinitionDigest, &turn.PermissionProfile, &turn.Status, &turn.StopReason, &turn.RecoveryClass, &turn.CancelRequested, &turn.LastSequence, &turn.StartedAt, &turn.UpdatedAt, &completed, &turn.RetryOfTurnID, &turn.ReconciliationNote, &turn.ContinuedFromTurnID, &turn.ContinuationChainID, &turn.ContinuationAvailable, &turn.ContinuationUnavailableReason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return turn, domain.ErrNotFound
 	}
@@ -914,7 +1411,293 @@ FROM agent_turns t LEFT JOIN agent_turn_reconciliations r ON r.turn_id=t.id AND 
 	if completed.Valid {
 		turn.CompletedAt = &completed.Time
 	}
+	turn.CompletionAssessment = completionAssessmentFromOutput(turn.ResultMessageID, outputRole, outputContent)
+	turn.CompletionAssessment.EvidenceRefs, err = s.agentTurnToolEvidenceRefs(ctx, turn.ID)
+	if err != nil {
+		return turn, err
+	}
+	turn.RunState, err = s.agentTurnRunState(ctx, turn)
+	if err != nil {
+		return turn, err
+	}
+	if turn.ContinuationChainID != "" {
+		turn.CumulativeMetrics, err = s.ContinuationChainMetrics(ctx, userID, turn.ContinuationChainID)
+		if err != nil {
+			return turn, err
+		}
+	}
 	return turn, nil
+}
+
+func completionAssessmentFromOutput(messageID, role, content string) domain.CompletionAssessment {
+	assessment := domain.CompletionAssessment{Status: "unassessed"}
+	if messageID != "" && role == "assistant" {
+		assessment.Status = "unverified"
+		assessment.AssistantSourceRef = "message:" + messageID + "#" + messageContentHash(content)
+	}
+	return assessment
+}
+
+func (s *Store) agentTurnRunState(ctx context.Context, turn domain.AgentTurn) (domain.RunState, error) {
+	state := domain.RunState{
+		Version: 1, Completeness: "complete",
+		CompletenessNote: "execution observations only; tool outcomes do not verify that the user's goal was achieved",
+		Actions:          []domain.RunStateAction{}, PendingActions: []domain.RunStateAction{},
+	}
+	var startDetails []byte
+	err := s.db.QueryRowContext(ctx, `SELECT e.details_json FROM agent_trace_events e JOIN agent_turns t ON t.id=e.turn_id WHERE e.turn_id=? AND t.user_id=? AND e.kind='turn.started' ORDER BY e.sequence LIMIT 1`, turn.ID, turn.UserID).Scan(&startDetails)
+	if errors.Is(err, sql.ErrNoRows) {
+		state.Completeness = "degraded"
+		state.CompletenessNote = "turn.started source details are missing"
+	} else if err != nil {
+		return state, err
+	} else if !json.Valid(startDetails) {
+		return state, fmt.Errorf("Turn %q has invalid turn.started details", turn.ID)
+	} else {
+		var details struct {
+			InputSourceRef string `json:"inputSourceRef"`
+		}
+		if err := json.Unmarshal(startDetails, &details); err != nil {
+			return state, err
+		}
+		if details.InputSourceRef != "" {
+			if !strings.HasPrefix(details.InputSourceRef, "message:"+turn.InputMessageID+"#") {
+				return state, fmt.Errorf("Turn %q input source does not match its input message", turn.ID)
+			}
+			content, _, readErr := s.ReadContextSource(ctx, turn.UserID, turn.ConversationID, details.InputSourceRef)
+			if errors.Is(readErr, domain.ErrNotFound) {
+				state.CurrentRequest = &domain.RunStateFact{ID: "request:" + turn.InputMessageID, Kind: "current_request", Status: "active", SourceKind: "user_message", Verification: "source_missing", SourceRef: details.InputSourceRef}
+				state.Completeness = "degraded"
+				state.CompletenessNote = "input message source is unavailable"
+			} else if readErr != nil {
+				return state, readErr
+			} else {
+				state.CurrentRequest = &domain.RunStateFact{ID: "request:" + turn.InputMessageID, Kind: "current_request", Statement: content, Status: "active", SourceKind: "user_message", Verification: "source_available", SourceRef: details.InputSourceRef}
+			}
+		} else {
+			var content string
+			readErr := s.db.QueryRowContext(ctx, `SELECT content FROM messages WHERE id=? AND conversation_id=? AND role='user'`, turn.InputMessageID, turn.ConversationID).Scan(&content)
+			if errors.Is(readErr, sql.ErrNoRows) {
+				state.Completeness = "degraded"
+				state.CompletenessNote = "legacy turn has no input source reference and its message is unavailable"
+			} else if readErr != nil {
+				return state, readErr
+			} else {
+				state.CurrentRequest = &domain.RunStateFact{ID: "request:" + turn.InputMessageID, Kind: "current_request", Statement: content, Status: "active", SourceKind: "user_message", Verification: "legacy_current_message_only", SourceRef: "message:" + turn.InputMessageID + "#" + messageContentHash(content)}
+				state.Completeness = "degraded"
+				state.CompletenessNote = "legacy turn did not pin the exact input revision in its start event"
+			}
+		}
+	}
+
+	if turn.ResultMessageID != "" {
+		var role, content string
+		readErr := s.db.QueryRowContext(ctx, `SELECT role,content FROM messages WHERE id=? AND conversation_id=?`, turn.ResultMessageID, turn.ConversationID).Scan(&role, &content)
+		if readErr != nil && !errors.Is(readErr, sql.ErrNoRows) {
+			return state, readErr
+		}
+		if readErr == nil && role == "assistant" {
+			state.AssistantResponse = &domain.RunStateFact{ID: "assistant-response:" + turn.ResultMessageID, Kind: "assistant_response", Status: "assistant_reported", SourceKind: "assistant_message", Verification: "unverified", SourceRef: "message:" + turn.ResultMessageID + "#" + messageContentHash(content)}
+		}
+	}
+
+	rows, err := s.db.QueryContext(ctx, `SELECT e.sequence,e.kind,e.details_json FROM agent_trace_events e JOIN agent_turns t ON t.id=e.turn_id WHERE e.turn_id=? AND t.user_id=? AND e.kind IN ('tool.started','tool.completed') ORDER BY e.sequence`, turn.ID, turn.UserID)
+	if err != nil {
+		return state, err
+	}
+	type traceRow struct {
+		sequence int
+		kind     string
+		details  []byte
+	}
+	events := []traceRow{}
+	for rows.Next() {
+		var event traceRow
+		if err := rows.Scan(&event.sequence, &event.kind, &event.details); err != nil {
+			rows.Close()
+			return state, err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return state, err
+	}
+	if err := rows.Close(); err != nil {
+		return state, err
+	}
+	pending := map[string]domain.RunStateAction{}
+	for _, event := range events {
+		if !json.Valid(event.details) {
+			return state, fmt.Errorf("Turn %q has invalid %s details", turn.ID, event.kind)
+		}
+		var details struct {
+			ToolCallID string `json:"toolCallId"`
+			Name       string `json:"name"`
+			Effect     string `json:"effect"`
+			SourceRef  string `json:"sourceRef"`
+			OK         *bool  `json:"ok"`
+		}
+		if err := json.Unmarshal(event.details, &details); err != nil {
+			return state, err
+		}
+		if details.ToolCallID == "" {
+			state.Completeness = "degraded"
+			state.CompletenessNote = "one or more tool events have no tool call ID"
+			continue
+		}
+		action := domain.RunStateAction{Sequence: event.sequence, ToolCallID: details.ToolCallID, ToolName: details.Name, Effect: details.Effect, Status: "in_flight", SourceAvailable: "not_applicable"}
+		if event.kind == "tool.started" {
+			pending[details.ToolCallID] = action
+			continue
+		}
+		if details.OK == nil {
+			action.Status = "tool_reported_unknown"
+			state.Completeness = "degraded"
+			state.CompletenessNote = "one or more tool completion events have no outcome"
+		} else if *details.OK {
+			action.Status = "tool_reported_ok"
+		} else {
+			action.Status = "tool_reported_failure"
+		}
+		if started, ok := pending[details.ToolCallID]; ok {
+			action.ToolName = details.Name
+			if action.ToolName == "" {
+				action.ToolName = started.ToolName
+			}
+			action.Effect = started.Effect
+			delete(pending, details.ToolCallID)
+		}
+		action.SourceRef = details.SourceRef
+		if action.SourceRef != "" {
+			if action.SourceRef != "tool_result:"+details.ToolCallID {
+				return state, fmt.Errorf("Turn %q tool source does not match call %q", turn.ID, details.ToolCallID)
+			}
+			var sourceType, sourceHash string
+			readErr := s.db.QueryRowContext(ctx, `SELECT source_type,content_sha256 FROM context_sources WHERE source_id=? AND conversation_id=? AND user_id=?`, action.SourceRef, turn.ConversationID, turn.UserID).Scan(&sourceType, &sourceHash)
+			if errors.Is(readErr, sql.ErrNoRows) {
+				action.SourceAvailable = "missing"
+				state.Completeness = "degraded"
+				state.CompletenessNote = "one or more tool result sources are unavailable"
+			} else if readErr != nil {
+				return state, readErr
+			} else if sourceType != "tool_result" {
+				return state, fmt.Errorf("Turn %q source %q is not a tool result", turn.ID, action.SourceRef)
+			} else {
+				action.SourceAvailable = "available"
+				action.SourceHash = sourceHash
+			}
+		} else {
+			action.SourceAvailable = "missing"
+			state.Completeness = "degraded"
+			state.CompletenessNote = "one or more tool completion events have no source reference"
+		}
+		state.Actions = append(state.Actions, action)
+	}
+	for _, action := range pending {
+		state.PendingActions = append(state.PendingActions, action)
+	}
+	sort.Slice(state.PendingActions, func(i, j int) bool { return state.PendingActions[i].Sequence < state.PendingActions[j].Sequence })
+	return state, nil
+}
+
+func (s *Store) agentTurnToolEvidenceRefs(ctx context.Context, turnID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT e.details_json,e.conversation_id,t.user_id FROM agent_trace_events e JOIN agent_turns t ON t.id=e.turn_id WHERE e.turn_id=? AND e.kind='tool.completed' ORDER BY e.sequence`, turnID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type evidenceCandidate struct{ ref, conversationID, userID string }
+	candidates := []evidenceCandidate{}
+	for rows.Next() {
+		var raw []byte
+		var conversationID, userID string
+		if err := rows.Scan(&raw, &conversationID, &userID); err != nil {
+			return nil, err
+		}
+		if !json.Valid(raw) {
+			return nil, fmt.Errorf("Turn %q has an invalid tool completion event", turnID)
+		}
+		var details struct {
+			SourceRef string `json:"sourceRef"`
+		}
+		if err := json.Unmarshal(raw, &details); err != nil {
+			return nil, err
+		}
+		if details.SourceRef != "" {
+			candidates = append(candidates, evidenceCandidate{ref: details.SourceRef, conversationID: conversationID, userID: userID})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	refs := []string{}
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		if _, ok := seen[candidate.ref]; ok {
+			continue
+		}
+		var sourceExists int
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM context_sources WHERE source_id=? AND conversation_id=? AND user_id=?)`, candidate.ref, candidate.conversationID, candidate.userID).Scan(&sourceExists); err != nil {
+			return nil, err
+		}
+		if sourceExists == 1 {
+			seen[candidate.ref] = struct{}{}
+			refs = append(refs, candidate.ref)
+		}
+	}
+	return refs, nil
+}
+
+func (s *Store) ContinuationChainMetrics(ctx context.Context, userID, chainID string) (domain.RunMetrics, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT e.kind,e.details_json FROM agent_trace_events e JOIN agent_turns t ON t.id=e.turn_id
+WHERE t.user_id=? AND (t.id=? OR t.continuation_chain_id=?) AND e.kind IN ('turn.completed','turn.incomplete','turn.failed','turn.cancelled','continuation.intent_classified')`, userID, chainID, chainID)
+	if err != nil {
+		return domain.RunMetrics{}, err
+	}
+	defer rows.Close()
+	var total domain.RunMetrics
+	for rows.Next() {
+		var kind string
+		var raw []byte
+		if err := rows.Scan(&kind, &raw); err != nil {
+			return total, err
+		}
+		var details struct {
+			Metrics domain.RunMetrics `json:"metrics"`
+			Usage   struct {
+				PromptTokens     int `json:"promptTokens"`
+				CompletionTokens int `json:"completionTokens"`
+				TotalTokens      int `json:"totalTokens"`
+			} `json:"usage"`
+			DurationMillis int64 `json:"durationMillis"`
+		}
+		if !json.Valid(raw) {
+			return total, fmt.Errorf("continuation chain %q has invalid terminal metrics", chainID)
+		}
+		if err := json.Unmarshal(raw, &details); err != nil {
+			return total, err
+		}
+		if kind == "continuation.intent_classified" {
+			total.ModelCalls++
+			total.PromptTokens += details.Usage.PromptTokens
+			total.CompletionTokens += details.Usage.CompletionTokens
+			total.TotalTokens += details.Usage.TotalTokens
+			total.DurationMillis += details.DurationMillis
+			continue
+		}
+		total.ModelCalls += details.Metrics.ModelCalls
+		total.ToolCalls += details.Metrics.ToolCalls
+		total.PromptTokens += details.Metrics.PromptTokens
+		total.CompletionTokens += details.Metrics.CompletionTokens
+		total.TotalTokens += details.Metrics.TotalTokens
+		total.DurationMillis += details.Metrics.DurationMillis
+	}
+	return total, rows.Err()
 }
 
 func (s *Store) RetryAgentTurnSeed(ctx context.Context, userID, turnID string) (domain.AgentTurn, domain.Message, error) {
@@ -931,7 +1714,7 @@ FROM agent_turns t JOIN messages m ON m.id=t.input_message_id WHERE t.id=? AND t
 	if err != nil {
 		return turn, message, err
 	}
-	if message.Role != "user" || (turn.Status != "failed" && turn.Status != "cancelled" && turn.Status != "interrupted" && turn.Status != "incomplete" && turn.Status != "needs_reconciliation") {
+	if message.Role != "user" || (turn.Status != "failed" && turn.Status != "cancelled" && turn.Status != "interrupted" && turn.Status != "incomplete") || turn.RecoveryClass == "unknown_external_effect" || turn.RecoveryClass == "external_effect_confirmed" {
 		return turn, message, domain.ErrConflict
 	}
 	return turn, message, nil
@@ -951,7 +1734,7 @@ FROM agent_turns t JOIN messages m ON m.id=t.input_message_id WHERE t.id=? AND t
 	if err != nil {
 		return turn, message, err
 	}
-	if message.Role != "user" || (turn.Status != "completed" && turn.Status != "failed" && turn.Status != "cancelled" && turn.Status != "interrupted" && turn.Status != "incomplete" && turn.Status != "needs_reconciliation") {
+	if message.Role != "user" || (turn.Status != "completed" && turn.Status != "failed" && turn.Status != "cancelled" && turn.Status != "interrupted" && turn.Status != "incomplete") || turn.RecoveryClass == "unknown_external_effect" || turn.RecoveryClass == "external_effect_confirmed" {
 		return turn, message, domain.ErrConflict
 	}
 	return turn, message, nil
@@ -1154,16 +1937,23 @@ FROM agent_turns t WHERE t.status IN ('running','cancelling','awaiting_approval'
 	for _, item := range items {
 		status, recoveryClass, kind := "interrupted", "safe_to_retry", "turn.interrupted"
 		checkpointValid := item.checkpointVersion == 1 && item.checkpointResume && item.checkpointStored
-		_, unresolvedTool, malformedToolJournal, unsafeToolEffect, lastToolCompleted, err := inspectToolJournal(ctx, tx, item.id)
+		_, unresolvedTool, malformedToolJournal, unsafeToolEffect, _, lastToolCompleted, err := inspectToolJournal(ctx, tx, item.id)
 		if err != nil {
 			return 0, err
 		}
-		if checkpointValid && !unresolvedTool && !malformedToolJournal && lastToolCompleted <= item.checkpointSequence {
+		if malformedToolJournal || unsafeToolEffect {
+			status, recoveryClass, kind = "needs_reconciliation", "unknown_external_effect", "turn.needs_reconciliation"
+		} else if checkpointValid && !malformedToolJournal && lastToolCompleted <= item.checkpointSequence {
 			recoveryClass = "checkpoint_resumable"
-		} else if malformedToolJournal || unsafeToolEffect {
-			recoveryClass = "unknown_external_effect"
+		} else if unresolvedTool {
+			// An incomplete read-only call is safe to retry; unknown or mutating
+			// effects were classified above and require explicit reconciliation.
+			recoveryClass = "safe_to_retry"
 		}
-		details, _ := json.Marshal(map[string]string{"stopReason": "host_restarted", "recoveryClass": recoveryClass})
+		details, marshalErr := json.Marshal(map[string]string{"stopReason": "host_restarted", "recoveryClass": recoveryClass})
+		if marshalErr != nil {
+			return 0, marshalErr
+		}
 		sequence := item.sequence + 1
 		if _, err := tx.ExecContext(ctx, `INSERT INTO agent_trace_events(id,conversation_id,turn_id,sequence,kind,details_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventID(item.id, sequence), item.conversationID, item.id, sequence, kind, details, now); err != nil {
 			return 0, err
@@ -1221,11 +2011,12 @@ FROM agent_turns t WHERE t.status IN ('running','cancelling','awaiting_approval'
 
 // inspectToolJournal returns tool presence, unresolved calls, journal integrity,
 // whether any started call may have changed state, and the latest completion.
-// Read and external-read tools can be retried; unknown and mutating effects fail closed.
-func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, bool, bool, bool, int, error) {
+// Checkpoint recovery uses the journal integrity and completion sequence; a
+// pending call in the checkpoint is replayed with its original call ID.
+func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, bool, bool, bool, bool, int, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT sequence,kind,details_json FROM agent_trace_events WHERE turn_id=? AND kind IN ('permission.checked','tool.started','tool.completed') ORDER BY sequence`, turnID)
 	if err != nil {
-		return false, false, false, false, 0, err
+		return false, false, false, false, false, 0, err
 	}
 	defer rows.Close()
 	started := map[string]bool{}
@@ -1237,7 +2028,7 @@ func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, b
 		var kind string
 		var raw []byte
 		if err := rows.Scan(&sequence, &kind, &raw); err != nil {
-			return false, false, false, false, 0, err
+			return false, false, false, false, false, 0, err
 		}
 		var details struct {
 			ToolCallID string `json:"toolCallId"`
@@ -1259,9 +2050,6 @@ func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, b
 		}
 		hasTool = true
 		if kind == "tool.started" {
-			if started[details.ToolCallID] {
-				malformed = true
-			}
 			started[details.ToolCallID] = true
 			if details.Effect != "" {
 				if previous, exists := effects[details.ToolCallID]; exists && previous != details.Effect {
@@ -1280,9 +2068,9 @@ func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, b
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return false, false, false, false, 0, err
+		return false, false, false, false, false, 0, err
 	}
-	unresolved := false
+	unresolved, completedUnsafeEffect := false, false
 	for callID := range started {
 		if !completed[callID] {
 			unresolved = true
@@ -1294,9 +2082,12 @@ func inspectToolJournal(ctx context.Context, tx *sql.Tx, turnID string) (bool, b
 			unsafeEffect = true
 		default:
 			unsafeEffect = true
+			if completed[callID] {
+				completedUnsafeEffect = true
+			}
 		}
 	}
-	return hasTool, unresolved, malformed, unsafeEffect, latestCompleted, nil
+	return hasTool, unresolved, malformed, unsafeEffect, completedUnsafeEffect, latestCompleted, nil
 }
 
 func (s *Store) reclassifyLegacyReadOnlyTurns(ctx context.Context) error {
@@ -1329,7 +2120,7 @@ func (s *Store) reclassifyLegacyReadOnlyTurns(ctx context.Context) error {
 		return err
 	}
 	for _, item := range candidates {
-		hasTool, _, malformed, unsafeEffect, _, err := inspectToolJournal(ctx, tx, item.id)
+		hasTool, _, malformed, unsafeEffect, _, _, err := inspectToolJournal(ctx, tx, item.id)
 		if err != nil {
 			return err
 		}

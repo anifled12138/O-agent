@@ -39,6 +39,45 @@ func TestScopeArtifactCleanup(t *testing.T) {
 	}
 }
 
+func TestScopeArtifactsAreNotRejectedAtThirtyTwoMiB(t *testing.T) {
+	workspace := testTempDir(t, "runfiles-large-workspace-")
+	root := testTempDir(t, "runfiles-large-root-")
+	manager, err := NewManager(root, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := manager.NewScope()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := scope.Close(); err != nil {
+			t.Errorf("close scope: %v", err)
+		}
+	}()
+	payload := make([]byte, (32<<20)+1)
+	artifact, err := scope.WriteArtifact("large", "bin", payload)
+	if err != nil {
+		t.Fatalf("artifact larger than the old implementation cap was rejected: %v", err)
+	}
+	file, err := scope.OpenArtifact(artifact.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if info.Size() != int64(len(payload)) {
+		_ = file.Close()
+		t.Fatalf("artifact size read back as %d, expected %d", info.Size(), len(payload))
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNewManagerRemovesOnlyStaleOwnedRuns(t *testing.T) {
 	root := testTempDir(t, "runfiles-root-")
 	if err := os.MkdirAll(root, 0o700); err != nil {

@@ -1,0 +1,130 @@
+//go:build linux
+
+package projectquota
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"syscall"
+	"testing"
+
+	"golang.org/x/sys/unix"
+)
+
+// This test is deliberately opt-in because it creates a real kernel quota and
+// writes to the filesystem. Run it on a disposable ext4/XFS mount with
+// prjquota/pquota enabled and a root-owned test invocation:
+// O_PROJECT_QUOTA_TEST_ROOT=/mnt/quota-test go test ./internal/projectquota -run TestKernelProjectQuotaRejectsWritesBeyondLimit
+func TestKernelProjectQuotaRejectsWritesBeyondLimit(t *testing.T) {
+	if os.Getenv("O_PROJECT_QUOTA_TEST_ROOT") == "" {
+		t.Skip("set O_PROJECT_QUOTA_TEST_ROOT to an isolated quota-enabled mount to run kernel enforcement acceptance")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("kernel project quota acceptance requires root")
+	}
+	root, err := filepath.Abs(filepath.Clean(os.Getenv("O_PROJECT_QUOTA_TEST_ROOT")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve configured quota test root: %v", err)
+	}
+	root = resolvedRoot
+	if root == string(filepath.Separator) || root == "." {
+		t.Fatalf("refusing unsafe quota test root %q", root)
+	}
+	probe, err := ProbeFilesystem(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !probe.MountSupported || !probe.QuotaOptionFound {
+		t.Skipf("mount does not support project quotas: %s", probe.Reason)
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(root, &stat); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(stat.Bavail)*uint64(stat.Bsize) < 128<<20 {
+		t.Skip("quota test mount needs at least 128 MiB free to distinguish quota rejection from filesystem exhaustion")
+	}
+	testRoot, err := os.MkdirTemp(root, ".o-projectquota-acceptance-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(testRoot); err != nil {
+			t.Errorf("remove quota acceptance workspace: %v", err)
+		}
+	})
+	if err := os.Mkdir(filepath.Join(testRoot, ".o-projects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(testRoot, ".o-projects", "acceptance"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the same high-bit namespace used by durable O workspace IDs.
+	const projectID = uint32(0xe0000000)
+	const limit = int64(32 << 20)
+	quota, err := ApplyEmptyWorkspace(testRoot, ".o-projects/acceptance", projectID, limit, limit)
+	if err != nil {
+		t.Fatalf("apply kernel project quota: %v", err)
+	}
+	if !quota.Applied || quota.LimitBytes != limit {
+		t.Fatalf("quota did not read back as applied: %+v", quota)
+	}
+	verified, err := InspectWorkspace(testRoot, ".o-projects/acceptance", projectID)
+	if err != nil || !verified.Applied || verified.LimitBytes != limit {
+		t.Fatalf("quota inspection failed: %+v, %v", verified, err)
+	}
+
+	file, err := os.OpenFile(filepath.Join(testRoot, ".o-projects", "acceptance", "large.bin"), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 1<<20)
+	var written int64
+	var writeErr error
+	for written < 64<<20 {
+		n, err := file.Write(chunk)
+		written += int64(n)
+		if err != nil {
+			writeErr = err
+			break
+		}
+		if n != len(chunk) {
+			writeErr = syscall.EIO
+			break
+		}
+	}
+	if syncErr := file.Sync(); syncErr != nil && writeErr == nil {
+		writeErr = syncErr
+	}
+	if closeErr := file.Close(); closeErr != nil && writeErr == nil {
+		writeErr = closeErr
+	}
+	if written >= 64<<20 {
+		t.Fatal("kernel accepted writes beyond the 32 MiB project hard limit")
+	}
+	if writeErr != nil && !errors.Is(writeErr, unix.EDQUOT) && !errors.Is(writeErr, unix.ENOSPC) {
+		t.Fatalf("write stopped for a reason other than quota exhaustion: bytes=%d err=%v", written, writeErr)
+	}
+	verified, err = InspectWorkspace(testRoot, ".o-projects/acceptance", projectID)
+	if err != nil || !verified.Applied || verified.LimitBytes != limit || verified.UsedBytes > limit {
+		t.Fatalf("quota readback after denied write: %+v, %v", verified, err)
+	}
+	if err := os.WriteFile(filepath.Join(testRoot, ".o-projects", "unlimited-neighbor"), []byte("still writable"), 0o600); err != nil {
+		t.Fatalf("quota unexpectedly blocked neighboring project: %v", err)
+	}
+	if err := os.Remove(filepath.Join(testRoot, ".o-projects", "acceptance", "large.bin")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReleaseEmptyWorkspace(testRoot, ".o-projects/acceptance", projectID); err != nil {
+		t.Fatalf("release empty workspace quota: %v", err)
+	}
+	quota, err = InspectWorkspace(testRoot, ".o-projects/acceptance", projectID)
+	if err != nil || quota.Applied || quota.LimitBytes != 0 {
+		t.Fatalf("released quota did not read back as cleared: %+v, %v", quota, err)
+	}
+}

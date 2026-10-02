@@ -25,16 +25,17 @@ type User struct {
 }
 
 type Provider struct {
-	ID            string    `json:"id"`
-	UserID        string    `json:"-"`
-	Name          string    `json:"name"`
-	Kind          string    `json:"kind"`
-	BaseURL       string    `json:"baseUrl"`
-	Model         string    `json:"model"`
-	ContextWindow int       `json:"contextWindow"`
-	HasAPIKey     bool      `json:"hasApiKey"`
-	CreatedAt     time.Time `json:"createdAt"`
-	UpdatedAt     time.Time `json:"updatedAt"`
+	ID             string    `json:"id"`
+	UserID         string    `json:"-"`
+	Name           string    `json:"name"`
+	Kind           string    `json:"kind"`
+	BaseURL        string    `json:"baseUrl"`
+	Model          string    `json:"model"`
+	ContextWindow  int       `json:"contextWindow"`
+	SupportsVision *bool     `json:"supportsVision,omitempty"`
+	HasAPIKey      bool      `json:"hasApiKey"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 type Project struct {
@@ -46,8 +47,43 @@ type Project struct {
 	Workdir             string    `json:"workdir"`
 	RemoteRepoURL       string    `json:"remoteRepoUrl"`
 	RemoteBranch        string    `json:"remoteBranch"`
+	RepositoryProvider  string    `json:"repositoryProvider"`
+	ResolvedCommit      string    `json:"resolvedCommit"`
+	MeasuredBytes       int64     `json:"measuredBytes"`
 	CreatedAt           time.Time `json:"createdAt"`
 	UpdatedAt           time.Time `json:"updatedAt"`
+}
+
+// ProjectPublication records a repository push across the local database and
+// the remote Git server. A publication in needs_reconciliation is never
+// replayed automatically because the outcome of its push is uncertain.
+type ProjectPublication struct {
+	ID                string                        `json:"id"`
+	UserID            string                        `json:"-"`
+	ProjectID         string                        `json:"projectId"`
+	IdempotencyKey    string                        `json:"idempotencyKey"`
+	TargetBranch      string                        `json:"targetBranch"`
+	ExpectedRemoteSHA string                        `json:"expectedRemoteSha"`
+	CommitSHA         string                        `json:"commitSha"`
+	Submodules        []ProjectPublicationSubmodule `json:"submodules,omitempty"`
+	RemoteSHA         string                        `json:"remoteSha,omitempty"`
+	Status            string                        `json:"status"`
+	Error             string                        `json:"error,omitempty"`
+	CreatedAt         time.Time                     `json:"createdAt"`
+	UpdatedAt         time.Time                     `json:"updatedAt"`
+}
+
+// ProjectPublicationSubmodule is a durable, immutable child-repository ref
+// target required by a parent publication. Status records only remote
+// read-back evidence; it never represents an attempted push by itself.
+type ProjectPublicationSubmodule struct {
+	Path          string `json:"path"`
+	RepositoryURL string `json:"repositoryUrl"`
+	CommitSHA     string `json:"commitSha"`
+	Ref           string `json:"ref"`
+	RemoteSHA     string `json:"remoteSha,omitempty"`
+	Status        string `json:"status"`
+	Error         string `json:"error,omitempty"`
 }
 
 type Conversation struct {
@@ -64,6 +100,20 @@ type Conversation struct {
 	ExecutionPaused       bool              `json:"executionPaused"`
 	CreatedAt             time.Time         `json:"createdAt"`
 	UpdatedAt             time.Time         `json:"updatedAt"`
+}
+
+const ConversationRecoveryRetention = 24 * time.Hour
+
+type ConversationDeletion struct {
+	ConversationID string    `json:"conversationId"`
+	DeletedAt      time.Time `json:"deletedAt"`
+	RecoverUntil   time.Time `json:"recoverUntil"`
+}
+
+type DeletedConversation struct {
+	Conversation
+	DeletedAt    time.Time `json:"deletedAt"`
+	RecoverUntil time.Time `json:"recoverUntil"`
 }
 
 type Message struct {
@@ -99,25 +149,75 @@ type TraceEvent struct {
 }
 
 type AgentTurn struct {
-	ID                    string            `json:"id"`
-	ConversationID        string            `json:"conversationId"`
-	UserID                string            `json:"-"`
-	InputMessageID        string            `json:"inputMessageId"`
-	RetryOfTurnID         string            `json:"retryOfTurnId,omitempty"`
-	ResultMessageID       string            `json:"resultMessageId,omitempty"`
-	ProviderID            string            `json:"providerId"`
-	AgentGenerationID     string            `json:"agentGenerationId"`
-	AgentDefinitionDigest string            `json:"agentDefinitionDigest"`
-	PermissionProfile     PermissionProfile `json:"permissionProfile"`
-	Status                string            `json:"status"`
-	StopReason            string            `json:"stopReason,omitempty"`
-	RecoveryClass         string            `json:"recoveryClass,omitempty"`
-	ReconciliationNote    string            `json:"-"`
-	CancelRequested       bool              `json:"cancelRequested"`
-	LastSequence          int               `json:"lastSequence"`
-	StartedAt             time.Time         `json:"startedAt"`
-	UpdatedAt             time.Time         `json:"updatedAt"`
-	CompletedAt           *time.Time        `json:"completedAt,omitempty"`
+	ID                            string               `json:"id"`
+	ConversationID                string               `json:"conversationId"`
+	UserID                        string               `json:"-"`
+	InputMessageID                string               `json:"inputMessageId"`
+	RetryOfTurnID                 string               `json:"retryOfTurnId,omitempty"`
+	ContinuedFromTurnID           string               `json:"continuedFromTurnId,omitempty"`
+	ContinuationChainID           string               `json:"continuationChainId,omitempty"`
+	CumulativeMetrics             RunMetrics           `json:"cumulativeMetrics,omitempty"`
+	ContinuationAvailable         bool                 `json:"continuationAvailable"`
+	ContinuationUnavailableReason string               `json:"continuationUnavailableReason,omitempty"`
+	RunState                      RunState             `json:"runState"`
+	CompletionAssessment          CompletionAssessment `json:"completionAssessment"`
+	ResultMessageID               string               `json:"resultMessageId,omitempty"`
+	ProviderID                    string               `json:"providerId"`
+	AgentGenerationID             string               `json:"agentGenerationId"`
+	AgentDefinitionDigest         string               `json:"agentDefinitionDigest"`
+	PermissionProfile             PermissionProfile    `json:"permissionProfile"`
+	Status                        string               `json:"status"`
+	StopReason                    string               `json:"stopReason,omitempty"`
+	RecoveryClass                 string               `json:"recoveryClass,omitempty"`
+	ReconciliationNote            string               `json:"reconciliationNote,omitempty"`
+	CancelRequested               bool                 `json:"cancelRequested"`
+	LastSequence                  int                  `json:"lastSequence"`
+	StartedAt                     time.Time            `json:"startedAt"`
+	UpdatedAt                     time.Time            `json:"updatedAt"`
+	CompletedAt                   *time.Time           `json:"completedAt,omitempty"`
+}
+
+// CompletionAssessment is deliberately separate from AgentTurn.Status:
+// "completed" means the execution turn ended, while task completion remains
+// unverified until an independent check cites durable evidence.
+type CompletionAssessment struct {
+	Status             string   `json:"status"` // unassessed, unverified, verified_completed (reserved for an evidence verifier)
+	AssistantSourceRef string   `json:"assistantSourceRef,omitempty"`
+	EvidenceRefs       []string `json:"evidenceRefs,omitempty"`
+}
+
+// RunState is a per-turn projection rebuilt from the durable input message and
+// execution trace. Tool outcomes are observations, not proof that the user's
+// goal was achieved.
+type RunState struct {
+	Version           int              `json:"version"`
+	Completeness      string           `json:"completeness"` // complete or degraded
+	CompletenessNote  string           `json:"completenessNote,omitempty"`
+	CurrentRequest    *RunStateFact    `json:"currentRequest,omitempty"`
+	Actions           []RunStateAction `json:"actions,omitempty"`
+	PendingActions    []RunStateAction `json:"pendingActions,omitempty"`
+	AssistantResponse *RunStateFact    `json:"assistantResponse,omitempty"`
+}
+
+type RunStateFact struct {
+	ID           string `json:"id"`
+	Kind         string `json:"kind"`
+	Statement    string `json:"statement,omitempty"`
+	Status       string `json:"status"`
+	SourceKind   string `json:"sourceKind"`
+	Verification string `json:"verification"`
+	SourceRef    string `json:"sourceRef"`
+}
+
+type RunStateAction struct {
+	Sequence        int    `json:"sequence"`
+	ToolCallID      string `json:"toolCallId"`
+	ToolName        string `json:"toolName"`
+	Effect          string `json:"effect,omitempty"`
+	Status          string `json:"status"` // in_flight, tool_reported_ok, tool_reported_failure
+	SourceRef       string `json:"sourceRef,omitempty"`
+	SourceHash      string `json:"sourceHash,omitempty"`
+	SourceAvailable string `json:"sourceAvailability"` // available, missing, not_applicable
 }
 
 type ApprovalRequest struct {
@@ -203,10 +303,12 @@ type AgentTurnReconciliation struct {
 }
 
 type TurnReceipt struct {
-	TurnID         string `json:"turnId"`
-	ConversationID string `json:"conversationId"`
-	InputMessageID string `json:"inputMessageId"`
-	Status         string `json:"status"`
+	TurnID              string `json:"turnId"`
+	ConversationID      string `json:"conversationId"`
+	InputMessageID      string `json:"inputMessageId"`
+	Status              string `json:"status"`
+	ContinuedFromTurnID string `json:"continuedFromTurnId,omitempty"`
+	ContinuationChainID string `json:"continuationChainId,omitempty"`
 }
 
 type AgentStep struct {
@@ -220,8 +322,8 @@ type AgentStep struct {
 }
 
 // AgentSpec is the mutable part of an Agent Definition. The Seed Kernel owns
-// execution and permissions; a generation may only select a strategy and its
-// bounded parameters.
+// execution and permissions; a generation may select a strategy and an
+// optional per-turn step budget.
 type AgentSpec struct {
 	Strategy      string `json:"strategy"`
 	SystemPrompt  string `json:"systemPrompt"`
@@ -286,6 +388,7 @@ type RunMetrics struct {
 	ReachedStepLimit      bool  `json:"reachedStepLimit"`
 	ReachedTokenLimit     bool  `json:"reachedTokenLimit,omitempty"`
 	ReachedModelCallLimit bool  `json:"reachedModelCallLimit,omitempty"`
+	ReachedStall          bool  `json:"reachedStall,omitempty"`
 }
 
 type EvalTrial struct {
