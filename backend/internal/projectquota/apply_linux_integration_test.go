@@ -130,6 +130,40 @@ func TestKernelProjectQuotaRejectsWritesBeyondLimit(t *testing.T) {
 	if err := os.Remove(filepath.Join(testRoot, ".o-projects", "acceptance", "large.bin")); err != nil {
 		t.Fatal(err)
 	}
+	// An empty directory must not authorize clearing charges belonging to a
+	// different inode with the same project ID, even outside the workspace.
+	outsidePath := filepath.Join(testRoot, ".o-projects", "charged-neighbor")
+	outside, err := os.OpenFile(outsidePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chargeErr := func() error {
+		attributes, err := readFSXAttr(int(outside.Fd()))
+		if err != nil {
+			return err
+		}
+		attributes.ProjectID = projectID
+		if err := writeFSXAttr(int(outside.Fd()), attributes); err != nil {
+			return err
+		}
+		if _, err := outside.Write(chunk); err != nil {
+			return err
+		}
+		return outside.Sync()
+	}()
+	if err := errors.Join(chargeErr, outside.Close()); err != nil {
+		t.Fatalf("create external project quota charge: %v", err)
+	}
+	if err := ReleaseEmptyWorkspace(testRoot, ".o-projects/acceptance", projectID); err == nil {
+		t.Fatal("released quota while another inode still carried project usage")
+	}
+	verified, err = InspectWorkspace(testRoot, ".o-projects/acceptance", projectID)
+	if err != nil || !verified.Applied || verified.LimitBytes != limit {
+		t.Fatalf("rejected release changed the authoritative quota: %+v, %v", verified, err)
+	}
+	if err := os.Remove(outsidePath); err != nil {
+		t.Fatal(err)
+	}
 	if err := ReleaseEmptyWorkspace(testRoot, ".o-projects/acceptance", projectID); err != nil {
 		t.Fatalf("release empty workspace quota: %v", err)
 	}

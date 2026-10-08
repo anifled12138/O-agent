@@ -193,7 +193,9 @@ func ReleaseEmptyWorkspace(workspaceRoot, relativePath string, projectID uint32)
 
 // ReleaseTaskWorkspace clears a quota after its empty task directory has been
 // removed, or clears an empty existing directory. A missing directory is
-// accepted only after the kernel reports zero project usage for the ID.
+// accepted only after the kernel reports zero project usage for the ID. An
+// existing empty directory may carry only its own allocated blocks; any other
+// charge prevents release, and final quota usage must read back as zero.
 func ReleaseTaskWorkspace(workspaceRoot, relativePath string, projectID uint32) (WorkspaceQuota, error) {
 	if projectID == 0 {
 		return WorkspaceQuota{}, errors.New("project ID must be nonzero")
@@ -237,7 +239,16 @@ func ReleaseTaskWorkspace(workspaceRoot, relativePath string, projectID uint32) 
 	}
 	currentLimit, currentUsage := quotaBytes(probe.Filesystem, quota)
 	if currentUsage != 0 {
-		return WorkspaceQuota{}, errors.New("cannot release a task project quota while kernel usage remains")
+		// ext4 charges the empty directory's own allocated blocks to its
+		// project. Clearing its project ID transfers those blocks back to
+		// project zero; any charge beyond this directory must remain protected.
+		var stat unix.Stat_t
+		if err := unix.Fstat(directoryFD, &stat); err != nil {
+			return WorkspaceQuota{}, fmt.Errorf("inspect empty workspace block usage before release: %w", err)
+		}
+		if attributes.ProjectID != projectID || currentUsage != stat.Blocks*512 {
+			return WorkspaceQuota{}, errors.New("cannot release a task project quota while usage outside the empty directory remains")
+		}
 	}
 	if currentLimit == 0 && attributes.ProjectID == 0 && attributes.XFlags&fsXFlagProjInherit == 0 {
 		return WorkspaceQuota{Filesystem: probe.Filesystem, MountPoint: probe.MountPoint, ProjectID: projectID}, nil
