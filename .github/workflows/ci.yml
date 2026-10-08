@@ -118,6 +118,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y e2fsprogs xfsprogs kmod util-linux
 
       - name: Verify kernel project quota enforcement on ext4 and XFS
+        timeout-minutes: 8
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -143,12 +144,13 @@ jobs:
           # Azure runner kernels may omit the loadable quota format driver
           # from their base modules package; provision the exact running kernel.
           if ! modinfo quota_v2 >/dev/null 2>&1; then
-            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo env DEBIAN_FRONTEND=noninteractive timeout 240s apt-get install -y "linux-modules-extra-$(uname -r)"
           fi
           sudo modprobe quota_v2
           sudo modprobe xfs
+          echo '::notice::Quota kernel modules are ready'
           test_binary="$RUNNER_TEMP/projectquota-linux.test"
-          go test -c -o "$test_binary" ./internal/projectquota
+          timeout 120s go test -c -o "$test_binary" ./internal/projectquota
           chmod 0755 "$test_binary"
           ext4_image="$RUNNER_TEMP/o-agent-quota-ext4.img"
           xfs_image="$RUNNER_TEMP/o-agent-quota-xfs.img"
@@ -160,26 +162,30 @@ jobs:
           cleanup() {
             local status=$?
             trap - EXIT
-            if (( mounted_xfs )); then sudo umount -- "$xfs_mount" || status=1; fi
-            if (( mounted_ext4 )); then sudo umount -- "$ext4_mount" || status=1; fi
+            if (( mounted_xfs )); then sudo timeout 45s umount -- "$xfs_mount" || status=1; fi
+            if (( mounted_ext4 )); then sudo timeout 45s umount -- "$ext4_mount" || status=1; fi
             exit "$status"
           }
           trap cleanup EXIT
 
           truncate -s 512M "$ext4_image"
           mkfs.ext4 -F -O project,quota "$ext4_image"
-          sudo mount -t ext4 -o loop,prjquota "$ext4_image" "$ext4_mount"
+          sudo timeout 30s mount -t ext4 -o loop,prjquota "$ext4_image" "$ext4_mount"
           mounted_ext4=1
-          sudo env O_PROJECT_QUOTA_TEST_ROOT="$ext4_mount" setpriv --bounding-set=-sys_resource "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v 2>&1 | tee projectquota-test.log
-          sudo umount -- "$ext4_mount"
+          echo '::notice::Starting ext4 kernel quota acceptance'
+          sudo env O_PROJECT_QUOTA_TEST_ROOT="$ext4_mount" setpriv --bounding-set=-sys_resource "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.timeout=45s -test.v 2>&1 | tee projectquota-test.log
+          echo '::notice::ext4 kernel quota acceptance passed'
+          sudo timeout 45s umount -- "$ext4_mount"
           mounted_ext4=0
 
           truncate -s 1G "$xfs_image"
           mkfs.xfs -f "$xfs_image"
-          sudo mount -t xfs -o loop,pquota "$xfs_image" "$xfs_mount"
+          sudo timeout 30s mount -t xfs -o loop,pquota "$xfs_image" "$xfs_mount"
           mounted_xfs=1
-          sudo env O_PROJECT_QUOTA_TEST_ROOT="$xfs_mount" setpriv --bounding-set=-sys_resource "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v 2>&1 | tee projectquota-test.log
-          sudo umount -- "$xfs_mount"
+          echo '::notice::Starting XFS kernel quota acceptance'
+          sudo env O_PROJECT_QUOTA_TEST_ROOT="$xfs_mount" setpriv --bounding-set=-sys_resource "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.timeout=45s -test.v 2>&1 | tee projectquota-test.log
+          echo '::notice::XFS kernel quota acceptance passed'
+          sudo timeout 45s umount -- "$xfs_mount"
           mounted_xfs=0
 
       - name: Upload Test Logs on Failure
