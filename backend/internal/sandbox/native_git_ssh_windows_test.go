@@ -402,7 +402,7 @@ func TestPrepareNativeSSHSigningEnvironmentPreservesSigningWhenAgentIsUnavailabl
 		"PATH":                `C:\Windows\System32`,
 		"SYSTEMROOT":          `C:\Windows`,
 		"GIT_CONFIG_NOSYSTEM": "1",
-		"GIT_CONFIG_GLOBAL":   "NUL",
+		"GIT_CONFIG_GLOBAL":   nativeGitNullPath,
 		"GIT_CONFIG_COUNT":    "1",
 		"GIT_CONFIG_KEY_0":    "safe.directory",
 		"GIT_CONFIG_VALUE_0":  filepath.Join(scratch, "repo"),

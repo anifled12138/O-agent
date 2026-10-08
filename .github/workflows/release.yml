@@ -97,3 +97,18 @@ jobs:
             deploy/ubuntu/README.md inside the archive to install and configure
             the server. The automatically generated source archives are source
             code and are not the installable runtime package.
+      - name: Read back published runtime assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve-source.outputs.tag_name }}
+        run: |
+          set -Eeuo pipefail
+          test "$(gh release view "$RELEASE_TAG" --json tagName --jq '.tagName')" = "$RELEASE_TAG"
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = false
+          mkdir downloaded-release
+          gh release download "$RELEASE_TAG" --pattern 'o-agent-cloud-runtime.tar.gz*' --dir downloaded-release
+          (cd downloaded-release && sha256sum -c o-agent-cloud-runtime.tar.gz.sha256)
+          cmp release-files/o-agent-cloud-runtime.tar.gz downloaded-release/o-agent-cloud-runtime.tar.gz
+          cmp release-files/o-agent-cloud-runtime.tar.gz.sha256 downloaded-release/o-agent-cloud-runtime.tar.gz.sha256

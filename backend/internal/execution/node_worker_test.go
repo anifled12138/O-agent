@@ -440,7 +440,8 @@ func TestNodeWorkerRunsConfiguredTasksConcurrently(t *testing.T) {
 			}
 			taskID := fmt.Sprintf("task_%d", index)
 			lease := fmt.Sprintf("lease_%d", index)
-			writeTestJSON(w, http.StatusOK, nodeClaim{Task: storage.ExecutionTask{ID: taskID, NodeID: "node", Status: "leased", Payload: json.RawMessage(`{}`), LeaseUntil: ptrTime(time.Now().UTC().Add(time.Minute))}, LeaseToken: lease, LeaseUntil: time.Now().UTC().Add(time.Minute)})
+			leaseUntil := time.Now().UTC().Add(time.Minute)
+			writeTestJSON(w, http.StatusOK, nodeClaim{Task: storage.ExecutionTask{ID: taskID, NodeID: "node", Status: "leased", Payload: json.RawMessage(`{}`), LeaseUntil: &leaseUntil}, LeaseToken: lease, LeaseUntil: leaseUntil})
 		case strings.HasSuffix(r.URL.Path, "/pulse"):
 			id := strings.Split(r.URL.Path, "/")[5]
 			var pulse struct {

@@ -15,6 +15,9 @@ import (
 	"time"
 )
 
+// Git for Windows recognizes /dev/null even when Windows device names are rejected.
+const nativeGitNullPath = "/dev/null"
+
 type nativeRepositoryScope struct {
 	ReadRoots             []string
 	WriteRoots            []string
@@ -349,7 +352,7 @@ func inspectNativeGitMetadata(ctx context.Context, executable, workdir string) (
 		return nativeGitMetadata{}, fmt.Errorf("read effective repository Git hooks path: %w", err)
 	}
 	hooksPath := ""
-	if hooksConfigured && strings.EqualFold(strings.TrimSpace(hooksValue), "NUL") {
+	if hooksConfigured && (strings.EqualFold(strings.TrimSpace(hooksValue), "NUL") || strings.TrimSpace(hooksValue) == nativeGitNullPath) {
 		// The repository explicitly disables hooks.
 	} else {
 		hooksValue = lines[4]
@@ -525,7 +528,7 @@ func nativeGitSubmodulePaths(ctx context.Context, executable, worktree string) (
 	if _, _, err := nativeFileIdentity(file); err != nil {
 		return nil, fmt.Errorf("validate Git submodule configuration %s: %w", file, err)
 	}
-	args := []string{"-C", worktree, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "config", "--null", "--file", file, "--get-regexp", `^submodule\..*\.path$`}
+	args := []string{"-C", worktree, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + nativeGitNullPath, "config", "--null", "--file", file, "--get-regexp", `^submodule\..*\.path$`}
 	output, err := runNativeGit(ctx, executable, args...)
 	if err != nil {
 		var exit *exec.ExitError
@@ -612,7 +615,7 @@ func runNativeGit(ctx context.Context, executable string, args ...string) ([]byt
 		"WINDIR=" + os.Getenv("SystemRoot"),
 		"PATH=" + filepath.Dir(executable),
 		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=NUL",
+		"GIT_CONFIG_GLOBAL=" + nativeGitNullPath,
 		"GIT_OPTIONAL_LOCKS=0",
 		"GIT_TERMINAL_PROMPT=0",
 	}
@@ -628,7 +631,7 @@ func runNativeGit(ctx context.Context, executable string, args ...string) ([]byt
 }
 
 func nativeGitWorktreeListed(ctx context.Context, executable, selectedWorktree string) (bool, error) {
-	args := []string{"-C", selectedWorktree, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "core.quotePath=false", "worktree", "list", "--porcelain"}
+	args := []string{"-C", selectedWorktree, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + nativeGitNullPath, "-c", "core.quotePath=false", "worktree", "list", "--porcelain"}
 	output, err := runNativeGit(ctx, executable, args...)
 	if err != nil {
 		return false, err
@@ -648,7 +651,7 @@ func nativeGitWorktreeListed(ctx context.Context, executable, selectedWorktree s
 
 func configureNativeGitEnvironment(environment map[string]string, scope *nativeRepositoryScope, writeAccess bool) {
 	environment["GIT_CONFIG_NOSYSTEM"] = "1"
-	environment["GIT_CONFIG_GLOBAL"] = "NUL"
+	environment["GIT_CONFIG_GLOBAL"] = nativeGitNullPath
 	environment["GIT_TERMINAL_PROMPT"] = "0"
 	environment["GIT_OPTIONAL_LOCKS"] = "0"
 	if !writeAccess {

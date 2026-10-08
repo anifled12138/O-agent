@@ -5,7 +5,6 @@ package sandbox
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -33,11 +32,7 @@ func TestSecurePrivateNativeDirectoryRepairsExistingDACLAndReadsItBack(t *testin
 	if readBack == nil {
 		t.Fatal("secured directory returned no security descriptor")
 	}
-	actual := nativeDACLSDDL(readBack.String())
-	if strings.Contains(actual, "WD") || !strings.Contains(actual, strings.ToUpper(owner.User.Sid.String())) ||
-		!strings.Contains(actual, "SY") || !strings.Contains(actual, "BA") {
-		t.Fatalf("repaired directory DACL is missing its protected principals or still grants Everyone: %s", actual)
-	}
+	assertProtectedNativePrincipals(t, readBack, owner.User.Sid, false)
 }
 
 func TestSecureNativeFileReadsBackProtectedDACL(t *testing.T) {
@@ -59,9 +54,39 @@ func TestSecureNativeFileReadsBackProtectedDACL(t *testing.T) {
 	if readBack == nil {
 		t.Fatal("secured runner returned no security descriptor")
 	}
-	actual := nativeDACLSDDL(readBack.String())
-	if strings.Contains(actual, "WD") || !strings.Contains(actual, strings.ToUpper(owner.User.Sid.String())) ||
-		!strings.Contains(actual, "SY") || !strings.Contains(actual, "BA") || !strings.Contains(actual, "BU") {
-		t.Fatalf("runner DACL read-back does not match its protected principals: %s", actual)
+	assertProtectedNativePrincipals(t, readBack, owner.User.Sid, true)
+}
+func assertProtectedNativePrincipals(t *testing.T, descriptor *windows.SECURITY_DESCRIPTOR, owner *windows.SID, runner bool) {
+	t.Helper()
+	if !nativeDACLProtected(descriptor.String()) {
+		t.Fatalf("native path DACL is not protected: %s", descriptor.String())
+	}
+	acl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	principals := []*windows.SID{owner}
+	wanted := []string{"S-1-5-18", "S-1-5-32-544"}
+	if runner {
+		wanted = append(wanted, "S-1-5-32-545")
+	}
+	for _, value := range wanted {
+		sid, err := windows.StringToSid(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		principals = append(principals, sid)
+	}
+	for _, principal := range principals {
+		if present, err := explicitACLHasSID(acl, principal, false); err != nil || !present {
+			t.Fatalf("protected DACL lacks principal %s: present=%v err=%v DACL=%s", principal.String(), present, err, descriptor.String())
+		}
+	}
+	world, err := windows.StringToSid("S-1-1-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present, err := explicitACLHasSID(acl, world, false); err != nil || present {
+		t.Fatalf("protected DACL still grants Everyone: present=%v err=%v", present, err)
 	}
 }
