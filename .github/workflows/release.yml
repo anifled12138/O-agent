@@ -7,56 +7,93 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag to release (e.g. v0.1.0)'
+        description: Existing version tag to test, package, and release
         required: true
         default: 'v0.1.0'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Publish GitHub Release
+  resolve-source:
+    name: Resolve release tag
     runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.source.outputs.tag_name }}
+      commit_sha: ${{ steps.source.outputs.commit_sha }}
     steps:
-      - name: Checkout repository
+      - name: Checkout tagged source
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag_name || github.ref_name }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable source commit
+        id: source
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_TAG" == v* ]]
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          commit_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse HEAD)" = "$commit_sha"
+          printf 'tag_name=%s\ncommit_sha=%s\n' "$RELEASE_TAG" "$commit_sha" >> "$GITHUB_OUTPUT"
 
+  build-runtime:
+    name: Verify and package tagged runtime
+    needs: resolve-source
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_ref: ${{ needs.resolve-source.outputs.commit_sha }}
+
+  release:
+    name: Publish GitHub Release with Linux runtime
+    needs: [resolve-source, build-runtime]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified Linux runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: o-agent-cloud-runtime
+          path: release-files
+      - name: Verify package checksum and source provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.resolve-source.outputs.commit_sha }}
+        run: |
+          set -Eeuo pipefail
+          cd release-files
+          test -f o-agent-cloud-runtime.tar.gz
+          test -f o-agent-cloud-runtime.tar.gz.sha256
+          sha256sum -c o-agent-cloud-runtime.tar.gz.sha256
+          build_info="$(tar -xOf o-agent-cloud-runtime.tar.gz ./BUILD-INFO)"
+          test "$build_info" = "source_commit=$EXPECTED_SOURCE_SHA"
+          for required in ./backend/axiom ./backend/axiom-sandbox-check ./backend/axiom-quota-helper ./frontend/standalone/server.js ./deploy/ubuntu/install-runtime.sh; do
+            tar -tzf o-agent-cloud-runtime.tar.gz | grep -Fx "$required" >/dev/null
+          done
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || inputs.tag_name }}
-          name: ${{ github.ref_name || inputs.tag_name }} - O Local-First Agent Platform
+          tag_name: ${{ needs.resolve-source.outputs.tag_name }}
+          name: ${{ needs.resolve-source.outputs.tag_name }} - O Linux Cloud Runtime
           draft: false
           prerelease: false
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-files/o-agent-cloud-runtime.tar.gz
+            release-files/o-agent-cloud-runtime.tar.gz.sha256
           body: |
-            ## 🚀 O Local-First Agent Platform
+            This release includes the Ubuntu x86_64 cloud runtime: the O backend,
+            Linux sandbox and quota helpers, standalone Web application, and systemd
+            deployment files. The package is built from this version tag after CI
+            passes, with a SHA-256 checksum and source commit in BUILD-INFO.
 
-            欢迎使用 **O** —— 面向本地优先、具备自主工具演化能力的智能工程助手。
-
-            ### 🌟 核心特性 (Key Features)
-
-            - **🧠 Local-First 架构与安全沙箱**：
-              - 高性能 Go 后端调度引擎与 Dop251 Goja 虚拟机沙箱隔离
-              - 统一模型适配层，支持主流大语言模型提供商
-              - 本地 SQLite 持久化会话、状态机与运行审计日志
-            - **🧩 原生插件系统与 MCP 协议支持**：
-              - 深度整合 Model Context Protocol (MCP) 客户端与工具标准
-              - 插件完整自治生命周期：提议、代码生成、沙箱编译与安全权限授权
-              - 零编译运行时能力碎片 (O Fragments) 与不可变状态胶囊 (Capsules)
-            - **🧬 自主工程演化闭环 (Self-Evolution & Harness)**：
-              - 内置多维度能力基准评测集 (Eval Harness)
-              - 具备自动化回溯验证、基线性能对比与安全边界约束
-            - **🖥️ 现代化前端与桌面客户端**：
-              - Next.js / Vite + Tailwind CSS 沉浸式响应式交互界面
-              - 内置独立模态框：模型演化观测、MCP/插件中心、会话设置与工作区管理
-              - Electron 跨平台桌面端集成与打包支持
-
-            ### 📦 获取源码与使用 (Getting Started)
-            - 您可以直接下载下方 Assets 列表中的源码包（`.zip` / `.tar.gz`），或通过 Git 克隆：
-              ```bash
-              git clone git@github.com:anifled12138/O-agent.git
-              ```
+            Download both runtime assets, verify the checksum, and follow
+            deploy/ubuntu/README.md inside the archive to install and configure
+            the server. The automatically generated source archives are source
+            code and are not the installable runtime package.

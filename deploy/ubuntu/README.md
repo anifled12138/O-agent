@@ -4,7 +4,7 @@ This directory contains a staged deployment for the cloud-control-plane role. Th
 
 ## Release layout
 
-CI publishes a single `o-agent-cloud-runtime` artifact for each successful run. Verify the `.sha256` file, then download and extract it; it has this exact layout:
+CI publishes a single `o-agent-cloud-runtime` artifact for each successful run. Version-tag releases run the same checks against the exact tagged commit and attach `o-agent-cloud-runtime.tar.gz` and its `.sha256` file to GitHub Releases; automatic source archives are not installable runtime packages. A failed test or provenance check prevents runtime publication. Verify the `.sha256` file, then extract the package; it has this exact layout:
 
 ```bash
 sha256sum -c o-agent-cloud-runtime.tar.gz.sha256

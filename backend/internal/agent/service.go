@@ -68,8 +68,9 @@ type Service struct {
 	approvals           map[string]chan bool
 	deltaLocks          sync.Map
 	projectRunLocks     projectRunLockSet
-	// sandboxCommand is nil in production. Tests may inject a command runner to
-	// exercise Git bundle semantics without weakening the host sandbox.
+	// sandboxCommand is nil in production. Injected runners execute in the host
+	// filesystem namespace, so their Git root read-back uses the host workdir.
+	// Tests can exercise Git semantics without weakening the host sandbox.
 	sandboxCommand func(context.Context, coretools.ExecutionConfig, string, []string, string, []string, []string, bool, time.Duration) (string, string, error, error)
 }
 
@@ -1649,7 +1650,7 @@ func (s *Service) inspectLocalGitSnapshot(ctx context.Context, workdir, reposito
 		return "", "", err
 	}
 	expectedRoot := resolved
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && (s == nil || s.sandboxCommand == nil) {
 		expectedRoot = "/workspace"
 	}
 	if !strings.EqualFold(filepath.Clean(root), filepath.Clean(expectedRoot)) {
@@ -1822,7 +1823,7 @@ func (s *Service) InspectGitPublication(ctx context.Context, repositoryURL, work
 		return preview, err
 	}
 	expectedRoot := workdir
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && (s == nil || s.sandboxCommand == nil) {
 		expectedRoot = "/workspace"
 	}
 	if !strings.EqualFold(filepath.Clean(strings.TrimSpace(root)), filepath.Clean(expectedRoot)) {
@@ -1925,7 +1926,7 @@ func (s *Service) PublishProjectCommit(ctx context.Context, repositoryURL, workd
 		return "", false, err
 	}
 	expectedRoot := workdir
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && (s == nil || s.sandboxCommand == nil) {
 		expectedRoot = "/workspace"
 	}
 	if !strings.EqualFold(filepath.Clean(strings.TrimSpace(root)), filepath.Clean(expectedRoot)) {

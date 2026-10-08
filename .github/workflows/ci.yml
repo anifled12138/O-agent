@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [ main, master ]
 
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact source commit to test and package
+        required: false
+        type: string
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,6 +27,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -43,7 +52,25 @@ jobs:
         run: go vet ./internal/sandbox ./internal/coretools ./cmd/axiom-command-runner ./cmd/axiom-sandbox-setup
 
       - name: Test Windows sandbox and Git credential broker
-        run: go test ./internal/sandbox ./internal/gitcredential
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          go test ./internal/sandbox ./internal/gitcredential 2>&1 | Tee-Object -FilePath windows-test.log
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            $lines = Get-Content windows-test.log
+            $reported = 0
+            for ($index = 0; $index -lt $lines.Count -and $reported -lt 60; $index++) {
+              if ($lines[$index] -match '--- FAIL:|panic:') {
+                for ($context = [Math]::Max(0, $index - 5); $context -le $index -and $reported -lt 60; $context++) {
+                  $line = $lines[$context].Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+                  Write-Output "::error::$line"
+                  $reported++
+                }
+              }
+            }
+            exit $testExit
+          }
 
   backend-test-and-build:
     name: Backend Test & Build
@@ -54,6 +81,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -79,7 +108,9 @@ jobs:
           TEST_EXIT=$?
           cat test.log
           if [ $TEST_EXIT -ne 0 ]; then
-            grep -E "(FAIL|panic:|--- FAIL:)" test.log | head -n 30 | while IFS= read -r line; do
+            awk '/--- FAIL:|panic:/ { for (i=NR-5; i<NR; i++) if (i>0) print context[i]; print } { context[NR]=$0 }' test.log | head -n 60 | while IFS= read -r line; do
+              line=${line//%/%25}
+              line=${line//$'\r'/%0D}
               echo "::error::$line"
             done
             exit $TEST_EXIT
@@ -156,6 +187,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -195,6 +228,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Download backend runtime
         uses: actions/download-artifact@v4
@@ -224,7 +259,7 @@ jobs:
           install -m 0755 staging/backend/axiom-quota-helper release/backend/axiom-quota-helper
           cp -a staging/frontend/. release/frontend/
           cp deploy/ubuntu/o-agent.service deploy/ubuntu/o-agent-quota-helper.service deploy/ubuntu/o-web.service deploy/ubuntu/o-agent-backup.service deploy/ubuntu/o-agent-backup.timer deploy/ubuntu/backup-and-upload.sh deploy/ubuntu/user-manager-delegation.conf deploy/ubuntu/install-runtime.sh deploy/ubuntu/config-paths.sh deploy/ubuntu/README.md deploy/ubuntu/Caddyfile.example release/deploy/ubuntu/
-          printf 'source_commit=%s\n' "$GITHUB_SHA" > release/BUILD-INFO
+          printf 'source_commit=%s\n' "$(git rev-parse HEAD)" > release/BUILD-INFO
           bash -n deploy/ubuntu/install-runtime.sh
           bash -n deploy/ubuntu/config-paths.sh deploy/ubuntu/config-paths.test.sh
           bash deploy/ubuntu/config-paths.test.sh

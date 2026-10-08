@@ -435,39 +435,32 @@ func startNativeGitCredentialBroker(pipeName, commandID, ownerSID, accountSID st
 			close(stop)
 			deadline := time.Now().Add(2 * time.Second)
 			var cancelErr error
+			reportedCancelErrors := make(map[windows.Handle]bool)
 			for {
 				mu.Lock()
 				handle := active
-				var err error
 				if handle != 0 {
-					err = cancelNativePipeIO(handle)
+					err := cancelNativePipeIO(handle)
+					if err != nil && !errors.Is(err, windows.ERROR_NOT_FOUND) && !reportedCancelErrors[handle] {
+						cancelErr = errors.Join(cancelErr, err)
+						reportedCancelErrors[handle] = true
+					}
 				}
 				mu.Unlock()
-				if handle == 0 || err == nil {
-					break
-				}
-				if !errors.Is(err, windows.ERROR_NOT_FOUND) {
-					cancelErr = errors.Join(cancelErr, err)
-					break
+				// Cancelling one I/O operation does not prevent the listener from
+				// entering its next read. Keep cancelling until it has closed its
+				// pipe and reported completion, including the connect/read race.
+				select {
+				case err := <-done:
+					stopErr = errors.Join(cancelErr, err)
+					return
+				default:
 				}
 				if time.Until(deadline) <= 0 {
-					cancelErr = errors.Join(cancelErr, errors.New("Git credential broker pipe I/O could not be cancelled"))
-					break
+					stopErr = errors.Join(cancelErr, errors.New("Git credential broker did not stop"))
+					return
 				}
 				time.Sleep(10 * time.Millisecond)
-			}
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				stopErr = errors.Join(cancelErr, errors.New("Git credential broker did not stop"))
-				return
-			}
-			timer := time.NewTimer(remaining)
-			defer timer.Stop()
-			select {
-			case err := <-done:
-				stopErr = errors.Join(cancelErr, err)
-			case <-timer.C:
-				stopErr = errors.Join(cancelErr, errors.New("Git credential broker did not stop"))
 			}
 		})
 		return stopErr
