@@ -525,6 +525,8 @@ func TestNodeWorkerRunsConfiguredTasksConcurrently(t *testing.T) {
 
 func TestNodeWorkerKeepsExecutingWhenWebSocketWakeIsUnavailable(t *testing.T) {
 	const credential = "0123456789abcdef0123456789abcdef"
+	wakeUnavailable := make(chan struct{})
+	var wakeUnavailableOnce sync.Once
 	var wakeAttempts atomic.Int32
 	var claimCount atomic.Int32
 	var terminalReports atomic.Int32
@@ -533,9 +535,17 @@ func TestNodeWorkerKeepsExecutingWhenWebSocketWakeIsUnavailable(t *testing.T) {
 		case r.URL.Path == "/api/v1/nodes/connect":
 			wakeAttempts.Add(1)
 			http.Error(w, "websocket upgrade is unavailable", http.StatusServiceUnavailable)
+			wakeUnavailableOnce.Do(func() { close(wakeUnavailable) })
 		case r.URL.Path == "/api/v1/nodes/heartbeat":
 			writeNodeHeartbeatReadBack(t, w, r)
 		case r.URL.Path == "/api/v1/nodes/tasks/claim":
+			// Prove polling executes after the unavailable wake endpoint has
+			// been exercised, independent of goroutine scheduling order.
+			select {
+			case <-wakeUnavailable:
+			case <-r.Context().Done():
+				return
+			}
 			if claimCount.Add(1) != 1 {
 				w.WriteHeader(http.StatusNoContent)
 				return
