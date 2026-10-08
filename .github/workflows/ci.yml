@@ -115,7 +115,7 @@ jobs:
           fi
 
       - name: Install project quota filesystem tools
-        run: sudo apt-get update && sudo apt-get install -y e2fsprogs xfsprogs kmod
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs xfsprogs kmod util-linux
 
       - name: Verify kernel project quota enforcement on ext4 and XFS
         shell: bash
@@ -170,7 +170,7 @@ jobs:
           mkfs.ext4 -F -O project,quota "$ext4_image"
           sudo mount -t ext4 -o loop,prjquota "$ext4_image" "$ext4_mount"
           mounted_ext4=1
-          sudo env O_PROJECT_QUOTA_TEST_ROOT="$ext4_mount" "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v 2>&1 | tee projectquota-test.log
+          sudo env O_PROJECT_QUOTA_TEST_ROOT="$ext4_mount" setpriv --bounding-set=-sys_resource "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v 2>&1 | tee projectquota-test.log
           sudo umount -- "$ext4_mount"
           mounted_ext4=0
 
@@ -178,7 +178,7 @@ jobs:
           mkfs.xfs -f "$xfs_image"
           sudo mount -t xfs -o loop,pquota "$xfs_image" "$xfs_mount"
           mounted_xfs=1
-          sudo env O_PROJECT_QUOTA_TEST_ROOT="$xfs_mount" "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v 2>&1 | tee projectquota-test.log
+          sudo env O_PROJECT_QUOTA_TEST_ROOT="$xfs_mount" setpriv --bounding-set=-sys_resource "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v 2>&1 | tee projectquota-test.log
           sudo umount -- "$xfs_mount"
           mounted_xfs=0
 

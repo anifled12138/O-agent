@@ -15,13 +15,23 @@ import (
 // This test is deliberately opt-in because it creates a real kernel quota and
 // writes to the filesystem. Run it on a disposable ext4/XFS mount with
 // prjquota/pquota enabled and a root-owned test invocation:
-// O_PROJECT_QUOTA_TEST_ROOT=/mnt/quota-test go test ./internal/projectquota -run TestKernelProjectQuotaRejectsWritesBeyondLimit
+// O_PROJECT_QUOTA_TEST_ROOT=/mnt/quota-test setpriv --bounding-set=-sys_resource go test ./internal/projectquota -run TestKernelProjectQuotaRejectsWritesBeyondLimit
 func TestKernelProjectQuotaRejectsWritesBeyondLimit(t *testing.T) {
 	if os.Getenv("O_PROJECT_QUOTA_TEST_ROOT") == "" {
 		t.Skip("set O_PROJECT_QUOTA_TEST_ROOT to an isolated quota-enabled mount to run kernel enforcement acceptance")
 	}
 	if os.Geteuid() != 0 {
 		t.Fatal("configured kernel project quota acceptance requires root")
+	}
+	// Administrative quota writes need CAP_SYS_ADMIN; the payload write must
+	// not carry CAP_SYS_RESOURCE, which would bypass the ext4 hard limit.
+	var capabilities [2]unix.CapUserData
+	header := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	if err := unix.Capget(&header, &capabilities[0]); err != nil {
+		t.Fatalf("read quota acceptance capabilities: %v", err)
+	}
+	if capabilities[unix.CAP_SYS_RESOURCE/32].Effective&(uint32(1)<<(unix.CAP_SYS_RESOURCE%32)) != 0 {
+		t.Fatal("run configured quota acceptance with setpriv --bounding-set=-sys_resource so payload writes cannot bypass the hard limit")
 	}
 	root, err := filepath.Abs(filepath.Clean(os.Getenv("O_PROJECT_QUOTA_TEST_ROOT")))
 	if err != nil {
