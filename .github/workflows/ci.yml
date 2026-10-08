@@ -121,6 +121,22 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          report_quota_error() {
+            local status="$1" command="$2" diagnostic
+            trap - ERR
+            if diagnostic="$(sudo dmesg 2>&1 | tail -n 12)"; then
+              :
+            else
+              diagnostic="Kernel diagnostics unavailable: $diagnostic"
+            fi
+            diagnostic="Project quota check failed (exit $status): $command"$'\n'"$diagnostic"
+            diagnostic=${diagnostic//%/%25}
+            diagnostic=${diagnostic//$'\r'/%0D}
+            diagnostic=${diagnostic//$'\n'/%0A}
+            echo "::error::$diagnostic"
+            exit "$status"
+          }
+          trap 'report_quota_error "$?" "$BASH_COMMAND"' ERR
           test_binary="$RUNNER_TEMP/projectquota-linux.test"
           go test -c -o "$test_binary" ./internal/projectquota
           chmod 0755 "$test_binary"
