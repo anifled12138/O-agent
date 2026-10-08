@@ -21,7 +21,7 @@ func TestKernelProjectQuotaRejectsWritesBeyondLimit(t *testing.T) {
 		t.Skip("set O_PROJECT_QUOTA_TEST_ROOT to an isolated quota-enabled mount to run kernel enforcement acceptance")
 	}
 	if os.Geteuid() != 0 {
-		t.Skip("kernel project quota acceptance requires root")
+		t.Fatal("configured kernel project quota acceptance requires root")
 	}
 	root, err := filepath.Abs(filepath.Clean(os.Getenv("O_PROJECT_QUOTA_TEST_ROOT")))
 	if err != nil {
@@ -40,14 +40,14 @@ func TestKernelProjectQuotaRejectsWritesBeyondLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !probe.MountSupported || !probe.QuotaOptionFound {
-		t.Skipf("mount does not support project quotas: %s", probe.Reason)
+		t.Fatalf("configured acceptance mount does not support project quotas: %s", probe.Reason)
 	}
 	var stat unix.Statfs_t
 	if err := unix.Statfs(root, &stat); err != nil {
 		t.Fatal(err)
 	}
 	if uint64(stat.Bavail)*uint64(stat.Bsize) < 128<<20 {
-		t.Skip("quota test mount needs at least 128 MiB free to distinguish quota rejection from filesystem exhaustion")
+		t.Fatal("configured quota test mount needs at least 128 MiB free to distinguish quota rejection from filesystem exhaustion")
 	}
 	testRoot, err := os.MkdirTemp(root, ".o-projectquota-acceptance-")
 	if err != nil {

@@ -115,7 +115,7 @@ jobs:
           fi
 
       - name: Install project quota filesystem tools
-        run: sudo apt-get update && sudo apt-get install -y e2fsprogs xfsprogs
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs xfsprogs kmod
 
       - name: Verify kernel project quota enforcement on ext4 and XFS
         shell: bash
@@ -137,6 +137,13 @@ jobs:
             exit "$status"
           }
           trap 'report_quota_error "$?" "$BASH_COMMAND"' ERR
+          # Azure runner kernels may omit the loadable quota format driver
+          # from their base modules package; provision the exact running kernel.
+          if ! modinfo quota_v2 >/dev/null 2>&1; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          fi
+          sudo modprobe quota_v2
+          sudo modprobe xfs
           test_binary="$RUNNER_TEMP/projectquota-linux.test"
           go test -c -o "$test_binary" ./internal/projectquota
           chmod 0755 "$test_binary"
