@@ -7,7 +7,6 @@ import { APIError, request } from './api';
 type AuthStatus = {
  authenticationRequired: boolean; setupRequired: boolean; registrationAvailable: boolean;
  passwordResetAvailable: boolean; turnstileSiteKey: string; loginChallengeRequired: boolean;
- minimumPasswordLength: number; accountMode: 'personal';
 };
 type View = 'checking' | 'open' | 'login' | 'register' | 'reset' | 'setup' | 'verify-register' | 'verify-reset' | 'connection-error';
 type Turnstile = {
@@ -113,8 +112,7 @@ export default function AuthenticationGate({children}: {children: (options: {onL
 
  async function submit(event: FormEvent<HTMLFormElement>) {
   event.preventDefault();
-  if (newPassword && Array.from(password).length < (status?.minimumPasswordLength ?? 15)) { setError('密码至少 15 个字符，可使用密码管理器生成'); return; }
-  if (newPassword && new TextEncoder().encode(password).length > 1024) { setError('密码过长，最多 1024 个 UTF-8 字节'); return; }
+  if (newPassword && !password.trim()) { setError('密码不能留空或全部为空白'); return; }
   if (needsHuman && !challengeToken) { setError('请先完成人机验证'); return; }
   setBusy(true); setError(''); setNotice('');
   try {
@@ -150,12 +148,12 @@ export default function AuthenticationGate({children}: {children: (options: {onL
  if (view === 'connection-error') return <main className="auth-shell"><section className="auth-card"><h1>暂时无法连接 O</h1><p role="alert" className="auth-error">{error}</p><button className="auth-primary" onClick={() => { setView('checking'); setError(''); void check(); }}>重新连接</button></section></main>;
  return <main className="auth-shell"><form className="auth-card" onSubmit={submit}>
   <div className="auth-brand">O</div><h1>{title}</h1>
-  <p className="auth-description">{verify ? `输入发送到 ${email} 的 8 位验证码。` : view === 'setup' ? '使用服务器引导密钥初始化主账户。' : '登录后选择云端 Linux 或已连接的电脑，开始对话。'}</p>
+  <p className="auth-description">{verify ? `输入发送到 ${email} 的 8 位验证码。` : view === 'setup' ? '使用服务器引导密钥创建账户。' : '登录后选择云端 Linux 或已连接的电脑，开始对话。'}</p>
   {view === 'setup' && <label>引导密钥<input required type="password" autoComplete="off" value={bootstrapToken} onChange={(e) => setBootstrapToken(e.target.value)} /></label>}
   {(view === 'register' || view === 'setup') && <label>名称<input value={displayName} maxLength={200} autoComplete="nickname" onChange={(e) => setDisplayName(e.target.value)} /></label>}
   {!verify && <label>邮箱<input required type="email" autoComplete="username" inputMode="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>}
   {verify && <label>邮箱验证码<input required pattern="[0-9]{8}" maxLength={8} inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value.replace(/[^0-9]/g, ''))} /></label>}
-  {passwordVisible && <div className="auth-field"><label htmlFor="auth-password">{view === 'verify-reset' ? '新密码' : '密码'}</label><input id="auth-password" required type="password" autoComplete={newPassword ? 'new-password' : 'current-password'} aria-describedby={newPassword ? 'auth-password-help' : undefined} value={password} onChange={(e) => setPassword(e.target.value)} />{newPassword && <small id="auth-password-help">至少 15 个字符，支持密码管理器和粘贴。</small>}</div>}
+  {passwordVisible && <div className="auth-field"><label htmlFor="auth-password">{view === 'verify-reset' ? '新密码' : '密码'}</label><input id="auth-password" required type="password" autoComplete={newPassword ? 'new-password' : 'current-password'} value={password} onChange={(e) => setPassword(e.target.value)} /></div>}
   {needsHuman && <HumanChallenge sitekey={status!.turnstileSiteKey} action={action} version={challengeVersion} onToken={setChallengeToken} />}
   {notice && <p role="status" className="auth-notice">{notice}</p>}
   {error && <p role="alert" className="auth-error">{error}</p>}
@@ -167,7 +165,6 @@ export default function AuthenticationGate({children}: {children: (options: {onL
    {verify && <button disabled={busy} type="button" onClick={() => switchView(view === 'verify-register' ? 'register' : 'reset')}>重新申请验证码</button>}
    {view === 'login' && status?.setupRequired && <button disabled={busy} type="button" onClick={() => switchView('setup')}>管理员初始设置</button>}
   </nav>
-  {status?.setupRequired && !status.registrationAvailable && <p className="auth-footnote">此个人服务器尚未初始化。管理员可配置注册邮箱与邮件服务，或使用引导密钥完成初始设置。</p>}
-  <p className="auth-footnote">一个主账户管理多台电脑。本地单机使用无需登录。</p>
+  {status?.setupRequired && !status.registrationAvailable && <p className="auth-footnote">服务尚未初始化。管理员可配置注册邮箱与邮件服务，或使用引导密钥完成初始设置。</p>}
  </form></main>;
 }

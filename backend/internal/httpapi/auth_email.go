@@ -11,13 +11,11 @@ import (
 	"net/mail"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/storage"
 )
 
-const authMinimumPasswordLength = 15
 const authCodeLifetime = 10 * time.Minute
 
 func normalizeAuthEmail(raw string) (string, error) {
@@ -29,7 +27,7 @@ func normalizeAuthEmail(raw string) (string, error) {
 	return strings.ToLower(raw), nil
 }
 func validAuthPassword(password string) bool {
-	return utf8.RuneCountInString(password) >= authMinimumPasswordLength && len(password) <= 1024
+	return strings.TrimSpace(password) != ""
 }
 
 func newAuthID() (string, error) {
@@ -67,7 +65,7 @@ func (s *Server) authChallengeStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if purpose == "register" && (!validAuthPassword(input.Password) || len(strings.TrimSpace(input.DisplayName)) > 200) {
-		write(w, http.StatusBadRequest, map[string]string{"error": "密码至少 15 个字符、最多 1024 个 UTF-8 字节，名称不得超过 200 个字符"})
+		write(w, http.StatusBadRequest, map[string]string{"error": "密码不能留空或全部为空白，名称过长时请缩短"})
 		return
 	}
 
@@ -185,7 +183,7 @@ func (s *Server) authChallengeVerify(w http.ResponseWriter, r *http.Request) {
 	hash := ""
 	if purpose == "reset" {
 		if !validAuthPassword(input.Password) {
-			write(w, http.StatusBadRequest, map[string]string{"error": "密码至少 15 个字符、最多 1024 个 UTF-8 字节"})
+			write(w, http.StatusBadRequest, map[string]string{"error": "密码不能留空或全部为空白"})
 			return
 		}
 		var err error

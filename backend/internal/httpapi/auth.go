@@ -53,7 +53,7 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	registration := s.authBootstrapToken != "" && needsSetup && s.authOwnerEmail != "" && s.authMailer != nil
-	write(w, http.StatusOK, map[string]any{"authenticationRequired": s.authBootstrapToken != "", "setupRequired": needsSetup, "registrationAvailable": registration, "passwordResetAvailable": s.authBootstrapToken != "" && !needsSetup && s.authMailer != nil, "turnstileSiteKey": s.authTurnstileSiteKey, "loginChallengeRequired": s.authHumanVerifier != nil && attempts >= 3, "minimumPasswordLength": authMinimumPasswordLength, "accountMode": "personal"})
+	write(w, http.StatusOK, map[string]any{"authenticationRequired": s.authBootstrapToken != "", "setupRequired": needsSetup, "registrationAvailable": registration, "passwordResetAvailable": s.authBootstrapToken != "" && !needsSetup && s.authMailer != nil, "turnstileSiteKey": s.authTurnstileSiteKey, "loginChallengeRequired": s.authHumanVerifier != nil && attempts >= 3, "accountMode": "personal"})
 }
 
 func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +71,7 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	address, err := mail.ParseAddress(strings.TrimSpace(input.Email))
 	if err != nil || address.Address != strings.TrimSpace(input.Email) || len(address.Address) > 254 || !validAuthPassword(input.Password) || len(strings.TrimSpace(input.DisplayName)) > 200 {
-		write(w, http.StatusBadRequest, map[string]string{"error": "provide a valid email and a password of at least 15 characters"})
+		write(w, http.StatusBadRequest, map[string]string{"error": "请提供有效邮箱、非空密码，并缩短过长的名称"})
 		return
 	}
 	display := strings.TrimSpace(input.DisplayName)
@@ -174,14 +174,11 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	valid := false
 	verifier := stored
 	if !strings.HasPrefix(verifier, "pbkdf2-sha256$") {
 		verifier = "pbkdf2-sha256$600000$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	}
-	if len(input.Password) <= 1024 {
-		valid = verifyPassword(input.Password, verifier) && err == nil
-	}
+	valid := verifyPassword(input.Password, verifier) && err == nil
 	if !valid || user.ID != s.workspaceID {
 		accountBlock, recordErr := s.store.RecordAuthLoginFailure(r.Context(), accountBucket, time.Now().UTC())
 		if recordErr != nil {
