@@ -440,7 +440,7 @@ func TestPrepareNativeSSHSigningEnvironmentPreservesSigningWhenAgentIsUnavailabl
 			command := exec.Command(gitPath, "config", "--get", key)
 			command.Dir = scratch
 			command.Env = environmentEntries(environment)
-			output, err := command.Output()
+			output, err := command.CombinedOutput()
 			if err != nil || strings.TrimSpace(string(output)) != want {
 				t.Fatalf("Git did not consume command-scoped %s=%q (output=%q err=%v)", key, want, output, err)
 			}

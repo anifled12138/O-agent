@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -380,8 +382,21 @@ func TestCreateProjectDeltaBundleRetainsGitLFSObjectsInRepositoryStorage(t *test
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := os.RemoveAll(testRoot); err != nil {
-			t.Errorf("remove project LFS test root: %v", err)
+		deadline := time.Now().Add(time.Second)
+		for {
+			err := os.RemoveAll(testRoot)
+			// A finished Git LFS filter can briefly retain a directory handle
+			// on Windows. Retry only that sharing violation, never other errors.
+			if runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(32)) && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				t.Errorf("remove project LFS test root: %v", err)
+			} else if _, err := os.Lstat(testRoot); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("project LFS test root still exists after cleanup: %v", err)
+			}
+			return
 		}
 	}()
 	workdir := filepath.Join(testRoot, "source")

@@ -618,7 +618,11 @@ func runNativeGit(ctx context.Context, executable string, args ...string) ([]byt
 	}
 	output, err := command.Output()
 	if err != nil {
-		return nil, fmt.Errorf("git metadata query failed: %w: %s", err, strings.TrimSpace(string(output)))
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return nil, fmt.Errorf("git metadata query failed: %w: %s", err, strings.TrimSpace(string(exit.Stderr)))
+		}
+		return nil, fmt.Errorf("git metadata query failed: %w", err)
 	}
 	return output, nil
 }

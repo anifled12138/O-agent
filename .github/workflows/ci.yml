@@ -55,18 +55,16 @@ jobs:
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          go test ./internal/sandbox ./internal/gitcredential 2>&1 | Tee-Object -FilePath windows-test.log
+          go test -v ./internal/sandbox ./internal/gitcredential 2>&1 | Tee-Object -FilePath windows-test.log
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) {
             $lines = Get-Content windows-test.log
             $reported = 0
             for ($index = 0; $index -lt $lines.Count -and $reported -lt 60; $index++) {
               if ($lines[$index] -match '--- FAIL:|panic:') {
-                for ($context = [Math]::Max(0, $index - 5); $context -le $index -and $reported -lt 60; $context++) {
-                  $line = $lines[$context].Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-                  Write-Output "::error::$line"
-                  $reported++
-                }
+                $message = ($lines[[Math]::Max(0, $index - 5)..$index] -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+                Write-Output "::error::$message"
+                $reported++
               }
             }
             exit $testExit

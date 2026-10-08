@@ -57,7 +57,7 @@ func TestBrowserRequestCancellationStopsBlockedPipeRead(t *testing.T) {
 }
 
 func TestParseLinuxMemAvailable(t *testing.T) {
-	available, err := parseLinuxMemAvailable(strings.NewReader("MemTotal: 4000000 kB\nMemAvailable: 2048000 kB\n"))
+	available, err := parseLinuxMemAvailable(strings.NewReader("MemTotal: 4000000 kB\nMemAvailable: 2097152 kB\n"))
 	if err != nil || available != 2<<30 {
 		t.Fatalf("available=%d err=%v, want 2 GiB", available, err)
 	}
