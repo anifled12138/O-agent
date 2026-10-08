@@ -129,6 +129,9 @@ jobs:
             else
               diagnostic="Kernel diagnostics unavailable: $diagnostic"
             fi
+            if [[ -f projectquota-test.log ]]; then
+              diagnostic="$(tail -n 20 projectquota-test.log)"$'\n'"$diagnostic"
+            fi
             diagnostic="Project quota check failed (exit $status): $command"$'\n'"$diagnostic"
             diagnostic=${diagnostic//%/%25}
             diagnostic=${diagnostic//$'\r'/%0D}
@@ -167,7 +170,7 @@ jobs:
           mkfs.ext4 -F -O project,quota "$ext4_image"
           sudo mount -t ext4 -o loop,prjquota "$ext4_image" "$ext4_mount"
           mounted_ext4=1
-          sudo env O_PROJECT_QUOTA_TEST_ROOT="$ext4_mount" "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v
+          sudo env O_PROJECT_QUOTA_TEST_ROOT="$ext4_mount" "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v 2>&1 | tee projectquota-test.log
           sudo umount -- "$ext4_mount"
           mounted_ext4=0
 
@@ -175,7 +178,7 @@ jobs:
           mkfs.xfs -f "$xfs_image"
           sudo mount -t xfs -o loop,pquota "$xfs_image" "$xfs_mount"
           mounted_xfs=1
-          sudo env O_PROJECT_QUOTA_TEST_ROOT="$xfs_mount" "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v
+          sudo env O_PROJECT_QUOTA_TEST_ROOT="$xfs_mount" "$test_binary" -test.run '^TestKernelProjectQuotaRejectsWritesBeyondLimit$' -test.v 2>&1 | tee projectquota-test.log
           sudo umount -- "$xfs_mount"
           mounted_xfs=0
 
@@ -184,7 +187,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backend-test-log
-          path: backend/test.log
+          path: |
+            backend/test.log
+            backend/projectquota-test.log
 
       - name: Build O Binary
         run: |

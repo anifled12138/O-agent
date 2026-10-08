@@ -401,27 +401,16 @@ func setProjectQuota(probe ProbeResult, projectID uint32, limitBytes int64) erro
 	if err != nil {
 		return err
 	}
-	special, err := unix.BytePtrFromString(probe.MountPoint)
-	if err != nil {
-		return err
-	}
 	switch probe.Filesystem {
 	case "ext4":
 		quota := ifDqblk{BlockHardLimit: blocks, BlockSoftLimit: blocks, Valid: qifBlockLimits}
-		_, _, errno := unix.Syscall6(unix.SYS_QUOTACTL, qcmd(qSetQuota, projectQuotaType), uintptr(unsafe.Pointer(special)), uintptr(projectID), uintptr(unsafe.Pointer(&quota)), 0, 0)
-		if errno != 0 {
-			return errno
-		}
+		return quotaControlAtMount(probe.MountPoint, qcmd(qSetQuota, projectQuotaType), projectID, unsafe.Pointer(&quota))
 	case "xfs":
 		quota := xfsDiskQuota{Version: 1, Flags: xfsProjectQuota, FieldMask: xfsHardBlockLimit | xfsSoftBlockLimit, ID: projectID, BlockHardLimit: blocks, BlockSoftLimit: blocks}
-		_, _, errno := unix.Syscall6(unix.SYS_QUOTACTL, xqmSetQuotaLimit, uintptr(unsafe.Pointer(special)), uintptr(projectID), uintptr(unsafe.Pointer(&quota)), 0, 0)
-		if errno != 0 {
-			return errno
-		}
+		return quotaControlAtMount(probe.MountPoint, qcmd(xqmSetQuotaLimit, projectQuotaType), projectID, unsafe.Pointer(&quota))
 	default:
 		return fmt.Errorf("unsupported project quota filesystem %q", probe.Filesystem)
 	}
-	return nil
 }
 
 type projectQuotaRecord struct {
@@ -430,23 +419,17 @@ type projectQuotaRecord struct {
 }
 
 func getProjectQuota(probe ProbeResult, projectID uint32) (projectQuotaRecord, error) {
-	special, err := unix.BytePtrFromString(probe.MountPoint)
-	if err != nil {
-		return projectQuotaRecord{}, err
-	}
 	switch probe.Filesystem {
 	case "ext4":
 		var quota ifDqblk
-		_, _, errno := unix.Syscall6(unix.SYS_QUOTACTL, qcmd(qGetQuota, projectQuotaType), uintptr(unsafe.Pointer(special)), uintptr(projectID), uintptr(unsafe.Pointer(&quota)), 0, 0)
-		if errno != 0 {
-			return projectQuotaRecord{}, errno
+		if err := quotaControlAtMount(probe.MountPoint, qcmd(qGetQuota, projectQuotaType), projectID, unsafe.Pointer(&quota)); err != nil {
+			return projectQuotaRecord{}, err
 		}
 		return projectQuotaRecord{ext4: &quota}, nil
 	case "xfs":
 		quota := xfsDiskQuota{Version: 1, Flags: xfsProjectQuota, ID: projectID}
-		_, _, errno := unix.Syscall6(unix.SYS_QUOTACTL, xqmGetQuota, uintptr(unsafe.Pointer(special)), uintptr(projectID), uintptr(unsafe.Pointer(&quota)), 0, 0)
-		if errno != 0 {
-			return projectQuotaRecord{}, errno
+		if err := quotaControlAtMount(probe.MountPoint, qcmd(xqmGetQuota, projectQuotaType), projectID, unsafe.Pointer(&quota)); err != nil {
+			return projectQuotaRecord{}, err
 		}
 		return projectQuotaRecord{xfs: &quota}, nil
 	default:
@@ -454,6 +437,21 @@ func getProjectQuota(probe ProbeResult, projectID uint32) (projectQuotaRecord, e
 	}
 }
 
+// quotactl requires a block-device path, not a mount directory. Linux 5.14+
+// quotactl_fd addresses the mounted filesystem directly without resolving its
+// backing device, and uses QCMD encoding for both ext4 and XFS operations.
+func quotaControlAtMount(mountPoint string, command uintptr, projectID uint32, record unsafe.Pointer) error {
+	fd, err := unix.Open(mountPoint, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open quota mount: %w", err)
+	}
+	_, _, errno := unix.Syscall6(unix.SYS_QUOTACTL_FD, uintptr(fd), command, uintptr(projectID), uintptr(record), 0, 0)
+	closeErr := unix.Close(fd)
+	if errno != 0 {
+		return errors.Join(errno, closeErr)
+	}
+	return closeErr
+}
 func quotaBytes(filesystem string, quota projectQuotaRecord) (int64, int64) {
 	switch filesystem {
 	case "ext4":
