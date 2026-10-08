@@ -45,6 +45,11 @@ type nativeGitMetadata struct {
 }
 
 func discoverNativeRepositoryScope(ctx context.Context, workdir string, allowedRoots []string, writeAccess bool) (*nativeRepositoryScope, error) {
+	var err error
+	workdir, err = canonicalNativeDirectory(workdir)
+	if err != nil {
+		return nil, fmt.Errorf("normalize selected Git workdir: %w", err)
+	}
 	var allowedBase string
 	for _, root := range allowedRoots {
 		resolved, err := canonicalNativeDirectory(root)

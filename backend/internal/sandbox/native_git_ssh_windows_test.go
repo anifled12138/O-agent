@@ -471,3 +471,48 @@ func TestUnavailableSSHSigningKeyDoesNotBlockOrdinaryGitOrDisableSigning(t *test
 		t.Fatalf("missing selected key unexpectedly exists in command scratch: %v", err)
 	}
 }
+func TestDiscoverNativeRepositoryScopeAcceptsDOSPathAlias(t *testing.T) {
+	gitPath, err := exec.LookPath("git.exe")
+	if err != nil {
+		t.Skip("Git is not installed")
+	}
+	directory := filepath.Join(t.TempDir(), "repository with a long directory name")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name, err := windows.UTF16PtrFromString(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]uint16, 32768)
+	length, err := windows.GetShortPathName(name, &buffer[0], uint32(len(buffer)))
+	if err != nil || length == 0 || length >= uint32(len(buffer)) {
+		t.Fatalf("read DOS directory alias: length=%d err=%v", length, err)
+	}
+	alias := windows.UTF16ToString(buffer[:length])
+	longPath, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.EqualFold(alias, longPath) {
+		t.Skip("this filesystem does not provide a DOS 8.3 alias")
+	}
+	if output, err := exec.Command(gitPath, "init", directory).CombinedOutput(); err != nil {
+		t.Fatalf("initialize alias-backed Git repository: %v: %s", err, output)
+	}
+	scope, err := discoverNativeRepositoryScope(context.Background(), alias, []string{longPath}, false)
+	if err != nil || scope == nil {
+		t.Fatalf("authorized DOS path alias was rejected: scope=%v err=%v", scope, err)
+	}
+	volume, index, err := nativeFileIdentity(longPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualVolume, actualIndex, err := nativeFileIdentity(scope.Workspace)
+	if err != nil || actualVolume != volume || actualIndex != index {
+		t.Fatalf("repository scope changed filesystem identity: volume=%d index=%d err=%v", actualVolume, actualIndex, err)
+	}
+	if !pathWithin(longPath, scope.Workspace) {
+		t.Fatalf("normalized scope escaped the authorized directory: %s", scope.Workspace)
+	}
+}

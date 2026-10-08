@@ -108,17 +108,31 @@ func canonicalNativeDirectory(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, _, err := nativeFileIdentity(absolute); err != nil {
+	volume, index, err := nativeFileIdentity(absolute)
+	if err != nil {
 		return "", err
 	}
-	info, err := os.Stat(absolute)
+	// Normalize DOS 8.3 aliases only after rejecting reparse points, then
+	// recheck the identity so normalization cannot authorize another object.
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	resolvedVolume, resolvedIndex, err := nativeFileIdentity(resolved)
+	if err != nil {
+		return "", err
+	}
+	if resolvedVolume != volume || resolvedIndex != index {
+		return "", errors.New("filesystem identity changed while normalizing a native directory")
+	}
+	info, err := os.Stat(resolved)
 	if err != nil {
 		return "", err
 	}
 	if !info.IsDir() {
 		return "", fmt.Errorf("%q is not a directory", path)
 	}
-	return filepath.Clean(absolute), nil
+	return filepath.Clean(resolved), nil
 }
 
 func nativeEnvironmentRuntimePaths(environment map[string]string) []string {

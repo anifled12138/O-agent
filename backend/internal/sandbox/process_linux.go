@@ -238,7 +238,7 @@ func bubblewrapArgs(command *exec.Cmd, policy Policy, bridge *linuxGitCredential
 	args = append(args, "--dir", guestRoot)
 	directories := map[string]bool{"/": true, guestRoot: true, "/usr": true, "/bin": true, "/sbin": true, "/lib": true, "/lib64": true, "/etc": true, "/dev": true, "/proc": true}
 	if policy.NetworkAccess {
-		if err := appendBind(args, "--ro-bind", policy.NetworkHostsFile, "/etc/hosts", directories); err != nil {
+		if err := appendBind(&args, "--ro-bind", policy.NetworkHostsFile, "/etc/hosts", directories); err != nil {
 			return nil, fmt.Errorf("mount pinned network destination hosts: %w", err)
 		}
 	}
@@ -246,12 +246,12 @@ func bubblewrapArgs(command *exec.Cmd, policy Policy, bridge *linuxGitCredential
 		if rootIsCovered(root, writeRoots) {
 			continue
 		}
-		if err := appendBind(args, "--ro-bind", root, guestPaths[root], directories); err != nil {
+		if err := appendBind(&args, "--ro-bind", root, guestPaths[root], directories); err != nil {
 			return nil, err
 		}
 	}
 	for _, root := range writeRoots {
-		if err := appendBind(args, "--bind", root, guestPaths[root], directories); err != nil {
+		if err := appendBind(&args, "--bind", root, guestPaths[root], directories); err != nil {
 			return nil, err
 		}
 	}
@@ -259,7 +259,7 @@ func bubblewrapArgs(command *exec.Cmd, policy Policy, bridge *linuxGitCredential
 	// paths never inherit broader write access.
 	for _, root := range readRoots {
 		if rootIsCovered(root, writeRoots) && !pathInRoots(root, writeRoots) {
-			if err := appendBind(args, "--ro-bind", root, guestPaths[root], directories); err != nil {
+			if err := appendBind(&args, "--ro-bind", root, guestPaths[root], directories); err != nil {
 				return nil, err
 			}
 		}
@@ -271,7 +271,7 @@ func bubblewrapArgs(command *exec.Cmd, policy Policy, bridge *linuxGitCredential
 	innerArgs := command.Args
 	if !isSystemPath(executablePath) {
 		guestExecutable := guestRoot + "/.o-agent-executable"
-		if err := appendBind(args, "--ro-bind", executablePath, guestExecutable, directories); err != nil {
+		if err := appendBind(&args, "--ro-bind", executablePath, guestExecutable, directories); err != nil {
 			return nil, err
 		}
 		innerArgs = append([]string(nil), command.Args...)
@@ -281,7 +281,7 @@ func bubblewrapArgs(command *exec.Cmd, policy Policy, bridge *linuxGitCredential
 			innerArgs[0] = guestExecutable
 		}
 	}
-	if err := appendLinuxHostMasks(args, len(readRoots) > 0); err != nil {
+	if err := appendLinuxHostMasks(&args, len(readRoots) > 0); err != nil {
 		return nil, err
 	}
 	if bridge != nil {
@@ -298,10 +298,10 @@ func bubblewrapArgs(command *exec.Cmd, policy Policy, bridge *linuxGitCredential
 			return nil, fmt.Errorf("inspect sandbox runtime mount root: %w", statErr)
 		}
 		directories["/run"] = true // appendLinuxHostMasks has hidden host /run above.
-		if err := appendBind(args, "--bind", bridge.dir, linuxCredentialGuestDir, directories); err != nil {
+		if err := appendBind(&args, "--bind", bridge.dir, linuxCredentialGuestDir, directories); err != nil {
 			return nil, fmt.Errorf("mount private Git credential bridge: %w", err)
 		}
-		if err := appendBind(args, "--ro-bind", canonicalHelper, linuxCredentialGuestDir+"/axiom", directories); err != nil {
+		if err := appendBind(&args, "--ro-bind", canonicalHelper, linuxCredentialGuestDir+"/axiom", directories); err != nil {
 			return nil, fmt.Errorf("mount Git credential helper executable: %w", err)
 		}
 	}
@@ -377,7 +377,7 @@ func canonicalSandboxPath(path string, directory bool) (string, error) {
 	return resolved, nil
 }
 
-func appendBind(args []string, operation, source, target string, directories map[string]bool) error {
+func appendBind(args *[]string, operation, source, target string, directories map[string]bool) error {
 	if source == "/" || target == "/" {
 		return errors.New("binding the host root into an Agent sandbox is forbidden")
 	}
@@ -388,11 +388,11 @@ func appendBind(args []string, operation, source, target string, directories map
 	}
 	for i := len(parents) - 1; i >= 0; i-- {
 		if !directories[parents[i]] {
-			args = append(args, "--dir", parents[i])
+			*args = append(*args, "--dir", parents[i])
 			directories[parents[i]] = true
 		}
 	}
-	args = append(args, operation, source, target)
+	*args = append(*args, operation, source, target)
 	// Bind mounts also make their destination available as a parent for later
 	// nested grants. This prevents duplicate --dir operations in the namespace.
 	directories[target] = true
@@ -454,7 +454,7 @@ func isSystemPath(path string) bool {
 	return false
 }
 
-func appendLinuxHostMasks(args []string, workspaceMounted bool) error {
+func appendLinuxHostMasks(args *[]string, workspaceMounted bool) error {
 	entries, err := os.ReadDir("/")
 	if err != nil {
 		return fmt.Errorf("list host root paths to mask: %w", err)
@@ -476,7 +476,7 @@ func appendLinuxHostMasks(args []string, workspaceMounted bool) error {
 			return fmt.Errorf("inspect host root path %q before masking: %w", name, statErr)
 		}
 		if info.IsDir() {
-			args = appendSizedTmpfs(args, filepath.Join("/", name))
+			*args = appendSizedTmpfs(*args, filepath.Join("/", name))
 		}
 	}
 	for _, path := range []string{"/etc/o-agent", "/etc/ssh", "/etc/ssl/private", "/etc/NetworkManager/system-connections", "/etc/letsencrypt", "/etc/sudoers.d"} {
@@ -491,13 +491,13 @@ func appendLinuxHostMasks(args []string, workspaceMounted bool) error {
 			info, statErr = os.Stat(path)
 		}
 		if statErr == nil && info.IsDir() {
-			args = appendSizedTmpfs(args, path)
+			*args = appendSizedTmpfs(*args, path)
 		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 			return fmt.Errorf("inspect host credential directory %q before masking: %w", path, statErr)
 		}
 	}
 	for _, path := range []string{"/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/krb5.keytab"} {
-		args = append(args, "--ro-bind-try", "/dev/null", path)
+		*args = append(*args, "--ro-bind-try", "/dev/null", path)
 	}
 	return nil
 }
