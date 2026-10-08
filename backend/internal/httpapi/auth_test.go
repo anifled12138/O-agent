@@ -334,6 +334,9 @@ func TestLoginRateLimitPersistsAcrossRestartAndSuccessClearsIt(t *testing.T) {
 		t.Fatalf("lockout did not survive server restart: %d %s", blocked.Code, blocked.Body.String())
 	}
 	bucket := hashToken("login-ip:203.0.113.8")
+	if err := store.ClearAuthLoginFailures(ctx, hashToken("login-email:owner@example.com")); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.ClearAuthLoginFailures(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}

@@ -69,6 +69,22 @@ The service uses private, durable paths under `/var/lib/o-agent`; do not place c
 
 Artifacts use local storage unless `/etc/o-agent/cloud.env` sets `O_ARTIFACT_STORE_BACKEND=s3`. For an S3-compatible provider, configure `O_ARTIFACT_S3_ENDPOINT`, `O_ARTIFACT_S3_REGION`, `O_ARTIFACT_S3_BUCKET`, `O_ARTIFACT_S3_ACCESS_KEY_ID`, and `O_ARTIFACT_S3_SECRET_ACCESS_KEY`; optionally set `O_ARTIFACT_S3_SESSION_TOKEN`, `O_ARTIFACT_S3_PREFIX` (defaults to `o-agent/artifacts`), and `O_ARTIFACT_S3_PATH_STYLE` (defaults to `true`). Keep credentials in this root-owned, `oagent`-readable mode-0640 env file and restart the backend after changing them. Use HTTPS for non-loopback endpoints and a private bucket with narrowly scoped read/write/list multipart permissions. The default transfer path relays retryable chunks through the VPS and uses local temporary staging space. After verifying the provider's presigned PUT checksum and conditional CopyObject behavior in a private test bucket, an operator may set `O_ARTIFACT_S3_DIRECT_UPLOAD=true` to let execution nodes directly upload single batches up to 500,000,000 bytes; the control service still reads back and verifies the complete object before publishing artifact metadata. The setting is rejected unless the S3 backend is enabled and otherwise defaults off. It controls new uploads; already persisted direct-upload attempts remain resumable if the setting is later disabled. Larger artifacts remain on resumable 8 MiB chunks; 500 MB is not a task or artifact size limit. Existing local artifacts migrate to the configured bucket when first read, with their original local objects retained. Configure private access, bucket versioning/deletion protection, staging-prefix lifecycle rules, and recovery retention before production use; these settings are separate from the encrypted SQLite backup timer.
 
+## Personal account registration and recovery
+
+Local standalone mode stays usable without an account. Cloud mode requires an authenticated browser session. This deployment has one primary account managing the cloud Linux Agent and its paired local computers.
+
+For email registration and password recovery, add the following settings to the existing root-owned, mode-0640 `/etc/o-agent/cloud.env`, using the actual values from your providers:
+
+- `O_AUTH_OWNER_EMAIL`: the only mailbox eligible to initialize this server's primary account.
+- `O_RESEND_API_KEY` and `O_AUTH_MAIL_FROM`: configure together. Verify the sender domain with Resend and grant the key permission to both send emails and retrieve their persisted records.
+- `O_TURNSTILE_SITE_KEY` and `O_TURNSTILE_SECRET_KEY`: configure together. Register the public frontend hostname with Turnstile; the backend checks that hostname and the form action.
+
+Restart the backend to consume these settings. Never put the secret keys in frontend environment variables, Git, or chat. Do not overwrite an existing env file. Public first-time registration only appears when an owner mailbox and mail service are configured and the primary account has no password yet. Without email configuration, the existing administrator bootstrap setup remains available; password-only login remains available for initialized accounts.
+
+Verification codes expire after ten minutes and cannot be replayed. Provider acceptance is read back but does not claim inbox delivery. A failed or uncertain mail request does not create an account or change a password. Password recovery atomically changes credentials and revokes prior browser sessions. The new password policy is at least 15 Unicode characters and at most 1024 UTF-8 bytes; existing credentials remain compatible. When configured, Turnstile protects registration/recovery requests and appears after repeated login failures. Server-side limits remain active without Turnstile.
+
+See [the account design and API behavior](../../docs/remote-chat-and-auth.md). Before public use, verify real inbox receipt, registration, logout, recovery, old-session revocation, and Turnstile success/failure on the configured HTTPS hostname. Automated tests use local provider substitutes and do not constitute live email or VPS acceptance.
+
 ## Encrypted control-data backup
 
 `axiom backup create-encrypted` exports a verified SQLite snapshot, its vault key, and finalized artifact objects as a chunk-authenticated AES-256-GCM archive. Generate the independent raw 32-byte backup key on a separate operator device, and keep a recoverable copy outside the VPS and away from the archive:

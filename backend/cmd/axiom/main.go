@@ -363,6 +363,9 @@ func run() error {
 	api := httpapi.New(workspaceID, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin, searchService)
 	api.SetArtifactStore(artifactService)
 	api.SetRemoteAuthentication(cfg.AuthBootstrapToken)
+	if err := api.SetEmailAuthentication(httpapi.EmailAuthConfig{OwnerEmail: cfg.AuthOwnerEmail, ResendAPIKey: cfg.ResendAPIKey, MailFrom: cfg.AuthMailFrom, TurnstileSiteKey: cfg.TurnstileSiteKey, TurnstileSecret: cfg.TurnstileSecretKey}); err != nil {
+		return fmt.Errorf("initialize account authentication: %w", err)
+	}
 	api.SetGitCredentials(gitCredentialService)
 	server := &http.Server{Addr: cfg.Addr, Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	serverErrors := make(chan error, 1)

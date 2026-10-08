@@ -21,6 +21,11 @@ type Config struct {
 	AgentTempDir              string
 	FrontendOrigin            string
 	AuthBootstrapToken        string
+	AuthOwnerEmail            string
+	ResendAPIKey              string
+	AuthMailFrom              string
+	TurnstileSiteKey          string
+	TurnstileSecretKey        string
 	TLSCertFile               string
 	TLSKeyFile                string
 	AgentMaxModelCalls        int
@@ -55,6 +60,11 @@ func Load() Config {
 		AgentTempDir:              env("O_AGENT_TEMP_DIR", "AXIOM_AGENT_TEMP_DIR", filepath.Join(os.TempDir(), "Axiom", "agent-runs")),
 		FrontendOrigin:            env("O_FRONTEND_ORIGIN", "AXIOM_FRONTEND_ORIGIN", "http://127.0.0.1:3000"),
 		AuthBootstrapToken:        env("O_AUTH_BOOTSTRAP_TOKEN", "AXIOM_AUTH_BOOTSTRAP_TOKEN", ""),
+		AuthOwnerEmail:            env("O_AUTH_OWNER_EMAIL", "", ""),
+		ResendAPIKey:              env("O_RESEND_API_KEY", "", ""),
+		AuthMailFrom:              env("O_AUTH_MAIL_FROM", "", ""),
+		TurnstileSiteKey:          env("O_TURNSTILE_SITE_KEY", "", ""),
+		TurnstileSecretKey:        env("O_TURNSTILE_SECRET_KEY", "", ""),
 		TLSCertFile:               env("O_TLS_CERT_FILE", "AXIOM_TLS_CERT_FILE", ""),
 		TLSKeyFile:                env("O_TLS_KEY_FILE", "AXIOM_TLS_KEY_FILE", ""),
 		AgentMaxModelCalls:        0,
@@ -134,6 +144,12 @@ func Load() Config {
 func (c Config) Validate() error {
 	if c.LoadError != nil {
 		return c.LoadError
+	}
+	if (c.ResendAPIKey == "") != (c.AuthMailFrom == "") {
+		return fmt.Errorf("O_RESEND_API_KEY and O_AUTH_MAIL_FROM must be configured together")
+	}
+	if (c.TurnstileSiteKey == "") != (c.TurnstileSecretKey == "") {
+		return fmt.Errorf("O_TURNSTILE_SITE_KEY and O_TURNSTILE_SECRET_KEY must be configured together")
 	}
 	if c.AgentMaxModelCalls < 0 {
 		return fmt.Errorf("O_AGENT_MAX_MODEL_CALLS must be 0 (unlimited) or greater")

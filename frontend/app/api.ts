@@ -92,6 +92,12 @@ export async function runSandboxMaintenance(operation: 'install' | 'repair' | 'u
   });
 }
 
+export class APIError extends Error {
+ readonly status: number;
+ readonly challengeRequired: boolean;
+ constructor(message: string, status: number, challengeRequired = false) {super(message);this.name='APIError';this.status=status;this.challengeRequired=challengeRequired;}
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const target = /^https?:\/\//.test(path) ? path : `${API}${path}`;
   const response = await fetch(target, { cache: 'no-store', credentials: 'same-origin', ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
@@ -99,15 +105,18 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const text = response.status === 204 ? '' : await response.text();
   if (!response.ok) {
     let message = response.statusText || '请求失败';
+ let challengeRequired=false;
     if (contentType.includes('application/json') && text) {
       try {
-        const body = JSON.parse(text) as { error?: string | { message?: string } };
+        const body = JSON.parse(text) as { error?: string | { message?: string }; challengeRequired?: boolean };
+ challengeRequired=body.challengeRequired===true;
         message = typeof body.error === 'string' ? body.error : body.error?.message ?? message;
       } catch { /* The status remains the safe fallback. */ }
     } else if (text.trim().startsWith('<')) {
       message = `API 返回了 HTML（${response.status}）。请检查网关的 /api 转发以及 O Host 是否正在运行。`;
     }
-    throw new Error(message);
+    if(response.status===401 && !target.includes('/auth/') && typeof window!=='undefined')window.dispatchEvent(new Event('o:authentication-required'));
+    throw new APIError(message,response.status,challengeRequired);
   }
   if (response.status === 204) return undefined as T;
   if (!contentType.includes('application/json')) throw new Error(`API 返回了 ${contentType || '未知内容类型'}，而不是 JSON。`);

@@ -72,6 +72,13 @@ if [[ ! -e /etc/o-agent/cloud.env ]]; then
   install -o root -g oagent -m 0640 /dev/null /etc/o-agent/cloud.env
   cat > /etc/o-agent/cloud.env <<'EOF'
 # Add O_AUTH_BOOTSTRAP_TOKEN (at least 32 random characters) before starting.
+# Optional personal-account email registration/recovery, configure real values:
+# O_AUTH_OWNER_EMAIL=owner@example.com
+# O_RESEND_API_KEY=<server-side-key-with-send-and-read-permission>
+# O_AUTH_MAIL_FROM=auth@example.com
+# Optional Turnstile (site and secret keys must be configured together):
+# O_TURNSTILE_SITE_KEY=<public-site-key>
+# O_TURNSTILE_SECRET_KEY=<server-side-secret>
 # Replace the example origin with the public HTTPS origin used in Caddy.
 # Add provider credentials through the authenticated O settings UI after first login.
 O_FRONTEND_ORIGIN=https://o.example.com

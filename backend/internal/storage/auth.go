@@ -169,12 +169,24 @@ func (s *Store) SetInitialCredentials(ctx context.Context, userID, email, displa
 }
 
 func (s *Store) CreateAuthSession(ctx context.Context, tokenHash, userID string, expiresAt time.Time) error {
+	return s.CreateAuthSessionForCredentials(ctx, tokenHash, userID, "", expiresAt)
+}
+func (s *Store) CreateAuthSessionForCredentials(ctx context.Context, tokenHash, userID, credentialHash string, expiresAt time.Time) error {
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if credentialHash != "" {
+		var current string
+		if err := tx.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE id=?`, userID).Scan(&current); err != nil {
+			return err
+		}
+		if current != credentialHash {
+			return domain.ErrUnauthorized
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_sessions WHERE expires_at<=?`, now); err != nil {
 		return err
 	}
@@ -224,4 +236,21 @@ func (s *Store) DeleteAuthSession(ctx context.Context, tokenHash string) error {
 		return domain.ErrConflict
 	}
 	return nil
+}
+
+// AuthLoginAttempts returns current failure count without revealing account existence.
+func (s *Store) AuthLoginAttempts(ctx context.Context, bucketHash string, now time.Time) (int, error) {
+	var attempts int
+	var started time.Time
+	err := s.db.QueryRowContext(ctx, `SELECT attempts,window_started_at FROM auth_login_limits WHERE bucket_hash=?`, bucketHash).Scan(&attempts, &started)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if now.Sub(started) >= authLoginWindow {
+		return 0, nil
+	}
+	return attempts, nil
 }

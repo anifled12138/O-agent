@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/mail"
@@ -32,6 +33,11 @@ func (s *Server) authRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.authLogout)
 	mux.HandleFunc("GET /api/v1/auth/session", s.authSession)
+	mux.HandleFunc("POST /api/v1/auth/register/start", s.authChallengeStart)
+	mux.HandleFunc("POST /api/v1/auth/register/verify", s.authChallengeVerify)
+	mux.HandleFunc("POST /api/v1/auth/password-reset/start", s.authChallengeStart)
+	mux.HandleFunc("POST /api/v1/auth/password-reset/verify", s.authChallengeVerify)
+	mux.HandleFunc("POST /api/v1/auth/logout-all", s.authLogoutAll)
 }
 
 func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +47,13 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	needsSetup := errors.Is(err, domain.ErrNotFound) || !strings.HasPrefix(hash, "pbkdf2-sha256$")
-	write(w, http.StatusOK, map[string]bool{"authenticationRequired": s.authBootstrapToken != "", "setupRequired": needsSetup})
+	attempts, err := s.store.AuthLoginAttempts(r.Context(), hashToken("login-ip:"+loginRemoteAddress(r)), time.Now().UTC())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	registration := s.authBootstrapToken != "" && needsSetup && s.authOwnerEmail != "" && s.authMailer != nil
+	write(w, http.StatusOK, map[string]any{"authenticationRequired": s.authBootstrapToken != "", "setupRequired": needsSetup, "registrationAvailable": registration, "passwordResetAvailable": s.authBootstrapToken != "" && !needsSetup && s.authMailer != nil, "turnstileSiteKey": s.authTurnstileSiteKey, "loginChallengeRequired": s.authHumanVerifier != nil && attempts >= 3, "minimumPasswordLength": authMinimumPasswordLength, "accountMode": "personal"})
 }
 
 func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
@@ -58,8 +70,8 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	address, err := mail.ParseAddress(strings.TrimSpace(input.Email))
-	if err != nil || address.Address != strings.TrimSpace(input.Email) || len(address.Address) > 254 || len(input.Password) < 12 || len(input.Password) > 1024 || len(strings.TrimSpace(input.DisplayName)) > 200 {
-		write(w, http.StatusBadRequest, map[string]string{"error": "provide a valid email and a password of at least 12 characters"})
+	if err != nil || address.Address != strings.TrimSpace(input.Email) || len(address.Address) > 254 || !validAuthPassword(input.Password) || len(strings.TrimSpace(input.DisplayName)) > 200 {
+		write(w, http.StatusBadRequest, map[string]string{"error": "provide a valid email and a password of at least 15 characters"})
 		return
 	}
 	display := strings.TrimSpace(input.DisplayName)
@@ -94,7 +106,7 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusInternalServerError, map[string]string{"error": "account setup could not be verified"})
 		return
 	}
-	if err := s.issueSession(w, r, user.ID); err != nil {
+	if err := s.issueSession(w, r, user.ID, hash); err != nil {
 		fail(w, err)
 		return
 	}
@@ -114,19 +126,72 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email          string `json:"email"`
+		Password       string `json:"password"`
+		ChallengeToken string `json:"challengeToken"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	user, stored, err := s.store.AuthUserByEmail(r.Context(), strings.ToLower(strings.TrimSpace(input.Email)))
+	email := strings.ToLower(strings.TrimSpace(input.Email))
+	accountBucket := hashToken("login-email:" + email)
+	allowed, retryAfter, err = s.store.AuthLoginAllowed(r.Context(), accountBucket, loginNow)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if !allowed {
+		writeLoginRateLimit(w, retryAfter)
+		return
+	}
+	ipAttempts, err := s.store.AuthLoginAttempts(r.Context(), bucketHash, loginNow)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	accountAttempts, err := s.store.AuthLoginAttempts(r.Context(), accountBucket, loginNow)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if s.authHumanVerifier != nil && (ipAttempts >= 3 || accountAttempts >= 3) {
+		if err := s.authHumanVerifier.Verify(r.Context(), input.ChallengeToken, "login"); err != nil {
+			blocked, recordErr := s.store.RecordAuthLoginFailure(r.Context(), bucketHash, time.Now().UTC())
+			if recordErr != nil {
+				fail(w, recordErr)
+				return
+			}
+			if blocked > 0 {
+				writeLoginRateLimit(w, blocked)
+				return
+			}
+			write(w, http.StatusForbidden, map[string]any{"error": err.Error(), "challengeRequired": true})
+			return
+		}
+	}
+	user, stored, err := s.store.AuthUserByEmail(r.Context(), email)
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		fail(w, err)
+		return
+	}
 	valid := false
-	if err == nil && stored != "" && len(input.Password) <= 1024 {
-		valid = verifyPassword(input.Password, stored)
+	verifier := stored
+	if !strings.HasPrefix(verifier, "pbkdf2-sha256$") {
+		verifier = "pbkdf2-sha256$600000$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	}
+	if len(input.Password) <= 1024 {
+		valid = verifyPassword(input.Password, verifier) && err == nil
 	}
 	if !valid || user.ID != s.workspaceID {
+		accountBlock, recordErr := s.store.RecordAuthLoginFailure(r.Context(), accountBucket, time.Now().UTC())
+		if recordErr != nil {
+			fail(w, recordErr)
+			return
+		}
 		blockedFor, recordErr := s.store.RecordAuthLoginFailure(r.Context(), bucketHash, time.Now().UTC())
+		if accountBlock > blockedFor {
+			blockedFor = accountBlock
+		}
 		if recordErr != nil {
 			fail(w, recordErr)
 			return
@@ -135,14 +200,18 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 			writeLoginRateLimit(w, blockedFor)
 			return
 		}
-		write(w, http.StatusUnauthorized, map[string]string{"error": "email or password is incorrect"})
+		write(w, http.StatusUnauthorized, map[string]any{"error": "邮箱或密码错误", "challengeRequired": s.authHumanVerifier != nil && (ipAttempts+1 >= 3 || accountAttempts+1 >= 3)})
 		return
 	}
 	if err := s.store.ClearAuthLoginFailures(r.Context(), bucketHash); err != nil {
 		fail(w, err)
 		return
 	}
-	if err := s.issueSession(w, r, user.ID); err != nil {
+	if err := s.store.ClearAuthLoginFailures(r.Context(), accountBucket); err != nil {
+		fail(w, err)
+		return
+	}
+	if err := s.issueSession(w, r, user.ID, stored); err != nil {
 		fail(w, err)
 		return
 	}
@@ -166,7 +235,7 @@ func writeLoginRateLimit(w http.ResponseWriter, retryAfter time.Duration) {
 		seconds = 1
 	}
 	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-	write(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed login attempts; try again after the stated delay"})
+	write(w, http.StatusTooManyRequests, map[string]string{"error": fmt.Sprintf("尝试过于频繁，请在 %d 秒后重试", seconds)})
 }
 
 func (s *Server) authSession(w http.ResponseWriter, r *http.Request) {
@@ -196,18 +265,18 @@ func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	http.SetCookie(w, &http.Cookie{Name: authCookieName, Value: "", Path: "/", HttpOnly: true, Secure: requestIsSecure(r), SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	clearAuthCookie(w, r)
 	write(w, http.StatusOK, map[string]bool{"authenticated": false})
 }
 
-func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) error {
+func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID, credentialHash string) error {
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return err
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
 	expires := time.Now().UTC().Add(authSessionLifetime)
-	if err := s.store.CreateAuthSession(r.Context(), hashToken(token), userID, expires); err != nil {
+	if err := s.store.CreateAuthSessionForCredentials(r.Context(), hashToken(token), userID, credentialHash, expires); err != nil {
 		return err
 	}
 	if persisted, err := s.store.AuthSessionUser(r.Context(), hashToken(token), time.Now().UTC()); err != nil || persisted != userID {
@@ -290,14 +359,14 @@ func hashPassword(password string) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	const iterations = 310000
+	const iterations = 600000
 	key := derivePasswordKey(password, salt, iterations)
-	return "pbkdf2-sha256$310000$" + base64.RawStdEncoding.EncodeToString(salt) + "$" + base64.RawStdEncoding.EncodeToString(key), nil
+	return "pbkdf2-sha256$600000$" + base64.RawStdEncoding.EncodeToString(salt) + "$" + base64.RawStdEncoding.EncodeToString(key), nil
 }
 
 func verifyPassword(password, encoded string) bool {
 	parts := strings.Split(encoded, "$")
-	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" || parts[1] != "310000" {
+	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" || (parts[1] != "310000" && parts[1] != "600000") {
 		return false
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[2])
@@ -308,7 +377,8 @@ func verifyPassword(password, encoded string) bool {
 	if err != nil || len(want) != 32 {
 		return false
 	}
-	got := derivePasswordKey(password, salt, 310000)
+	iterations, _ := strconv.Atoi(parts[1])
+	got := derivePasswordKey(password, salt, iterations)
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 

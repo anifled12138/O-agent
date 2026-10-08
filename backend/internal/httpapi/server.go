@@ -52,6 +52,10 @@ type Server struct {
 	gitCredentials        *gitcredential.Service
 	frontendOrigin        string
 	authBootstrapToken    string
+	authOwnerEmail        string
+	authMailer            VerificationMailer
+	authHumanVerifier     HumanVerifier
+	authTurnstileSiteKey  string
 	projectDeltas         projectDeltaSnapshotter
 	projectPublicationMu  sync.Mutex
 	projectPublicationOps map[string]struct{}

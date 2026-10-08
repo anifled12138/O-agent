@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent, RefObject } from 'react';
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent, RefObject } from 'react';
 import { Plus, Layers, Settings as SettingsIcon, Activity, ClipboardList, ArrowUp, Square, Pause, Sparkles, KeyRound, AlertCircle, Info, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight, GitFork, Shield, Copy, PanelLeftClose, PanelLeftOpen, Trash2, Laptop, Paperclip } from 'lucide-react';
 import UnifiedPluginCenter from './UnifiedPluginCenter';
 import ObservabilityModal from './ObservabilityModal';
@@ -9,6 +9,7 @@ import { Settings } from './SettingsModal';
 import ProjectModal from './ProjectModal';
 import { copyToClipboard, MarkdownView } from './MarkdownView';
 import WebAppControls from './WebAppControls';
+import AuthenticationGate from './AuthenticationGate';
 import CloudTaskCenter from './CloudTaskCenter';
 import ExecutionNodesModal from './ExecutionNodesModal';
 import { API_V2, request, UnifiedPlugin, getUnifiedPlugins, updateConversationTitle, generateConversationTitle, deleteConversation as deleteConversationRequest, getDeletedConversations, restoreConversation as restoreConversationRequest, DeletedConversation, Project, getProjects, updateConversationProject, updateConversationPermissionProfile, ConversationPermissionProfile, ApprovalRequest, getConversationApprovals, resolveAgentApproval, ExecutionNode, getExecutionNodes, submitLocalAgentTask, uploadArtifactFile, UserArtifact } from './api';
@@ -44,75 +45,8 @@ function localCalendarDayKey(date = new Date()) {
 }
 
 export default function OApp() {
-  const [gate, setGate] = useState<'checking' | 'open' | 'login' | 'setup'>('checking');
-  const [authRequired, setAuthRequired] = useState(false);
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [bootstrapToken, setBootstrapToken] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    request<{ authenticationRequired: boolean; setupRequired: boolean }>('/auth/status')
-      .then(async (status) => {
-        if (cancelled) return;
-        setAuthRequired(status.authenticationRequired);
-        if (!status.authenticationRequired) { setGate('open'); return; }
-        try {
-          await request('/auth/session');
-          if (!cancelled) setGate('open');
-        } catch {
-          if (!cancelled) setGate(status.setupRequired ? 'setup' : 'login');
-        }
-      })
-      .catch((cause: unknown) => { if (!cancelled) { setError(cause instanceof Error ? cause.message : '连接 O 服务失败'); setGate('login'); } });
-    return () => { cancelled = true; };
-  }, []);
-
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setBusy(true);
-    setError('');
-    try {
-      if (gate === 'setup') {
-        await request('/auth/setup', {
-          method: 'POST',
-          headers: { 'X-O-Bootstrap-Token': bootstrapToken },
-          body: JSON.stringify({ email, displayName, password }),
-        });
-      } else {
-        await request('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
-      }
-      setGate('open');
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '身份验证失败');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (gate === 'open') return <WorkspaceApp />;
-  if (gate === 'checking') return <Splash />;
-  return (
-    <main style={{ minHeight: '100dvh', display: 'grid', placeItems: 'center', padding: 24, background: '#f4f3ee', color: '#25251f' }}>
-      <form onSubmit={submit} style={{ width: 'min(100%, 400px)', display: 'grid', gap: 14, padding: 28, border: '1px solid #deddd5', borderRadius: 18, background: '#fffefa', boxShadow: '0 16px 48px #25251f12' }}>
-        <div><div style={{ fontSize: 25, fontWeight: 700 }}>O</div><h1 style={{ margin: '8px 0 4px', fontSize: 20 }}>{gate === 'setup' ? '设置云端管理员' : '登录 O'}</h1><p style={{ margin: 0, color: '#696960', fontSize: 14 }}>{gate === 'setup' ? '首次设置需要服务器启动时配置的引导密钥。' : '登录后可安全访问你的任务和工作区。'}</p></div>
-        {gate === 'setup' && <label style={authLabel}>引导密钥<input required autoComplete="off" value={bootstrapToken} onChange={(event) => setBootstrapToken(event.target.value)} style={authInput} /></label>}
-        {gate === 'setup' && <label style={authLabel}>显示名称<input required value={displayName} onChange={(event) => setDisplayName(event.target.value)} style={authInput} /></label>}
-        <label style={authLabel}>邮箱<input required type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} style={authInput} /></label>
-        <label style={authLabel}>密码<input required minLength={12} type="password" autoComplete={gate === 'setup' ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} style={authInput} /></label>
-        {error && <p role="alert" style={{ margin: 0, color: '#a22828', fontSize: 14 }}>{error}</p>}
-        <button disabled={busy} type="submit" style={{ minHeight: 44, border: 0, borderRadius: 10, background: '#25251f', color: 'white', fontWeight: 600, cursor: busy ? 'wait' : 'pointer' }}>{busy ? '请稍候…' : gate === 'setup' ? '创建管理员并登录' : '登录'}</button>
-        {authRequired && <p style={{ margin: 0, color: '#77776e', fontSize: 12 }}>会话使用安全 Cookie 保存；请通过 HTTPS 访问云端服务。</p>}
-      </form>
-    </main>
-  );
+ return <AuthenticationGate>{({onLogout,remoteAuthenticated}) => <WorkspaceApp onLogout={remoteAuthenticated ? onLogout : undefined} />}</AuthenticationGate>;
 }
-
-const authLabel: CSSProperties = { display: 'grid', gap: 6, fontSize: 13, fontWeight: 600 };
-const authInput: CSSProperties = { width: '100%', boxSizing: 'border-box', minHeight: 42, padding: '8px 11px', border: '1px solid #cbc9c0', borderRadius: 9, background: '#fff', color: '#25251f', font: 'inherit' };
 
 function skipConversationDeleteConfirmationToday() {
   try {
@@ -152,7 +86,15 @@ export function shouldAutoTitle(title?: string): boolean {
   return false;
 }
 
-function WorkspaceApp() {
+function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
+ const [logoutBusy,setLogoutBusy]=useState(false);
+ async function logout(){
+  if(!onLogout || logoutBusy)return;
+  setLogoutBusy(true);
+  try{await onLogout();}
+  catch(cause){setNotice(cause instanceof Error ? cause.message : '退出登录失败','error');setLogoutBusy(false);}
+ }
+
   const [loading, setLoading] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileViewport, setMobileViewport] = useState(false);
@@ -1070,6 +1012,7 @@ function WorkspaceApp() {
           {sidebarCollapsed ? <PanelLeftOpen size={17} strokeWidth={1.8} aria-hidden="true" /> : <PanelLeftClose size={17} strokeWidth={1.8} aria-hidden="true" />}
         </button>
         <WebAppControls />
+ {onLogout && <button type="button" className="sidebar-toggle-button" disabled={logoutBusy} onClick={() => void logout()} title="退出登录" aria-label="退出登录"><LogOut size={17} aria-hidden="true" /></button>}
       </div>
       {mobileViewport && !sidebarCollapsed && <div className="mobile-sidebar-backdrop" onClick={() => setSidebarCollapsed(true)} aria-hidden="true" />}
       <Sidebar

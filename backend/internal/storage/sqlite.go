@@ -729,6 +729,9 @@ WHERE recovery_class='' AND status IN ('completed','failed','cancelled','interru
 	if err := s.migrateConversationPermissionProfiles(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateAuthEmail(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateLegacyReconciliationStatuses(ctx); err != nil {
 		return err
 	}
