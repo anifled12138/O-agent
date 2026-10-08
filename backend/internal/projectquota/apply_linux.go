@@ -440,6 +440,12 @@ func getProjectQuota(probe ProbeResult, projectID uint32) (projectQuotaRecord, e
 	case "xfs":
 		quota := xfsDiskQuota{Version: 1, Flags: xfsProjectQuota, ID: projectID}
 		if err := quotaControlAtMount(probe.MountPoint, qcmd(xqmGetQuota, projectQuotaType), projectID, unsafe.Pointer(&quota)); err != nil {
+			// XFS reports an all-zero/uninitialized record as ENOENT.
+			// Match only the raw kernel result, never a missing mount or
+			// a descriptor-close error wrapped by quotaControlAtMount.
+			if err == unix.ENOENT {
+				return projectQuotaRecord{xfs: &xfsDiskQuota{Version: 1, Flags: xfsProjectQuota, ID: projectID}}, nil
+			}
 			return projectQuotaRecord{}, err
 		}
 		return projectQuotaRecord{xfs: &quota}, nil
@@ -459,7 +465,10 @@ func quotaControlAtMount(mountPoint string, command uintptr, projectID uint32, r
 	_, _, errno := unix.Syscall6(unix.SYS_QUOTACTL_FD, uintptr(fd), command, uintptr(projectID), uintptr(record), 0, 0)
 	closeErr := unix.Close(fd)
 	if errno != 0 {
-		return errors.Join(errno, closeErr)
+		if closeErr != nil {
+			return errors.Join(errno, closeErr)
+		}
+		return errno
 	}
 	return closeErr
 }

@@ -168,7 +168,10 @@ func TestKernelProjectQuotaRejectsWritesBeyondLimit(t *testing.T) {
 		t.Fatalf("release empty workspace quota: %v", err)
 	}
 	quota, err = InspectWorkspace(testRoot, ".o-projects/acceptance", projectID)
-	if err != nil || quota.Applied || quota.LimitBytes != 0 {
+	if err != nil || quota.Applied || quota.LimitBytes != 0 || quota.UsedBytes != 0 {
 		t.Fatalf("released quota did not read back as cleared: %+v, %v", quota, err)
+	}
+	if err := ReleaseEmptyWorkspace(testRoot, ".o-projects/acceptance", projectID); err != nil {
+		t.Fatalf("releasing the already-cleared quota was not idempotent: %v", err)
 	}
 }
