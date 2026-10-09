@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,29 +16,25 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/runfiles"
 	"axiom.local/agent/internal/sandbox"
 )
 
-func TestLinuxSandboxToolDescriptionMatchesEnforcedMemoryAndTmpfsLimit(t *testing.T) {
-	memoryMiB := domain.CloudTaskSandboxMemoryLimitBytes / (1 << 20)
+func TestLinuxSandboxToolDescriptionDoesNotClaimHardwareCaps(t *testing.T) {
 	description := linuxSandboxDescription(0)
-	if !strings.Contains(description, fmt.Sprintf("%d MiB memory with swap disabled", memoryMiB)) {
-		t.Fatalf("tool description does not use the enforced task memory limit (%d MiB): %s", memoryMiB, description)
+	for _, required := range []string{"executes Bubblewrap directly", "no per-command CPU, memory, swap or process-count hard limit", "requested timeout, output bounds and process-tree cancellation", "does not require a systemd user manager", "Host O service configuration and credentials under /etc/o-agent are hidden", "This workspace has no O-managed per-task disk quota"} {
+		if !strings.Contains(description, required) {
+			t.Fatalf("missing sandbox contract %q: %s", required, description)
+		}
 	}
-	if !strings.Contains(description, fmt.Sprintf("each private tmpfs mount is capped at the same %d MiB task memory limit", memoryMiB)) {
-		t.Fatalf("tool description does not explain the enforced tmpfs limit (%d MiB): %s", memoryMiB, description)
-	}
-	if !strings.Contains(description, "Host O service configuration and credentials under /etc/o-agent are hidden") {
-		t.Fatalf("tool description must describe host O credential isolation: %s", description)
-	}
-	if !strings.Contains(description, "This workspace has no O-managed per-task disk quota") {
-		t.Fatalf("unmetered local workspace must not claim a cloud disk quota: %s", description)
+	for _, stale := range []string{"100% CPU", "memory with swap disabled", "128 processes", "tmpfs mount is capped"} {
+		if strings.Contains(description, stale) {
+			t.Fatalf("stale sandbox hardware contract %q: %s", stale, description)
+		}
 	}
 	cloudDescription := linuxSandboxDescription(8 << 30)
-	if !strings.Contains(cloudDescription, "ext4/XFS project quota with a hard limit of 8589934592 bytes") || !strings.Contains(cloudDescription, "not shared artifact storage, database, or logs") {
-		t.Fatalf("cloud task workspace description does not match its enforced quota: %s", cloudDescription)
+	if !strings.Contains(cloudDescription, "ext4/XFS project quota with a hard limit of 8589934592 bytes") || !strings.Contains(cloudDescription, "not shared artifact storage") {
+		t.Fatalf("cloud disk quota contract was lost: %s", cloudDescription)
 	}
 }
 

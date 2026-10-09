@@ -20,12 +20,6 @@ const maxSandboxInputBytes = 1 << 20
 const maxSandboxRuntime = 180 * time.Second
 const maxLongLivedSandboxRuntime = 24 * time.Hour
 
-// Let a single scratch tmpfs use the task's full memory budget. The cgroup
-// remains the aggregate enforcement boundary across the process and all of its
-// private mounts; a smaller per-mount ceiling needlessly rejected large but
-// otherwise valid temporary files.
-const linuxSandboxScratchMaxBytes = linuxSandboxMemoryMaxBytes
-
 // Run executes a process inside bubblewrap mount, user, PID, IPC, UTS and
 // network namespaces. A missing or non-functional bubblewrap installation is
 // an error; this path never falls back to an unsandboxed child process.
@@ -33,7 +27,7 @@ func Run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (r
 	return run(ctx, command, input, policy, maxSandboxRuntime)
 }
 
-// RunLongLived uses the same isolation and resource controls for trusted
+// RunLongLived uses the same isolation and lifetime controls for trusted
 // host-owned sessions whose lifetime is explicitly stopped by their owner.
 func RunLongLived(ctx context.Context, command *exec.Cmd, input []byte, policy Policy) (runErr, cleanupErr error) {
 	return run(ctx, command, input, policy, maxLongLivedSandboxRuntime)
@@ -80,18 +74,16 @@ func run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy, ma
 	if err != nil {
 		return fmt.Errorf("bubblewrap is required for Linux command execution: %w", err), nil
 	}
-	if err := requireLinuxResourceControllers(); err != nil {
-		return err, nil
-	}
-	systemdRun, err := exec.LookPath("systemd-run")
-	if err != nil {
-		return fmt.Errorf("systemd-run is required to enforce Linux task resource limits: %w", err), nil
-	}
-	systemctl, err := exec.LookPath("systemctl")
-	if err != nil {
-		return fmt.Errorf("systemctl is required to stop a Linux task scope on cancellation: %w", err), nil
-	}
+	var systemdRun, systemctl string
 	if policy.NetworkAccess {
+		systemdRun, err = exec.LookPath("systemd-run")
+		if err != nil {
+			return fmt.Errorf("network destination filtering is unavailable: %w", err), nil
+		}
+		systemctl, err = exec.LookPath("systemctl")
+		if err != nil {
+			return fmt.Errorf("network scope cleanup is unavailable: %w", err), nil
+		}
 		if err := requireLinuxIPAddressFilter(ctx); err != nil {
 			return err, nil
 		}
@@ -107,13 +99,17 @@ func run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy, ma
 	if err != nil {
 		return err, nil
 	}
-	unit, args, err := systemdScopeArgs(bwrap, bwrapArgs, policy.Timeout, policy.NetworkAccess, policy.NetworkAllowIPs)
+	launcher, args, unit := bwrap, bwrapArgs, ""
+	if policy.NetworkAccess {
+		unit, args, err = systemdScopeArgs(bwrap, bwrapArgs, policy.Timeout, true, policy.NetworkAllowIPs)
+		launcher = systemdRun
+	}
 	if err != nil {
 		return err, nil
 	}
 	runCtx, cancel := context.WithTimeout(ctx, policy.Timeout)
 	defer cancel()
-	wrapped := exec.CommandContext(runCtx, systemdRun, args...)
+	wrapped := exec.CommandContext(runCtx, launcher, args...)
 	wrapped.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8"}
 	wrapped.Dir = "/"
 	wrapped.Stdin = command.Stdin
@@ -121,37 +117,39 @@ func run(ctx context.Context, command *exec.Cmd, input []byte, policy Policy, ma
 		wrapped.Stdin = bytes.NewReader(input)
 	}
 	wrapped.Stdout, wrapped.Stderr = command.Stdout, command.Stderr
-	wrapped.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	cancellationErr := configureLinuxProcessGroup(wrapped)
 	err = wrapped.Run()
 	command.ProcessState = wrapped.ProcessState
 	if runCtx.Err() != nil {
-		stopErr := stopLinuxTaskScope(systemctl, unit)
+		stopErr := cancellationErr()
+		if unit != "" {
+			stopErr = errors.Join(stopErr, stopLinuxTaskScope(systemctl, unit))
+		}
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			return context.DeadlineExceeded, stopErr
 		}
 		return runCtx.Err(), stopErr
 	}
-	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-		return context.DeadlineExceeded, nil
-	}
 	return err, nil
 }
 
-func requireLinuxResourceControllers() error {
-	controllers, err := os.ReadFile("/sys/fs/cgroup/cgroup.controllers")
-	if err != nil {
-		return fmt.Errorf("cgroup v2 resource controllers are required for Linux sandbox execution: %w", err)
-	}
-	available := map[string]bool{}
-	for _, name := range strings.Fields(string(controllers)) {
-		available[name] = true
-	}
-	for _, required := range []string{"cpu", "memory", "pids"} {
-		if !available[required] {
-			return fmt.Errorf("cgroup v2 %s controller is unavailable; refusing unbounded Linux sandbox execution", required)
+// configureLinuxProcessGroup bounds cancellation even when descendants retain
+// stdout/stderr. Bubblewrap's PID namespace and --die-with-parent also terminate
+// descendants that detach from the outer launcher's process group.
+// Read the returned error only after Cmd.Wait has joined its context watcher.
+func configureLinuxProcessGroup(command *exec.Cmd) func() error {
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	var cancellationErr error
+	command.Cancel = func() error {
+		cancellationErr = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		if errors.Is(cancellationErr, syscall.ESRCH) {
+			cancellationErr = nil
+			return os.ErrProcessDone
 		}
+		return cancellationErr
 	}
-	return nil
+	command.WaitDelay = 3 * time.Second
+	return func() error { return cancellationErr }
 }
 
 func stopLinuxTaskScope(systemctl, unit string) error {
@@ -476,7 +474,7 @@ func appendLinuxHostMasks(args *[]string, workspaceMounted bool) error {
 			return fmt.Errorf("inspect host root path %q before masking: %w", name, statErr)
 		}
 		if info.IsDir() {
-			*args = appendSizedTmpfs(*args, filepath.Join("/", name))
+			*args = appendPrivateTmpfs(*args, filepath.Join("/", name))
 		}
 	}
 	for _, path := range []string{"/etc/o-agent", "/etc/ssh", "/etc/ssl/private", "/etc/NetworkManager/system-connections", "/etc/letsencrypt", "/etc/sudoers.d"} {
@@ -491,7 +489,7 @@ func appendLinuxHostMasks(args *[]string, workspaceMounted bool) error {
 			info, statErr = os.Stat(path)
 		}
 		if statErr == nil && info.IsDir() {
-			*args = appendSizedTmpfs(*args, path)
+			*args = appendPrivateTmpfs(*args, path)
 		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 			return fmt.Errorf("inspect host credential directory %q before masking: %w", path, statErr)
 		}
@@ -502,8 +500,8 @@ func appendLinuxHostMasks(args *[]string, workspaceMounted bool) error {
 	return nil
 }
 
-func appendSizedTmpfs(args []string, path string) []string {
-	return append(args, "--size", fmt.Sprintf("%d", linuxSandboxScratchMaxBytes), "--tmpfs", path)
+func appendPrivateTmpfs(args []string, path string) []string {
+	return append(args, "--tmpfs", path)
 }
 
 func pathWithin(root, path string) bool {

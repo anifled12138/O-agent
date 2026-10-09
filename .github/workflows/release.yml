@@ -118,6 +118,13 @@ jobs:
             Linux: download the runtime tar.gz and checksum, then follow the included
             deploy/ubuntu/README.md. Verify each download with its .sha256 file.
             Source provenance is included in both packages.
+
+            Linux sandbox update: per-command CPU, memory, swap, process-count and
+            fixed tmpfs caps are removed. Offline commands launch Bubblewrap directly.
+            Network-enabled commands still require verified systemd/cgroup IP filtering.
+            Cloud role still requires the project-quota helper and a supported quota
+            mount (default task quota: 8 GiB). Web service limits are unchanged.
+            This release does not claim to remove those remaining deployment blockers.
       - name: Read back published runtime assets
         shell: bash
         env:

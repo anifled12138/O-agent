@@ -20,7 +20,6 @@ import (
 	"strings"
 	"time"
 
-	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/provider"
 	"axiom.local/agent/internal/runfiles"
 	"axiom.local/agent/internal/sandbox"
@@ -804,12 +803,11 @@ func getCoreTools(workspaceRoot string, runScope *runfiles.Scope, archive Source
 }
 
 func linuxSandboxDescription(taskWorkspaceQuotaBytes int64) string {
-	memoryMiB := domain.CloudTaskSandboxMemoryLimitBytes / (1 << 20)
-	diskDescription := "This workspace has no O-managed per-task disk quota; the host filesystem controls its available space. The private tmpfs memory cap does not limit workspace files."
+	diskDescription := "This workspace has no O-managed per-task disk quota; the host filesystem controls its available space."
 	if taskWorkspaceQuotaBytes > 0 {
-		diskDescription = fmt.Sprintf("This cloud execution-task workspace is backed by an ext4/XFS project quota with a hard limit of %d bytes; the kernel rejects writes above that task limit. The quota applies to workspace files, not shared artifact storage, database, or logs. The private tmpfs memory cap remains a separate limit.", taskWorkspaceQuotaBytes)
+		diskDescription = fmt.Sprintf("This cloud execution-task workspace is backed by an ext4/XFS project quota with a hard limit of %d bytes; the kernel rejects writes above that task limit. The quota applies to workspace files, not shared artifact storage, database, or logs.", taskWorkspaceQuotaBytes)
 	}
-	return fmt.Sprintf("Linux uses Bubblewrap mount, user, PID, IPC, UTS, and network namespaces inside a per-command systemd user-scope cgroup v2 unit. Each command is limited to 100%% CPU (one core), %d MiB memory with swap disabled, 128 processes, and its requested timeout; each private tmpfs mount is capped at the same %d MiB task memory limit. Execution fails closed unless the systemd user manager, delegated cgroup v2 cpu/memory/pids controllers, systemd-run, systemctl, and the Bubblewrap isolation probe are available. The selected workspace is mounted inside the sandbox at /workspace. Host O service configuration and credentials under /etc/o-agent are hidden from sandbox commands. HTTPS Git credentials configured in Settings are brokered over a private per-command Unix socket only for the exact authorized repository; host Git credential helpers are not inherited. Network-enabled commands pin exact requested hostnames to resolved public IPs, use a private /etc/hosts map, and run under systemd IPAddressDeny=any with explicit per-address allows; O probes a loopback connection to verify the cgroup filter before the first such command and fails closed if the probe cannot prove it active. "+diskDescription, memoryMiB, memoryMiB)
+	return "Linux executes Bubblewrap directly with mount, user, PID, IPC, UTS, and network namespaces. O imposes no per-command CPU, memory, swap or process-count hard limit, and no fixed private-tmpfs size cap; host and filesystem limits still apply. Commands retain their requested timeout, output bounds and process-tree cancellation. Offline execution requires a working Bubblewrap isolation probe, but does not require a systemd user manager or delegated cgroup controllers. The selected workspace is mounted at /workspace. Host O service configuration and credentials under /etc/o-agent are hidden. HTTPS Git credentials are brokered over a private per-command Unix socket only for the exact authorized repository; host Git credential helpers are not inherited. Network-enabled commands still require a separately verified per-destination IP filter; unavailable filtering is an explicit error, never unrestricted host-network execution. " + diskDescription
 }
 
 const fsReadInlineArchiveBytes int64 = 32 << 20

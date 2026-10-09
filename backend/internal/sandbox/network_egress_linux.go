@@ -48,7 +48,11 @@ func probeLinuxIPAddressFilter(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("systemd-run is required to verify the IP egress filter: %w", err)
 	}
-	_, args, err := systemdScopeArgs(bash, []string{bash, "-c", fmt.Sprintf("exec 3<>/dev/tcp/127.0.0.1/%d", port)}, 3*time.Second, true, nil)
+	systemctl, err := exec.LookPath("systemctl")
+	if err != nil {
+		return fmt.Errorf("systemctl is required to clean up the IP egress probe: %w", err)
+	}
+	unit, args, err := systemdScopeArgs(bash, []string{bash, "-c", fmt.Sprintf("exec 3<>/dev/tcp/127.0.0.1/%d", port)}, 3*time.Second, true, nil)
 	if err != nil {
 		return err
 	}
@@ -58,9 +62,10 @@ func probeLinuxIPAddressFilter(ctx context.Context) error {
 	command.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "LC_ALL=C"}
 	var stdout, stderr strings.Builder
 	command.Stdout, command.Stderr = &stdout, &stderr
+	cancellationErr := configureLinuxProcessGroup(command)
 	runErr := command.Run()
 	if ctx.Err() != nil || probeCtx.Err() != nil {
-		return errors.Join(errors.New("IP egress filter probe did not reach a terminal result"), ctx.Err(), probeCtx.Err())
+		return errors.Join(errors.New("IP egress filter probe did not reach a terminal result"), ctx.Err(), probeCtx.Err(), cancellationErr(), stopLinuxTaskScope(systemctl, unit))
 	}
 	var exitErr *exec.ExitError
 	if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 1 {

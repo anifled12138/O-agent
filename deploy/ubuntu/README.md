@@ -51,7 +51,7 @@ only after confirming the key-based session works.
 
 On a dedicated Ubuntu 26.04 VPS, install Bubblewrap, Caddy, Node.js 22.13 or newer, Go-built release artifacts, and the standard systemd/logind tools using your organization's trusted package sources. To expose the Agent's optional `browser_session` tool, also install a trusted Chrome/Chromium build whose resolved executable is a regular executable under `/usr`; snap-backed browsers and binaries resolving under `/opt` are currently not visible to the Bubblewrap runtime. Browser sessions start only when that executable, Bubblewrap, `systemd-run`, and cgroup v2 are all available. Set `O_BROWSER_EXECUTABLE=/usr/lib/.../chromium` in `/etc/o-agent/cloud.env` only if the binary is not discoverable on `PATH`; do not set it to a wrapper script or symlink. Without a supported browser binary the rest of O continues to work and the browser tool stays unavailable.
 
-The browser uses a throw-away profile under the sandbox's private `/tmp`, an exact public-host allow-list and cgroup IP filtering; it does not persist login cookies. One browser session runs per O host at a time. O reserves a 1.5 GiB memory envelope while it runs, so new cloud/local tasks are admitted against the reduced capacity and remain queued when resources are tight. Verify a real page open, screenshot, allowed navigation and blocked unlisted host on the target Ubuntu host before enabling browser-dependent workflows.
+The browser uses a throw-away profile under the sandbox's private `/tmp`, an exact public-host allow-list and cgroup IP filtering; it does not persist login cookies. One browser session runs per O host at a time. O reserves an estimated 1.5 GiB admission budget (not a kernel memory cap) while it runs, so new cloud/local tasks are admitted against the reduced capacity and remain queued when resources are tight. Verify a real page open, screenshot, allowed navigation and blocked unlisted host on the target Ubuntu host before enabling browser-dependent workflows.
 
 Review and run:
 
@@ -152,7 +152,7 @@ The destination directory must not already exist. A successful command verifies 
 
 ## Preflight and activation
 
-Run the backend as the same `oagent` user that will run cloud tasks. Enable cgroup v2 and ensure `cpu`, `memory`, and `pids` are delegated to that user's systemd manager. The installer reloads systemd before enabling linger so the first user manager starts with delegation. If an existing host needs a new delegation setting, drain its tasks and schedule a maintenance restart; never terminate a user manager that may own running tasks just to apply a deployment change.
+Run the backend as the same `oagent` user that will run cloud tasks. Offline commands execute Bubblewrap directly without per-command CPU, memory, swap, process-count or fixed tmpfs caps; they do not require a systemd user manager or delegated resource controllers. Network-enabled commands still require systemd user scopes and a verified cgroup IP filter. The shipped service deployment continues to use a systemd user manager. The installer reloads systemd before enabling linger so the first user manager starts with delegation. If an existing host needs a new delegation setting, drain its tasks and schedule a maintenance restart; never terminate a user manager that may own running tasks just to apply a deployment change.
 
 ```bash
 sudo systemctl daemon-reload
@@ -165,7 +165,7 @@ sudo -u oagent env XDG_RUNTIME_DIR=/run/user/$(id -u oagent) \
   /opt/o-agent/current/backend/axiom-sandbox-check
 ```
 
-The check must exit zero and return `healthy`, `networkEgressFiltering: true`, and `writeVerified: true`. It also reports `workspaceQuotaMount` for the configured workspace filesystem. `mountSupported` and `quotaOptionFound` only confirm ext4/XFS mount prerequisites; `hardLimitVerified` must remain false until the privileged task quota backend applies and reads back a per-workspace limit. Do not present the mount preflight as task disk isolation. A successful binary build alone is not host validation. If the workspace filesystem is unsupported or lacks active `prjquota/pquota`, stop here and prepare the filesystem using the VPS provider's supported maintenance procedure; the installer does not repartition, reformat, or remount it.
+The offline check must exit zero and return `healthy` and `writeVerified: true`. It reports `networkEgressFiltering` separately; a false value explicitly disables network-enabled sandbox commands, with no unrestricted fallback. Require `networkEgressFiltering: true` before using network-enabled commands or browser sessions. It also reports `workspaceQuotaMount` for the configured workspace filesystem. `mountSupported` and `quotaOptionFound` only confirm ext4/XFS mount prerequisites; `hardLimitVerified` must remain false until the privileged task quota backend applies and reads back a per-workspace limit. Do not present the mount preflight as task disk isolation. A successful binary build alone is not host validation. If the workspace filesystem is unsupported or lacks active `prjquota/pquota`, stop here and prepare the filesystem using the VPS provider's supported maintenance procedure; the installer does not repartition, reformat, or remount it.
 
 After the mount preflight, start the privileged helper and read its systemd state back before starting the cloud backend:
 
@@ -189,7 +189,7 @@ sudo -u oagent XDG_RUNTIME_DIR=/run/user/$(id -u oagent) \
 sudo systemctl enable --now o-web.service
 ```
 
-Verify `systemctl --user is-active o-agent.service`, `sudo systemctl is-active o-web.service`, `curl -fsS http://127.0.0.1:9171/api/v1/health`, and the public HTTPS login page. Verify a queued cloud task consumes CPU/memory scope and its durable artifact can be read back after service restart before declaring deployment complete.
+Verify `systemctl --user is-active o-agent.service`, `sudo systemctl is-active o-web.service`, `curl -fsS http://127.0.0.1:9171/api/v1/health`, and the public HTTPS login page. Verify a queued cloud task executes inside Bubblewrap, cancellation terminates its process tree, and its durable artifact can be read back after service restart before declaring deployment complete.
 
 ## Rollback
 

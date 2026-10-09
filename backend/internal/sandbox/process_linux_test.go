@@ -3,11 +3,13 @@
 package sandbox
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -86,7 +88,7 @@ func TestBubblewrapArgsIsolatesNetworkUnlessPolicyAllowsIt(t *testing.T) {
 	}
 }
 
-func TestBubblewrapTmpfsUsesTheTaskMemoryBudget(t *testing.T) {
+func TestBubblewrapPrivateTmpfsHasNoProductMemoryCap(t *testing.T) {
 	root := t.TempDir()
 	command := exec.Command("/usr/bin/true")
 	command.Dir = root
@@ -100,8 +102,8 @@ func TestBubblewrapTmpfsUsesTheTaskMemoryBudget(t *testing.T) {
 			continue
 		}
 		count++
-		if index < 2 || args[index-2] != "--size" || args[index-1] != fmt.Sprintf("%d", linuxSandboxMemoryMaxBytes) {
-			t.Fatalf("tmpfs mount %q does not use the task memory budget: %q", args[index+1], args)
+		if index >= 2 && args[index-2] == "--size" {
+			t.Fatalf("tmpfs mount %q retains a product-imposed memory cap: %q", args[index+1], args)
 		}
 	}
 	if count == 0 {
@@ -161,4 +163,119 @@ func indexOfArgPair(args []string, flag, value string) int {
 		}
 	}
 	return len(args)
+}
+
+// Fixtures test launcher/cancellation only; they do not prove namespace isolation.
+func installBubblewrapFixture(t *testing.T, script string) {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "bwrap"), []byte("#!/bin/sh\n"+script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory) // No systemd-run or systemctl.
+}
+
+func TestLinuxOfflineLauncherDoesNotRequireSystemd(t *testing.T) {
+	installBubblewrapFixture(t, "exit 17\n")
+	command := exec.Command("/usr/bin/true")
+	command.Dir = "/usr"
+	runErr, cleanupErr := Run(context.Background(), command, nil, Policy{Timeout: time.Second})
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 17 || cleanupErr != nil {
+		t.Fatalf("run=%v cleanup=%v", runErr, cleanupErr)
+	}
+	if command.ProcessState == nil || command.ProcessState.ExitCode() != 17 {
+		t.Fatal("child terminal state was not propagated")
+	}
+}
+
+func TestLinuxMissingOrBrokenBubblewrapNeverRunsUnisolatedCommand(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "must-not-exist")
+	command := exec.Command("/bin/sh", "-c", "touch \"$1\"", "fixture", marker)
+	command.Dir = "/usr"
+	t.Setenv("PATH", t.TempDir())
+	runErr, cleanupErr := Run(context.Background(), command, nil, Policy{Timeout: time.Second})
+	if runErr == nil || cleanupErr != nil {
+		t.Fatalf("missing bwrap: run=%v cleanup=%v", runErr, cleanupErr)
+	}
+	installBubblewrapFixture(t, "exit 23\n")
+	runErr, cleanupErr = Run(context.Background(), command, nil, Policy{Timeout: time.Second})
+	if runErr == nil || cleanupErr != nil {
+		t.Fatalf("broken bwrap: run=%v cleanup=%v", runErr, cleanupErr)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unisolated command ran: %v", err)
+	}
+}
+
+func TestLinuxCancellationAndTimeoutTerminateLauncherProcessGroup(t *testing.T) {
+	for _, mode := range []string{"cancel", "timeout"} {
+		t.Run(mode, func(t *testing.T) {
+			pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+			installBubblewrapFixture(t, "/bin/sleep 60 &\nprintf '%s' \"$!\" > '"+pidFile+"'\nwait\n")
+			command := exec.Command("/usr/bin/true")
+			command.Dir = "/usr"
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			timeout := 3 * time.Second
+			if mode == "timeout" {
+				timeout = 500 * time.Millisecond
+			}
+			type result struct{ runErr, cleanupErr error }
+			done := make(chan result, 1)
+			go func() {
+				runErr, cleanupErr := Run(ctx, command, nil, Policy{Timeout: timeout})
+				done <- result{runErr, cleanupErr}
+			}()
+			deadline := time.Now().Add(2 * time.Second)
+			var pid int
+			for time.Now().Before(deadline) {
+				if content, err := os.ReadFile(pidFile); err == nil {
+					pid, err = strconv.Atoi(string(content))
+					if err == nil && pid > 0 {
+						break
+					}
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if pid == 0 {
+				cancel()
+				<-done
+				t.Fatal("descendant did not start")
+			}
+			if mode == "cancel" {
+				cancel()
+			}
+			select {
+			case r := <-done:
+				want := context.Canceled
+				if mode == "timeout" {
+					want = context.DeadlineExceeded
+				}
+				if !errors.Is(r.runErr, want) || r.cleanupErr != nil {
+					t.Fatalf("run=%v cleanup=%v, want %v", r.runErr, r.cleanupErr, want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("cancellation did not terminate launcher")
+			}
+			deadline = time.Now().Add(time.Second)
+			for {
+				content, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+				if errors.Is(err, os.ErrNotExist) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, tail, ok := strings.Cut(string(content), ") ")
+				if ok && strings.HasPrefix(tail, "Z ") {
+					break
+				} // Dead, pending host PID-1 reaping.
+				if time.Now().After(deadline) {
+					t.Fatalf("descendant %d remains alive: %s", pid, content)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
+	}
 }

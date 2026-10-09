@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestSystemdScopeArgsApplyPerTaskResourceAndLifetimeLimits(t *testing.T) {
+func TestNetworkScopeDoesNotImposeHardwareOrLifetimeLimits(t *testing.T) {
 	unit, args, err := systemdScopeArgs("/usr/bin/bwrap", []string{"--unshare-all", "--", "/usr/bin/git", "status"}, 17*time.Second, false, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -19,13 +19,19 @@ func TestSystemdScopeArgsApplyPerTaskResourceAndLifetimeLimits(t *testing.T) {
 	}
 	want := []string{
 		"--user", "--scope", "--collect", "--unit", unit, "--slice", "o-agent.slice",
-		"--property=CPUQuota=100%", "--property=MemoryMax=1610612736", "--property=MemorySwapMax=0",
-		"--property=TasksMax=128", "--property=RuntimeMaxSec=17s", "--", "/usr/bin/bwrap",
+		"--", "/usr/bin/bwrap",
 		"--unshare-all", "--", "/usr/bin/git", "status",
 	}
 	for _, value := range want {
 		if !containsValue(args, value) {
 			t.Fatalf("systemd scope args do not contain %q: %q", value, args)
+		}
+	}
+	for _, argument := range args {
+		for _, property := range []string{"CPUQuota=", "MemoryMax=", "MemorySwapMax=", "TasksMax=", "RuntimeMaxSec="} {
+			if strings.Contains(argument, property) {
+				t.Fatalf("network scope retains hard limit: %s", argument)
+			}
 		}
 	}
 	if containsValue(args, "--wait") {

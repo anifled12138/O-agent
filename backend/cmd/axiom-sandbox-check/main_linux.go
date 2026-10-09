@@ -36,9 +36,7 @@ func run(ctx context.Context, output io.Writer) error {
 	if status.Health != "healthy" {
 		return fmt.Errorf("Linux sandbox health check failed: %s", status.Reason)
 	}
-	if !status.NetworkEgressFiltering {
-		return fmt.Errorf("Linux sandbox egress filter is not verified: %s", status.NetworkEgressReason)
-	}
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -79,7 +77,7 @@ func runWriteSmokeTest(ctx context.Context, workspace string) (bool, error) {
 	})
 	if runErr != nil || cleanupErr != nil {
 		if runErr != nil {
-			runErr = fmt.Errorf("execute Bubblewrap/systemd sandbox smoke test: %w", runErr)
+			runErr = fmt.Errorf("execute Bubblewrap sandbox smoke test: %w", runErr)
 		}
 		return false, errors.Join(runErr, cleanupErr)
 	}

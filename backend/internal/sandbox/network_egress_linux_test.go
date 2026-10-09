@@ -7,8 +7,12 @@ import (
 	"errors"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestPrepareLinuxNetworkAllowlistPinsOnlyResolvedPublicAddresses(t *testing.T) {
@@ -80,5 +84,41 @@ func TestPrepareLinuxNetworkAllowlistRejectsResolutionFailureAndNoPublicAnswers(
 	}
 	if _, _, _, err := prepareLinuxNetworkAllowlistWithResolver(context.Background(), []string{"example.test"}, privateOnly); err == nil {
 		t.Fatal("network allow-list accepted a destination with only private addresses")
+	}
+}
+
+func TestIPFilterProbeTimeoutTerminatesLauncherAndStopsScope(t *testing.T) {
+	directory := t.TempDir()
+	pidFile := filepath.Join(directory, "launcher.pid")
+	stopped := filepath.Join(directory, "scope-stopped")
+	fixtures := map[string]string{
+		"bash":        "exit 0\n",
+		"systemd-run": "printf '%s' \"$$\" > '" + pidFile + "'\nexec /bin/sleep 60\n",
+		"systemctl":   "case \"$2\" in\nstop) printf stopped > '" + stopped + "';;\nshow) printf 'not-found\\n';;\n*) exit 2;;\nesac\n",
+	}
+	for name, script := range fixtures {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte("#!/bin/sh\n"+script), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", directory)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := probeLinuxIPAddressFilter(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("probe=%v, want deadline exceeded", err)
+	}
+	content, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(content))
+	if err != nil || pid <= 0 {
+		t.Fatalf("invalid launcher PID %q: %v", content, err)
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("timed-out launcher %d remains: %v", pid, err)
+	}
+	if content, err := os.ReadFile(stopped); err != nil || string(content) != "stopped" {
+		t.Fatalf("network scope was not stopped: content=%q err=%v", content, err)
 	}
 }

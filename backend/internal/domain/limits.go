@@ -8,8 +8,8 @@ const MaxCloudWorkerConcurrency = 64
 // capacity is still reduced by the node's live memory and CPU snapshot.
 const MaxLocalNodeWorkerConcurrency = 64
 
-// CloudTaskSandboxMemoryLimitBytes is also consumed by the Linux systemd scope
-// and cloud worker admission, keeping the scheduler aligned with enforcement.
+// CloudTaskSandboxMemoryLimitBytes is a legacy name for the estimated task
+// admission budget. It does not impose a Linux command memory hard limit.
 const CloudTaskSandboxMemoryLimitBytes int64 = 1536 << 20
 
 // CloudWorkspaceDiskReserveBytes keeps space available for the control plane,
