@@ -49,7 +49,7 @@ jobs:
       source_ref: ${{ needs.resolve-source.outputs.commit_sha }}
 
   release:
-    name: Publish GitHub Release with Linux runtime
+    name: Publish GitHub Release with Windows and Linux runtimes
     needs: [resolve-source, build-runtime]
     runs-on: ubuntu-latest
     permissions:
@@ -59,6 +59,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: o-agent-cloud-runtime
+          path: release-files
+      - name: Download verified Windows distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: o-agent-windows-desktop
           path: release-files
       - name: Verify package checksum and source provenance
         shell: bash
@@ -70,6 +75,15 @@ jobs:
           test -f o-agent-cloud-runtime.tar.gz
           test -f o-agent-cloud-runtime.tar.gz.sha256
           sha256sum -c o-agent-cloud-runtime.tar.gz.sha256
+          test -f O-Windows-x64-Setup.exe
+          test -f O-win32-x64-portable.zip
+          sha256sum -c O-Windows-x64-Setup.exe.sha256
+          sha256sum -c O-win32-x64-portable.zip.sha256
+          grep -Fx "source_commit=$EXPECTED_SOURCE_SHA" WINDOWS-BUILD-INFO
+          grep -Fx 'platform=win32' WINDOWS-BUILD-INFO
+          grep -Fx 'arch=x64' WINDOWS-BUILD-INFO
+          unzip -tq O-win32-x64-portable.zip
+          unzip -p O-win32-x64-portable.zip resources/app/runtime/BUILD-INFO | cmp WINDOWS-BUILD-INFO -
           build_info="$(tar -xOf o-agent-cloud-runtime.tar.gz ./BUILD-INFO)"
           test "$build_info" = "source_commit=$EXPECTED_SOURCE_SHA"
           for required in ./backend/axiom ./backend/axiom-sandbox-check ./backend/axiom-quota-helper ./frontend/standalone/server.js ./deploy/ubuntu/install-runtime.sh; do
@@ -79,7 +93,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.resolve-source.outputs.tag_name }}
-          name: ${{ needs.resolve-source.outputs.tag_name }} - O Linux Cloud Runtime
+          name: ${{ needs.resolve-source.outputs.tag_name }} - O Windows and Linux
           draft: false
           prerelease: false
           generate_release_notes: true
@@ -87,16 +101,23 @@ jobs:
           files: |
             release-files/o-agent-cloud-runtime.tar.gz
             release-files/o-agent-cloud-runtime.tar.gz.sha256
+            release-files/O-Windows-x64-Setup.exe
+            release-files/O-Windows-x64-Setup.exe.sha256
+            release-files/O-win32-x64-portable.zip
+            release-files/O-win32-x64-portable.zip.sha256
+            release-files/WINDOWS-BUILD-INFO
           body: |
-            This release includes the Ubuntu x86_64 cloud runtime: the O backend,
-            Linux sandbox and quota helpers, standalone Web application, and systemd
-            deployment files. The package is built from this version tag after CI
-            passes, with a SHA-256 checksum and source commit in BUILD-INFO.
+            Windows x64 desktop installer and portable ZIP, plus the Ubuntu x86_64
+            cloud runtime. All packages are built and verified from this version tag;
+            both platforms must pass before this release can be published.
 
-            Download both runtime assets, verify the checksum, and follow
-            deploy/ubuntu/README.md inside the archive to install and configure
-            the server. The automatically generated source archives are source
-            code and are not the installable runtime package.
+            Windows: download O-Windows-x64-Setup.exe to install/update, or extract
+            the portable ZIP and launch O.exe. Quit the running O app before upgrading.
+            This milestone's Windows binaries are unsigned.
+
+            Linux: download the runtime tar.gz and checksum, then follow the included
+            deploy/ubuntu/README.md. Verify each download with its .sha256 file.
+            Source provenance is included in both packages.
       - name: Read back published runtime assets
         shell: bash
         env:
@@ -108,7 +129,8 @@ jobs:
           test "$(gh release view "$RELEASE_TAG" --json tagName --jq '.tagName')" = "$RELEASE_TAG"
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = false
           mkdir downloaded-release
-          gh release download "$RELEASE_TAG" --pattern 'o-agent-cloud-runtime.tar.gz*' --dir downloaded-release
-          (cd downloaded-release && sha256sum -c o-agent-cloud-runtime.tar.gz.sha256)
-          cmp release-files/o-agent-cloud-runtime.tar.gz downloaded-release/o-agent-cloud-runtime.tar.gz
-          cmp release-files/o-agent-cloud-runtime.tar.gz.sha256 downloaded-release/o-agent-cloud-runtime.tar.gz.sha256
+          gh release download "$RELEASE_TAG" --dir downloaded-release
+          (cd downloaded-release && sha256sum -c o-agent-cloud-runtime.tar.gz.sha256 && sha256sum -c O-Windows-x64-Setup.exe.sha256 && sha256sum -c O-win32-x64-portable.zip.sha256)
+          for filename in o-agent-cloud-runtime.tar.gz o-agent-cloud-runtime.tar.gz.sha256 O-Windows-x64-Setup.exe O-Windows-x64-Setup.exe.sha256 O-win32-x64-portable.zip O-win32-x64-portable.zip.sha256 WINDOWS-BUILD-INFO; do
+            cmp "release-files/$filename" "downloaded-release/$filename"
+          done

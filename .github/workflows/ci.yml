@@ -253,6 +253,77 @@ jobs:
           name: frontend-dist
           path: frontend/dist
 
+  windows-desktop-package:
+    name: Package Windows Desktop
+    needs: [windows-sandbox-build, backend-test-and-build, frontend-test-and-build]
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache-dependency-path: backend/go.sum
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+      - name: Install desktop and renderer dependencies
+        shell: pwsh
+        run: |
+          npm --prefix frontend ci --legacy-peer-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix desktop ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build required Windows installer and portable package
+        id: package
+        shell: pwsh
+        run: node desktop/scripts/package.mjs
+      - name: Verify packaged runtime and remote node startup across restart
+        shell: pwsh
+        timeout-minutes: 3
+        run: node desktop/scripts/smoke-package.mjs '${{ steps.package.outputs.app_dir }}'
+      - name: Stage and read back Windows distribution files
+        shell: pwsh
+        env:
+          RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
+          APP_DIR: ${{ steps.package.outputs.app_dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedSource = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $buildInfo = [IO.File]::ReadAllText((Join-Path $env:RELEASE_DIR 'BUILD-INFO'))
+          if (-not ($buildInfo -split "`n" -contains "source_commit=$expectedSource")) { throw 'Windows source provenance mismatch' }
+          if ([IO.File]::ReadAllText((Join-Path $env:APP_DIR 'resources/app/runtime/BUILD-INFO')) -ne $buildInfo) { throw 'packaged runtime provenance mismatch' }
+          New-Item -ItemType Directory -Path windows-release | Out-Null
+          $files = @(
+            @{ Source = 'installer/O-Setup.exe'; Target = 'O-Windows-x64-Setup.exe' },
+            @{ Source = 'O-win32-x64-portable.zip'; Target = 'O-win32-x64-portable.zip' }
+          )
+          foreach ($entry in $files) {
+            $original = Join-Path $env:RELEASE_DIR $entry.Source
+            $expectedHash = ([IO.File]::ReadAllText("$original.sha256").Trim() -split '\s+')[0]
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $original).Hash.ToLowerInvariant() -ne $expectedHash) { throw 'original Windows checksum mismatch' }
+            $target = Join-Path windows-release $entry.Target
+            Copy-Item -LiteralPath $original -Destination $target
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant() -ne $expectedHash) { throw 'staged Windows checksum mismatch' }
+            [IO.File]::WriteAllText("$target.sha256", "$expectedHash  $($entry.Target)`n", [Text.UTF8Encoding]::new($false))
+          }
+          [IO.File]::WriteAllText('windows-release/WINDOWS-BUILD-INFO', $buildInfo, [Text.UTF8Encoding]::new($false))
+      - name: Upload Windows desktop distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: o-agent-windows-desktop
+          path: windows-release/*
+          if-no-files-found: error
   assemble-cloud-runtime:
     name: Assemble Ubuntu Cloud Runtime
     needs: [backend-test-and-build, frontend-test-and-build]

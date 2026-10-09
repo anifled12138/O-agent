@@ -220,6 +220,12 @@ async function main() {
   const isFast = args.includes('--fast') || args.includes('-f');
   const skipInstaller = isFast || args.includes('--skip-installer');
 
+  // Full release delivery uses the same strict pipeline as Windows CI.
+  if (!isUIOnly && !isBackendOnly && !isFast && !skipInstaller) {
+    await run(process.execPath, [path.join(desktopDir, 'scripts', 'package.mjs')], rootDir);
+    return;
+  }
+
   const startTime = Date.now();
 
   if (isUIOnly) {
@@ -261,7 +267,6 @@ async function main() {
     tmpdir: path.join(rootDir, '.tmp', 'packager'),
     download: {
       cache: path.join(rootDir, '.cache', 'electron'),
-      unsafelyDisableChecksums: true,
     },
     name: 'O',
     executableName: 'O',

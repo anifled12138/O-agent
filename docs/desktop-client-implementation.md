@@ -64,14 +64,42 @@ sandboxing, navigation restriction, and local packaged content.
 
 ## Build and distribution
 
-`npm run build:desktop` performs a reproducible pipeline:
+`npm run build:desktop` and the full `npm run package` delivery target use the
+same strict pipeline in `desktop/scripts/package.mjs`. UI-only, backend-only and
+explicit fast/portable-only targets remain available for development.
 
-1. build the dedicated static desktop renderer;
-2. build the Go Host with `CGO_ENABLED=0`, `-trimpath`, and stripped symbols;
-3. package the current platform with Electron Packager;
-4. copy only the renderer artifacts and Host executable into the runtime area;
-5. on Windows, create a Squirrel installer.
+The release pipeline builds the dedicated static renderer, the Go Host and both
+Windows sandbox helpers, then packages Electron. On Windows both the Squirrel
+installer and portable ZIP are required; failures propagate rather than being
+reported as a successful release. Electron downloads retain upstream checksum
+verification. Packaged executables are compared with their compiled inputs, the
+ZIP is checked for corruption and required assets, and each distribution file
+gets a SHA-256 checksum. `BUILD-INFO` records the source commit, application
+version, platform and architecture in both the output directory and app runtime.
 
-Every build uses a version-and-timestamp output directory under `release/`, so
-an earlier package is not overwritten. The current milestone is unsigned; code
-signing and trusted update metadata are required before public distribution.
+Every build uses a version-and-timestamp directory under `release/`, so earlier
+packages are retained. The Windows package smoke test starts the bundled Go Host
+with isolated data, verifies authenticated remote-node heartbeats and HTTP
+polling against a local test control server, creates a conversation, restarts
+the process, and reads that same conversation back. This does not constitute
+acceptance against a deployed VPS or a real model provider.
+
+Successful CI produces `o-agent-windows-desktop` and `o-agent-cloud-runtime`.
+Version-tag releases test and build both platforms from the same commit and
+publish the Windows installer/portable ZIP and Linux runtime together. Missing
+packages, failed checksums or source mismatch block publication; release assets
+are downloaded and checked again after publication.
+
+The current Windows milestone is unsigned. Download from the project's own
+release, verify the SHA-256 file, and quit O through its tray menu before
+upgrading. Version 0.2.1 advances the installer version from previous 0.2.0
+builds. The application data directory remains `%APPDATA%\O\data`; upgrading
+program files must not replace that directory.
+
+Remote control still requires registering this Windows computer on the cloud
+Web interface and supplying its one-time node credential through the startup
+environment, together with `O_NODE_CONTROL_URL` (the public HTTPS origin).
+Restart O after changing the startup environment. If there are multiple local
+model providers, `O_NODE_PROVIDER_ID` selects the local provider used by remote
+tasks. The cloud device list must report a live heartbeat before the computer
+is treated as connected. Installing the updated program alone does not pair it.

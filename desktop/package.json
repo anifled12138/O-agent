@@ -1,7 +1,7 @@
 {
   "name": "o-desktop",
   "productName": "O",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "O local-first Agent desktop client",
   "main": "main.cjs",

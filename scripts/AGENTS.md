@@ -24,7 +24,7 @@
 | **仅修改了前端代码** (UI/CSS/React) | `npm run package:ui`<br>或 `node scripts/package.mjs --ui` | ~200ms | `frontend/dist-desktop`<br>更新桌面端静态资源 |
 | **仅修改了后端代码** (Go/API/O) | `npm run package:backend`<br>或 `node scripts/package.mjs --backend` | ~300ms | `desktop/.runtime/package/o-host.exe`<br>更新独立后端执行体 |
 | **日常开发/测试快速出包** (推荐) | `npm run package:fast`<br>或 `build.bat --fast` | ~2-3s | `release/O-0.1.0-xxxx/O-win32-x64/O.exe`<br>生成绿色免安装目录，可直接双击启动验证 |
-| **全量发布交付打包** (包含 Zip) | `npm run package`<br>或 `build.bat` | ~15-25s | `release/O-0.1.0-xxxx/`<br>包含完整程序目录与 `O-win32-x64-portable.zip` |
+| **全量发布交付打包** (包含 Zip) | `npm run package`<br>或 `build.bat` | ~15-25s | `release/O-0.1.0-xxxx/`<br>包含完整程序目录、`installer/O-Setup.exe`、`O-win32-x64-portable.zip`、校验文件和 BUILD-INFO |
 | **磁盘空间清理** | `npm run package:clean`<br>或 `build.bat --clean` | <1s | 清理历史 `release/O-*` 过期产物 |
 
 ---
@@ -100,3 +100,14 @@
 
 4. **历史构建物管理**：
    每次打包都会生成一个新的带时间戳的子文件夹（如 `release/O-0.1.0-20260920T151941Z`）。如果频繁测试打包导致磁盘占用过大，可执行 `node scripts/package.mjs --clean` 进行清理。
+
+## 5. 同步发布 Windows 与 Linux
+
+完整 `npm run package` 与 `npm run build:desktop` 复用
+`desktop/scripts/package.mjs` 的严格发布流水线。完整 Windows 交付必须同时
+生成安装程序与便携 ZIP；安装程序生成失败必须返回错误。`--fast` 和
+`--skip-installer` 是显式选择的开发/便携交付目标，不能用于声称完整发行版已发布。
+
+CI 通过全部平台检查后生成 `o-agent-windows-desktop` 与
+`o-agent-cloud-runtime`。版本标签发布必须使用同一源提交，并验证两个平台的
+必要文件、校验和及来源记录；发布后下载产物读回校验。当前桌面里程碑未签名。
