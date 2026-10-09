@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -164,6 +165,7 @@ func TestKernelProjectQuotaRejectsWritesBeyondLimit(t *testing.T) {
 	if err := os.Remove(outsidePath); err != nil {
 		t.Fatal(err)
 	}
+	waitForUnlinkedQuotaCharges(t, testRoot, ".o-projects/acceptance", projectID)
 	if err := ReleaseEmptyWorkspace(testRoot, ".o-projects/acceptance", projectID); err != nil {
 		t.Fatalf("release empty workspace quota: %v", err)
 	}
@@ -173,5 +175,42 @@ func TestKernelProjectQuotaRejectsWritesBeyondLimit(t *testing.T) {
 	}
 	if err := ReleaseEmptyWorkspace(testRoot, ".o-projects/acceptance", projectID); err != nil {
 		t.Fatalf("releasing the already-cleared quota was not idempotent: %v", err)
+	}
+}
+
+// Unlink returns before XFS's deferred inode inactivation necessarily retires
+// quota charges. Wait for the authoritative kernel usage before testing release;
+// never relax the release guard or treat an empty directory as zero usage.
+func waitForUnlinkedQuotaCharges(t *testing.T, root, relativePath string, projectID uint32) {
+	t.Helper()
+	directory, err := os.Open(filepath.Join(root, relativePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := directory.Close(); err != nil {
+			t.Errorf("close quota acceptance directory: %v", err)
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := unix.Syncfs(int(directory.Fd())); err != nil {
+			t.Fatalf("flush quota acceptance filesystem after unlink: %v", err)
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(directory.Fd()), &stat); err != nil {
+			t.Fatal(err)
+		}
+		quota, err := InspectWorkspace(root, relativePath, projectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if quota.UsedBytes == stat.Blocks*512 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("unlinked quota charges did not retire: project usage=%d bytes, empty directory=%d bytes", quota.UsedBytes, stat.Blocks*512)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
