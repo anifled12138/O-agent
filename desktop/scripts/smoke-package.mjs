@@ -14,6 +14,7 @@ for (const name of ['o-host.exe', 'axiom-command-runner.exe', 'axiom-sandbox-set
   assert.ok((await fs.stat(path.join(runtime, name))).size > 0, `missing runtime asset: ${name}`);
 }
 const scratch = await fs.mkdtemp(path.join(root, '.tmp', 'windows-package-smoke-'));
+await fs.mkdir(path.join(scratch, 'workspace'));
 const credential = randomBytes(32).toString('hex');
 let heartbeats = 0, claims = 0, wakes = 0, protocolError;
 let child, exited, mainError;
@@ -52,7 +53,7 @@ async function start() {
   child = spawn(path.join(runtime, 'o-host.exe'), [], {
     cwd: runtime, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...cleanEnv, O_ADDR: `127.0.0.1:${port}`, O_EXECUTION_ROLE: 'local',
-      O_DATA_DIR: path.join(scratch, 'data'), O_WORKSPACE_ROOT: scratch,
+      O_DATA_DIR: path.join(scratch, 'data'), O_WORKSPACE_ROOT: path.join(scratch, 'workspace'),
       O_AGENT_TEMP_DIR: path.join(scratch, 'temp'), O_DESKTOP_STDIN: '1',
       O_FRONTEND_ORIGIN: url, O_NODE_CONTROL_URL: controlUrl, O_NODE_CREDENTIAL: credential },
   });
@@ -94,7 +95,14 @@ async function request(url, route, method = 'GET', body) {
 }
 try {
   let url = await start();
-  const conversation = await request(url, '/api/v1/conversations', 'POST', { title: 'Windows package persistence smoke' });
+  const provider = await request(url, '/api/v1/providers', 'POST', {
+    name: 'Package smoke fixture', kind: 'openai-compatible', baseUrl: controlUrl,
+    model: 'package-smoke-fixture', apiKey: 'synthetic-package-smoke-key',
+  });
+  assert.ok(provider.id, 'missing persisted provider identity');
+  const conversation = await request(url, '/api/v1/conversations', 'POST', {
+    title: 'Windows package persistence smoke', providerId: provider.id,
+  });
   assert.ok(conversation.id, 'missing durable conversation identity');
   const firstRead = await request(url, `/api/v1/conversations/${conversation.id}`);
   assert.equal(firstRead.title, conversation.title);
