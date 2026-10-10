@@ -356,3 +356,14 @@ func TestStartupQuotaReconciliationDegradesReleasedRowWhenQuotaCannotBeCleared(t
 		t.Fatalf("failed release recovery state did not survive restart: %+v err=%v", restarted, err)
 	}
 }
+
+func TestDisablingQuotaDoesNotMisrepresentExistingKernelAllocation(t *testing.T) {
+	service := &Service{}
+	binding := storage.ExecutionTaskWorkspace{QuotaProjectID: 2147483648, QuotaLimitBytes: 8 << 30, QuotaState: "applied"}
+	if err := service.verifyExecutionTaskQuota(context.Background(), binding); err == nil {
+		t.Fatal("existing allocated workspace was treated as unmetered without its helper")
+	}
+	if err := service.verifyExecutionTaskQuota(context.Background(), storage.ExecutionTaskWorkspace{QuotaState: "not_configured"}); err != nil {
+		t.Fatalf("new unmetered workspace was blocked: %v", err)
+	}
+}

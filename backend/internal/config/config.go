@@ -15,41 +15,42 @@ import (
 )
 
 type Config struct {
-	Addr                      string
-	DataDir                   string
-	WorkspaceRoot             string
-	AgentTempDir              string
-	FrontendOrigin            string
-	AuthBootstrapToken        string
-	AuthOwnerEmail            string
-	ResendAPIKey              string
-	AuthMailFrom              string
-	TurnstileSiteKey          string
-	TurnstileSecretKey        string
-	TLSCertFile               string
-	TLSKeyFile                string
-	AgentMaxModelCalls        int
-	CloudWorkerConcurrency    int
-	NodeWorkerConcurrency     int
-	ExecutionRole             string
-	NodeControlURL            string
-	NodeCredential            string
-	NodeProviderID            string
-	QuotaHelperSocket         string
-	CloudWorkspaceQuota       int64
-	CloudWorkspaceDiskReserve int64
-	CloudWorkspaceRetention   time.Duration
-	ArtifactStoreBackend      string
-	ArtifactS3Endpoint        string
-	ArtifactS3Region          string
-	ArtifactS3Bucket          string
-	ArtifactS3AccessKeyID     string
-	ArtifactS3SecretKey       string
-	ArtifactS3SessionToken    string
-	ArtifactS3Prefix          string
-	ArtifactS3PathStyle       bool
-	ArtifactS3DirectUpload    bool
-	LoadError                 error
+	Addr                       string
+	DataDir                    string
+	WorkspaceRoot              string
+	AgentTempDir               string
+	FrontendOrigin             string
+	AuthBootstrapToken         string
+	AuthOwnerEmail             string
+	ResendAPIKey               string
+	AuthMailFrom               string
+	TurnstileSiteKey           string
+	TurnstileSecretKey         string
+	TLSCertFile                string
+	TLSKeyFile                 string
+	AgentMaxModelCalls         int
+	CloudWorkerConcurrency     int
+	NodeWorkerConcurrency      int
+	ExecutionRole              string
+	NodeControlURL             string
+	NodeCredential             string
+	NodeProviderID             string
+	QuotaHelperSocket          string
+	CloudWorkspaceQuotaEnabled bool
+	CloudWorkspaceQuota        int64
+	CloudWorkspaceDiskReserve  int64
+	CloudWorkspaceRetention    time.Duration
+	ArtifactStoreBackend       string
+	ArtifactS3Endpoint         string
+	ArtifactS3Region           string
+	ArtifactS3Bucket           string
+	ArtifactS3AccessKeyID      string
+	ArtifactS3SecretKey        string
+	ArtifactS3SessionToken     string
+	ArtifactS3Prefix           string
+	ArtifactS3PathStyle        bool
+	ArtifactS3DirectUpload     bool
+	LoadError                  error
 }
 
 func Load() Config {
@@ -120,6 +121,14 @@ func Load() Config {
 	} else {
 		config.NodeWorkerConcurrency = value
 	}
+	if value := env("O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "AXIOM_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "false"); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			config.LoadError = fmt.Errorf("parse O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED: %w", err)
+		} else {
+			config.CloudWorkspaceQuotaEnabled = parsed
+		}
+	}
 	if value, err := int64Setting("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "AXIOM_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", config.CloudWorkspaceQuota); err != nil {
 		config.LoadError = err
 	} else {
@@ -164,7 +173,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("O_EXECUTION_ROLE must be local or cloud")
 	}
 	if c.CloudWorkspaceQuota < 0 {
-		return fmt.Errorf("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES must be a positive byte count for cloud role")
+		return fmt.Errorf("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES must be zero (disabled) or a positive byte count")
 	}
 	if c.CloudWorkspaceDiskReserve < 0 {
 		return fmt.Errorf("O_CLOUD_TASK_DISK_RESERVE_BYTES must be zero or a positive byte count")
@@ -198,13 +207,13 @@ func (c Config) Validate() error {
 			return fmt.Errorf("O_ARTIFACT_S3_PREFIX must be a normalized relative key prefix")
 		}
 	}
-	if c.ExecutionRole == "cloud" && c.CloudWorkspaceQuota == 0 {
-		return fmt.Errorf("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES must configure the cloud task hard disk quota")
+	if c.ExecutionRole == "cloud" && c.CloudWorkspaceQuotaEnabled && c.CloudWorkspaceQuota == 0 {
+		return fmt.Errorf("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES must be positive when O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED=true")
 	}
-	if c.ExecutionRole == "cloud" && (c.QuotaHelperSocket == "" || !path.IsAbs(c.QuotaHelperSocket) || path.Clean(c.QuotaHelperSocket) != c.QuotaHelperSocket) {
+	if c.ExecutionRole == "cloud" && c.CloudWorkspaceQuotaEnabled && (c.QuotaHelperSocket == "" || !path.IsAbs(c.QuotaHelperSocket) || path.Clean(c.QuotaHelperSocket) != c.QuotaHelperSocket) {
 		return fmt.Errorf("O_QUOTA_HELPER_SOCKET must be a canonical absolute Unix socket path for cloud role")
 	}
-	if c.ExecutionRole == "local" && (c.CloudWorkspaceQuota != 0 || c.QuotaHelperSocket != "") {
+	if c.ExecutionRole == "local" && (c.CloudWorkspaceQuotaEnabled || c.CloudWorkspaceQuota != 0 || c.QuotaHelperSocket != "") {
 		return fmt.Errorf("cloud task workspace quota settings require O_EXECUTION_ROLE=cloud")
 	}
 	frontendOrigin, err := url.Parse(c.FrontendOrigin)

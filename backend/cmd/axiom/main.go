@@ -253,7 +253,7 @@ func run() error {
 		return err
 	}
 	agentService.SetGitCredentialBroker(gitCredentialService)
-	if cfg.ExecutionRole == "cloud" {
+	if cfg.ExecutionRole == "cloud" && cfg.CloudWorkspaceQuotaEnabled {
 		quotaClient, err := projectquota.NewHelperClient(cfg.QuotaHelperSocket)
 		if err != nil {
 			return fmt.Errorf("configure cloud workspace quota helper: %w", err)
@@ -326,8 +326,10 @@ func run() error {
 		if err := cloudWorker.SetConcurrency(cfg.CloudWorkerConcurrency); err != nil {
 			return fmt.Errorf("configure cloud task concurrency: %w", err)
 		}
-		if err := cloudWorker.SetDiskAdmissionBudget(agentService.WorkspaceRoot(), cfg.CloudWorkspaceQuota, cfg.CloudWorkspaceDiskReserve); err != nil {
-			return fmt.Errorf("configure cloud task disk admission: %w", err)
+		if cfg.CloudWorkspaceQuotaEnabled {
+			if err := cloudWorker.SetDiskAdmissionBudget(agentService.WorkspaceRoot(), cfg.CloudWorkspaceQuota, cfg.CloudWorkspaceDiskReserve); err != nil {
+				return fmt.Errorf("configure cloud task disk admission: %w", err)
+			}
 		}
 		go cloudWorker.Run(ctx)
 		go heartbeatCloudExecutionNode(ctx, store, cloudCredentialHash)

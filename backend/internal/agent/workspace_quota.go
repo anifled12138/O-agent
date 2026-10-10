@@ -14,8 +14,8 @@ import (
 )
 
 // ConfigureWorkspaceQuota installs the privileged Linux project quota client
-// and the fixed per-task block hard limit. Cloud-role startup requires this
-// dependency; local runtimes may leave it unset.
+// and the opt-in per-task block hard limit. Local and cloud runtimes leave
+// it unset by default; explicitly enabled quotas retain fail-closed verification.
 func (s *Service) ConfigureWorkspaceQuota(manager projectquota.Manager, limitBytes int64) error {
 	if s == nil || (manager == nil) != (limitBytes == 0) || limitBytes < 0 {
 		return domain.ErrInvalid
@@ -227,6 +227,9 @@ func (s *Service) persistAppliedWorkspaceQuota(ctx context.Context, binding stor
 
 func (s *Service) verifyExecutionTaskQuota(ctx context.Context, binding storage.ExecutionTaskWorkspace) error {
 	if s.workspaceQuota == nil {
+		if binding.QuotaProjectID != 0 || binding.QuotaLimitBytes != 0 {
+			return fmt.Errorf("existing workspace quota allocation requires its configured helper; create a new unmetered task or re-enable quota verification: %w", domain.ErrConflict)
+		}
 		return nil
 	}
 	if binding.QuotaState != "applied" || binding.QuotaProjectID <= 0 || binding.QuotaProjectID > int64(^uint32(0)) || binding.QuotaLimitBytes <= 0 {

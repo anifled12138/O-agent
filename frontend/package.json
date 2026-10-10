@@ -9,6 +9,7 @@
     "dev": "vinext dev",
     "dev:desktop-ui": "vite --config vite.desktop.config.ts",
     "build": "vinext build",
+    "postbuild": "node scripts/prepare-standalone.mjs",
     "build:desktop-ui": "vite build --config vite.desktop.config.ts",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-desktop --ignore-pattern .next",

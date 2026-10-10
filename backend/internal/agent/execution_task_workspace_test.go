@@ -70,7 +70,7 @@ func TestScratchExecutionTaskWorkspaceIsolatedDurableAndRecoverable(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	service.store = store
+	service = &Service{store: store, workspaceRoot: root}
 	recovered, err := service.EnsureExecutionTaskScratchWorkspace(ctx, owner, "task_scratch_one")
 	if err != nil || recovered != first {
 		t.Fatalf("scratch workspace did not recover its durable mapping: path=%q want=%q err=%v", recovered, first, err)
@@ -80,7 +80,7 @@ func TestScratchExecutionTaskWorkspaceIsolatedDurableAndRecoverable(t *testing.T
 		t.Fatalf("scratch task output did not survive workspace recovery: %q err=%v", content, err)
 	}
 	binding, err := store.ExecutionTaskWorkspace(ctx, owner, "task_scratch_one")
-	if err != nil || binding.Status != "ready" || binding.Workdir != first || binding.SourceProjectID != "" {
+	if err != nil || binding.Status != "ready" || binding.Workdir != first || binding.SourceProjectID != "" || binding.QuotaProjectID != 0 || binding.QuotaLimitBytes != 0 || binding.QuotaState != "not_configured" {
 		t.Fatalf("recovered scratch workspace binding did not read back ready: %+v err=%v", binding, err)
 	}
 }

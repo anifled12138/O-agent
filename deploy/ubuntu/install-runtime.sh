@@ -40,7 +40,7 @@ node -e 'const [major,minor]=process.versions.node.split(".").map(Number); proce
 command -v systemctl >/dev/null || { echo 'systemd is required.' >&2; exit 1; }
 command -v loginctl >/dev/null || { echo 'systemd-logind is required.' >&2; exit 1; }
 command -v bwrap >/dev/null || { echo 'Bubblewrap is required for Linux task isolation.' >&2; exit 1; }
-command -v systemd-run >/dev/null || { echo 'systemd-run is required for per-task resource scopes.' >&2; exit 1; }
+command -v systemd-run >/dev/null || echo 'Network-enabled sandbox commands will be unavailable without systemd-run; offline Bubblewrap remains available.' >&2
 
 source "$(dirname -- "$0")/config-paths.sh"
 o_agent_require_real_directory /etc/o-agent
@@ -84,7 +84,8 @@ if [[ ! -e /etc/o-agent/cloud.env ]]; then
 O_FRONTEND_ORIGIN=https://o.example.com
 O_CLOUD_WORKER_CONCURRENCY=64
 O_QUOTA_HELPER_SOCKET=/run/o-agent/quota.sock
-O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES=8589934592
+O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED=false
+O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES=0
 O_CLOUD_TASK_DISK_RESERVE_BYTES=4294967296
 O_CLOUD_TASK_WORKSPACE_RETENTION=720h
 EOF

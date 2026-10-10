@@ -122,9 +122,12 @@ jobs:
             Linux sandbox update: per-command CPU, memory, swap, process-count and
             fixed tmpfs caps are removed. Offline commands launch Bubblewrap directly.
             Network-enabled commands still require verified systemd/cgroup IP filtering.
-            Cloud role still requires the project-quota helper and a supported quota
-            mount (default task quota: 8 GiB). Web service limits are unchanged.
-            This release does not claim to remove those remaining deployment blockers.
+            Cloud workspace quotas now require explicit opt-in and are disabled by
+            default, including existing installations with legacy quota-byte settings.
+            Normal ext4 is supported without root-filesystem maintenance. Web service
+            memory/process caps are removed. The archive preserves hidden Web runtime
+            dependencies and must serve the O page and pass cloud restart/login checks
+            after extraction outside the source checkout before publication.
       - name: Read back published runtime assets
         shell: bash
         env:

@@ -142,7 +142,7 @@ func TestCloudWorkspaceRetentionDefaultsAndCanBeDisabled(t *testing.T) {
 }
 
 func TestCloudRoleRequiresAuthenticatedHTTPSFrontendBehindLoopbackProxy(t *testing.T) {
-	for _, name := range []string{"O_ADDR", "AXIOM_ADDR", "O_AUTH_BOOTSTRAP_TOKEN", "AXIOM_AUTH_BOOTSTRAP_TOKEN", "O_TLS_CERT_FILE", "AXIOM_TLS_CERT_FILE", "O_TLS_KEY_FILE", "AXIOM_TLS_KEY_FILE", "O_FRONTEND_ORIGIN", "AXIOM_FRONTEND_ORIGIN", "O_EXECUTION_ROLE", "AXIOM_EXECUTION_ROLE", "O_NODE_CONTROL_URL", "AXIOM_NODE_CONTROL_URL", "O_NODE_CREDENTIAL", "AXIOM_NODE_CREDENTIAL", "O_QUOTA_HELPER_SOCKET", "AXIOM_QUOTA_HELPER_SOCKET", "O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "AXIOM_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "O_CLOUD_TASK_DISK_RESERVE_BYTES", "AXIOM_CLOUD_TASK_DISK_RESERVE_BYTES"} {
+	for _, name := range []string{"O_ADDR", "AXIOM_ADDR", "O_AUTH_BOOTSTRAP_TOKEN", "AXIOM_AUTH_BOOTSTRAP_TOKEN", "O_TLS_CERT_FILE", "AXIOM_TLS_CERT_FILE", "O_TLS_KEY_FILE", "AXIOM_TLS_KEY_FILE", "O_FRONTEND_ORIGIN", "AXIOM_FRONTEND_ORIGIN", "O_EXECUTION_ROLE", "AXIOM_EXECUTION_ROLE", "O_NODE_CONTROL_URL", "AXIOM_NODE_CONTROL_URL", "O_NODE_CREDENTIAL", "AXIOM_NODE_CREDENTIAL", "O_QUOTA_HELPER_SOCKET", "AXIOM_QUOTA_HELPER_SOCKET", "O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "AXIOM_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "AXIOM_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "O_CLOUD_TASK_DISK_RESERVE_BYTES", "AXIOM_CLOUD_TASK_DISK_RESERVE_BYTES"} {
 		t.Setenv(name, "")
 	}
 	t.Setenv("O_EXECUTION_ROLE", "cloud")
@@ -155,11 +155,12 @@ func TestCloudRoleRequiresAuthenticatedHTTPSFrontendBehindLoopbackProxy(t *testi
 		t.Fatal("cloud API with an insecure default frontend origin was accepted")
 	}
 	t.Setenv("O_FRONTEND_ORIGIN", "https://o.example.test")
-	if err := Load().Validate(); err == nil {
-		t.Fatal("cloud role started without a durable task hard quota and root helper socket")
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("default cloud role unnecessarily required project quotas: %v", err)
 	}
 	t.Setenv("O_QUOTA_HELPER_SOCKET", "/run/o-agent/quota.sock")
 	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "8589934592")
+	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "true")
 	if cfg := Load(); cfg.CloudWorkspaceDiskReserve != domain.CloudWorkspaceDiskReserveBytes {
 		t.Fatalf("default cloud disk reserve = %d, want %d", cfg.CloudWorkspaceDiskReserve, domain.CloudWorkspaceDiskReserveBytes)
 	}
@@ -194,6 +195,7 @@ func TestCloudRoleRequiresAuthenticatedHTTPSFrontendBehindLoopbackProxy(t *testi
 	t.Setenv("O_AUTH_BOOTSTRAP_TOKEN", "")
 	t.Setenv("O_QUOTA_HELPER_SOCKET", "")
 	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "")
+	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "false")
 	if err := Load().Validate(); err == nil {
 		t.Fatal("local-role API exposed through a public TLS proxy was allowed without authentication")
 	}
@@ -244,5 +246,44 @@ func TestNodeWorkerConfigurationMustBeCompleteAndLocal(t *testing.T) {
 	t.Setenv("O_EXECUTION_ROLE", "cloud")
 	if err := Load().Validate(); err == nil {
 		t.Fatal("cloud role accepted a second remote node credential")
+	}
+}
+
+func TestCloudQuotaRequiresExplicitOptInIncludingLegacyInstallations(t *testing.T) {
+	for _, key := range []string{"O_EXECUTION_ROLE", "AXIOM_EXECUTION_ROLE", "O_FRONTEND_ORIGIN", "AXIOM_FRONTEND_ORIGIN", "O_ADDR", "AXIOM_ADDR", "O_AUTH_BOOTSTRAP_TOKEN", "AXIOM_AUTH_BOOTSTRAP_TOKEN", "O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "AXIOM_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "AXIOM_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "O_QUOTA_HELPER_SOCKET", "AXIOM_QUOTA_HELPER_SOCKET"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("O_EXECUTION_ROLE", "cloud")
+	t.Setenv("O_FRONTEND_ORIGIN", "https://o.example.test")
+	t.Setenv("O_AUTH_BOOTSTRAP_TOKEN", "01234567890123456789012345678901")
+	if cfg := Load(); cfg.CloudWorkspaceQuotaEnabled || cfg.Validate() != nil {
+		t.Fatalf("plain cloud deployment requires quotas: enabled=%v err=%v", cfg.CloudWorkspaceQuotaEnabled, cfg.Validate())
+	}
+	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "8589934592")
+	t.Setenv("O_QUOTA_HELPER_SOCKET", "/nonexistent/quota.sock")
+	if cfg := Load(); cfg.CloudWorkspaceQuotaEnabled || cfg.Validate() != nil {
+		t.Fatalf("legacy installer implicitly enabled quotas: enabled=%v err=%v", cfg.CloudWorkspaceQuotaEnabled, cfg.Validate())
+	}
+	t.Setenv("AXIOM_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "true")
+	if cfg := Load(); !cfg.CloudWorkspaceQuotaEnabled || cfg.Validate() != nil {
+		t.Fatalf("explicit legacy opt-in failed: enabled=%v err=%v", cfg.CloudWorkspaceQuotaEnabled, cfg.Validate())
+	}
+	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "false")
+	if Load().CloudWorkspaceQuotaEnabled {
+		t.Fatal("current disabled setting did not override legacy opt-in")
+	}
+	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "true")
+	t.Setenv("O_QUOTA_HELPER_SOCKET", "")
+	if err := Load().Validate(); err == nil {
+		t.Fatal("enabled quota accepted a missing helper socket")
+	}
+	t.Setenv("O_QUOTA_HELPER_SOCKET", "/run/o-agent/quota.sock")
+	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_BYTES", "0")
+	if err := Load().Validate(); err == nil {
+		t.Fatal("enabled quota accepted a zero hard limit")
+	}
+	t.Setenv("O_CLOUD_TASK_WORKSPACE_QUOTA_ENABLED", "invalid")
+	if err := Load().Validate(); err == nil {
+		t.Fatal("malformed quota switch was silently ignored")
 	}
 }

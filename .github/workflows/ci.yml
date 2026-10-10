@@ -252,6 +252,7 @@ jobs:
         with:
           name: frontend-dist
           path: frontend/dist
+          include-hidden-files: true
 
   windows-desktop-package:
     name: Package Windows Desktop
@@ -329,6 +330,11 @@ jobs:
     needs: [backend-test-and-build, frontend-test-and-build]
     runs-on: ubuntu-latest
     steps:
+      - name: Set up runtime Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -361,7 +367,7 @@ jobs:
           install -m 0755 staging/backend/axiom-sandbox-check release/backend/axiom-sandbox-check
           install -m 0755 staging/backend/axiom-quota-helper release/backend/axiom-quota-helper
           cp -a staging/frontend/. release/frontend/
-          cp deploy/ubuntu/o-agent.service deploy/ubuntu/o-agent-quota-helper.service deploy/ubuntu/o-web.service deploy/ubuntu/o-agent-backup.service deploy/ubuntu/o-agent-backup.timer deploy/ubuntu/backup-and-upload.sh deploy/ubuntu/user-manager-delegation.conf deploy/ubuntu/install-runtime.sh deploy/ubuntu/config-paths.sh deploy/ubuntu/README.md deploy/ubuntu/Caddyfile.example release/deploy/ubuntu/
+          cp deploy/ubuntu/o-agent.service deploy/ubuntu/o-agent-quota-helper.service deploy/ubuntu/o-web.service deploy/ubuntu/o-agent-backup.service deploy/ubuntu/o-agent-backup.timer deploy/ubuntu/backup-and-upload.sh deploy/ubuntu/user-manager-delegation.conf deploy/ubuntu/install-runtime.sh deploy/ubuntu/config-paths.sh deploy/ubuntu/smoke-runtime.mjs deploy/ubuntu/README.md deploy/ubuntu/Caddyfile.example release/deploy/ubuntu/
           printf 'source_commit=%s\n' "$(git rev-parse HEAD)" > release/BUILD-INFO
           bash -n deploy/ubuntu/install-runtime.sh
           bash -n deploy/ubuntu/config-paths.sh deploy/ubuntu/config-paths.test.sh
@@ -403,6 +409,11 @@ jobs:
           sha256sum o-agent-cloud-runtime.tar.gz > o-agent-cloud-runtime.tar.gz.sha256
           sha256sum -c o-agent-cloud-runtime.tar.gz.sha256
           tar -tzf o-agent-cloud-runtime.tar.gz >/dev/null
+          # Start the exact archive outside the checkout so missing runtime
+          # dependencies cannot be supplied by frontend/node_modules.
+          smoke_dir=$(mktemp -d "$RUNNER_TEMP/o-cloud-archive.XXXXXX")
+          tar -xzf o-agent-cloud-runtime.tar.gz -C "$smoke_dir"
+          node deploy/ubuntu/smoke-runtime.mjs "$smoke_dir"
       - name: Upload deployable cloud runtime
         uses: actions/upload-artifact@v4
         with:
