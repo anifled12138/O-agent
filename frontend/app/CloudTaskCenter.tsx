@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Copy, RefreshCw, Square, X } from 'lucide-react';
 import { API, ArtifactShareLink, continueLocalTaskInCloud, createArtifactShareLink, ExecutionTask, HandoffEffectResolution, HandoffExternalEffect, importLocalTaskProjectDelta, listArtifactShareLinks, previewLocalTaskContinuation, Project, request, requestSafeTaskHandoff, revokeArtifactShareLink } from './api';
 import { useDialogA11y } from './useDialogA11y';
+import type { RoutedExecutionTask } from './executionRouting';
 
 type CloudTask = ExecutionTask;
 type RecoveryEvidenceArtifact = { id: string; role: string; fileName: string; byteSize: number };
@@ -24,7 +25,7 @@ const progressLabels: Record<string, string> = {
   artifacts_verified: '任务成果已在云端校验，正在确认最终状态',
 };
 
-export default function CloudTaskCenter({ onClose, onOpenConversation }: { onClose: () => void; onOpenConversation: (id: string) => void }) {
+export default function CloudTaskCenter({ onClose, onOpenConversation, focusedTaskId }: { onClose: () => void; onOpenConversation: (id: string) => void; focusedTaskId?: string }) {
   const [tasks, setTasks] = useState<CloudTask[]>([]);
   const [error, setError] = useState('');
   const [busyTask, setBusyTask] = useState('');
@@ -41,7 +42,7 @@ export default function CloudTaskCenter({ onClose, onOpenConversation }: { onClo
     try {
       const latest = await request<CloudTask[]>('/tasks');
       if (!Array.isArray(latest)) throw new Error('任务列表格式无效。');
-      setTasks(latest);
+      setTasks([...latest].sort((a, b) => Number(b.id === focusedTaskId) - Number(a.id === focusedTaskId)));
       setImportedProjects(Object.fromEntries(latest.filter((task) => task.importedProject).map((task) => [task.id, task.importedProject as Project])));
       setContinuedConversations(Object.fromEntries(latest.filter((task) => task.continuedConversation).map((task) => [task.id, task.continuedConversation as NonNullable<ExecutionTask['continuedConversation']>])));
       setContinuationTaskStatuses(Object.fromEntries(latest.filter((task) => task.continuationTaskId && task.continuationTaskStatus).map((task) => [task.id, { id: task.continuationTaskId as string, status: task.continuationTaskStatus as string }])));
@@ -49,7 +50,7 @@ export default function CloudTaskCenter({ onClose, onOpenConversation }: { onClo
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '任务列表读取失败');
     }
-  }, []);
+  }, [focusedTaskId]);
   useEffect(() => { const initial = window.setTimeout(() => void refresh(), 0); const timer = window.setInterval(() => void refresh(), 5000); return () => { window.clearTimeout(initial); window.clearInterval(timer); }; }, [refresh]);
 
   async function cancel(id: string) {
@@ -174,11 +175,18 @@ export default function CloudTaskCenter({ onClose, onOpenConversation }: { onClo
       }
       const result = await continueLocalTaskInCloud(id, undefined, effectResolutions ?? [], recovery);
       if (!result.conversation?.id || result.project && result.conversation.projectId !== result.project.id || !result.task?.id || !result.task.status) throw new Error('云端续接会话或持久任务没有读回对应的项目分支与状态。');
+      const [taskReadBack, conversationReadBack] = await Promise.all([
+        request<RoutedExecutionTask>(`/tasks/${encodeURIComponent(result.task.id)}`),
+        request<{ id: string; projectId: string; parentConversationId: string; messages: unknown[] }>(`/conversations/${encodeURIComponent(result.conversation.id)}`),
+      ]);
+      if (taskReadBack.id !== result.task.id || taskReadBack.parentTaskId !== id || taskReadBack.nodeId !== result.task.nodeId || taskReadBack.payload?.conversationId !== result.conversation.id || !taskReadBack.status || conversationReadBack.id !== result.conversation.id || conversationReadBack.projectId !== result.conversation.projectId || conversationReadBack.parentConversationId !== result.conversation.parentConversationId || !Array.isArray(conversationReadBack.messages)) throw new Error('续接任务与同步后的会话未通过权威状态核验，请重试。');
+
       setHandoffReview(null);
       setContinuedConversations((current) => ({ ...current, [id]: result.conversation }));
-      setContinuationTaskStatuses((current) => ({ ...current, [id]: { id: result.task.id, status: result.task.status } }));
+      setContinuationTaskStatuses((current) => ({ ...current, [id]: { id: result.task.id, status: taskReadBack.status } }));
       setError('');
       await refresh();
+      if (focusedTaskId === id) onOpenConversation(result.conversation.id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '云端续接会话创建失败');
     } finally {
@@ -189,10 +197,11 @@ export default function CloudTaskCenter({ onClose, onOpenConversation }: { onClo
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section ref={ref} role="dialog" aria-modal="true" aria-labelledby="cloud-task-center-title" tabIndex={-1} style={{ width: 'min(720px, calc(100vw - 28px))', maxHeight: 'min(780px, calc(100dvh - 32px))', overflow: 'auto', background: 'var(--panel, #fffefa)', color: 'var(--text, #25251f)', border: '1px solid var(--border, #deddd5)', borderRadius: 16, padding: 20, boxShadow: '0 18px 60px #0003' }}>
       <header style={{ display: 'flex', alignItems: 'center', gap: 12, borderBottom: '1px solid var(--border, #deddd5)', paddingBottom: 12 }}>
-        <div style={{ flex: 1 }}><h2 id="cloud-task-center-title" style={{ margin: 0, fontSize: 18 }}>云端任务</h2><p style={{ margin: '5px 0 0', color: 'var(--muted, #77776e)', fontSize: 13 }}>状态来自云端持久记录，关闭此窗口不会停止任务。</p></div>
+        <div style={{ flex: 1 }}><h2 id="cloud-task-center-title" style={{ margin: 0, fontSize: 18 }}>任务与产物</h2><p style={{ margin: '5px 0 0', color: 'var(--muted, #77776e)', fontSize: 13 }}>切换前先安全暂停，校验会话、检查点与项目产物，再打开续接会话。</p></div>
         <button type="button" className="icon-button" onClick={() => void refresh()} aria-label="刷新任务列表" title="刷新"><RefreshCw size={16} /></button>
         <button type="button" className="icon-button" onClick={onClose} aria-label="关闭任务列表"><X size={18} /></button>
       </header>
+      {focusedTaskId && <p className="task-handoff-guidance" role="status">当前会话的交接任务已置顶。运行中的本地任务请先点击「安全暂停并准备云端续接」；归档后点击「在云端继续」。同步失败时保留原记录，可重试。</p>}
       {error && <p role="alert" style={{ color: '#a22828', fontSize: 13 }}>{error}</p>}
       {shareMessage && <p role="status" style={{ color: '#16835d', fontSize: 12 }}>{shareMessage}</p>}
       {tasks.length === 0 ? <p style={{ color: 'var(--muted, #77776e)', padding: '24px 4px' }}>还没有已提交的任务。</p> : <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>

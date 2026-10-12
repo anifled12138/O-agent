@@ -191,6 +191,16 @@ func (s *Store) HeartbeatExecutionNode(ctx context.Context, tokenHash, platform 
 }
 
 func (s *Store) HeartbeatExecutionNodeWithResources(ctx context.Context, tokenHash, platform string, capabilities []string, resources ExecutionNodeResources, now time.Time) (ExecutionNode, error) {
+	return s.HeartbeatExecutionNodeWithCatalog(ctx, tokenHash, platform, capabilities, resources, nil, now)
+}
+
+// A catalog and its heartbeat become visible atomically, so online devices have a usable model selection.
+func (s *Store) HeartbeatExecutionNodeWithCatalog(ctx context.Context, tokenHash, platform string, capabilities []string, resources ExecutionNodeResources, catalog *NodeCatalog, now time.Time) (ExecutionNode, error) {
+	if catalog != nil {
+		if err := catalog.Validate(); err != nil {
+			return ExecutionNode{}, err
+		}
+	}
 	if err := resources.Validate(); err != nil {
 		return ExecutionNode{}, err
 	}
@@ -221,6 +231,22 @@ func (s *Store) HeartbeatExecutionNodeWithResources(ctx context.Context, tokenHa
 	var userID, nodeID string
 	if err := tx.QueryRowContext(ctx, `SELECT user_id,id FROM execution_nodes WHERE token_hash=? AND revoked_at IS NULL`, tokenHash).Scan(&userID, &nodeID); err != nil {
 		return ExecutionNode{}, err
+	}
+	if catalog != nil {
+		body, err := json.Marshal(catalog)
+		if err != nil {
+			return ExecutionNode{}, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_node_catalogs(node_id,catalog_json) VALUES(?,?) ON CONFLICT(node_id) DO UPDATE SET catalog_json=excluded.catalog_json`, nodeID, body); err != nil {
+			return ExecutionNode{}, err
+		}
+		var saved []byte
+		if err = tx.QueryRowContext(ctx, `SELECT catalog_json FROM execution_node_catalogs WHERE node_id=?`, nodeID).Scan(&saved); err != nil {
+			return ExecutionNode{}, err
+		}
+		if string(saved) != string(body) {
+			return ExecutionNode{}, domain.ErrConflict
+		}
 	}
 	node, err := executionNodeByID(ctx, tx, userID, nodeID)
 	if err != nil {
@@ -271,12 +297,30 @@ func (s *Store) ExecutionNodeForToken(ctx context.Context, tokenHash string) (Ex
 }
 
 func (s *Store) RevokeExecutionNode(ctx context.Context, userID, id string, now time.Time) error {
+	return s.revokeExecutionNode(ctx, userID, id, "", now)
+}
+
+// Self-revocation is fenced by the current credential so a delayed logout cannot revoke a newer sign-in.
+func (s *Store) RevokeExecutionNodeForToken(ctx context.Context, userID, id, tokenHash string, now time.Time) error {
+	if tokenHash == "" {
+		return domain.ErrUnauthorized
+	}
+	return s.revokeExecutionNode(ctx, userID, id, tokenHash, now)
+}
+func (s *Store) revokeExecutionNode(ctx context.Context, userID, id, expectedToken string, now time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE execution_nodes SET token_hash='revoked:'||id,revoked_at=?,updated_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL`, now.UTC(), now.UTC(), id, userID)
+	var currentToken string
+	if err := tx.QueryRowContext(ctx, "SELECT token_hash FROM execution_nodes WHERE id=? AND user_id=?", id, userID).Scan(&currentToken); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.ErrNotFound
+		}
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE execution_nodes SET token_hash='revoked:'||id,revoked_at=?,updated_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL AND (?='' OR token_hash=?)`, now.UTC(), now.UTC(), id, userID, expectedToken, expectedToken)
 	if err != nil {
 		return err
 	}
@@ -290,6 +334,9 @@ func (s *Store) RevokeExecutionNode(ctx context.Context, userID, id string, now 
 			return readErr
 		}
 		if node.RevokedAt == nil {
+			if expectedToken != "" {
+				return domain.ErrUnauthorized
+			}
 			return domain.ErrConflict
 		}
 		if err := tx.Commit(); err != nil {
@@ -306,6 +353,9 @@ func (s *Store) RevokeExecutionNode(ctx context.Context, userID, id string, now 
 	}
 	if changed != 1 {
 		return domain.ErrConflict
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO device_credential_revocations(token_hash,user_id,node_id,revoked_at) VALUES(?,?,?,?) ON CONFLICT(token_hash) DO NOTHING", currentToken, userID, id, now.UTC()); err != nil {
+		return err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,status,sequence FROM execution_tasks WHERE node_id=? AND user_id=? AND status IN ('queued','leased','accepted','running','reported_succeeded','reported_failed') ORDER BY created_at,id`, id, userID)
 	if err != nil {
@@ -368,6 +418,13 @@ func (s *Store) RevokeExecutionNode(ctx context.Context, userID, id string, now 
 		if err := insertExecutionTaskEvent(ctx, tx, task.id, next, status, details, now); err != nil {
 			return err
 		}
+	}
+	var receiptCount int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM device_credential_revocations WHERE token_hash=? AND user_id=? AND node_id=?", currentToken, userID, id).Scan(&receiptCount); err != nil {
+		return err
+	}
+	if receiptCount != 1 {
+		return domain.ErrConflict
 	}
 	var tokenHash string
 	var revokedAt time.Time

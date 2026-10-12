@@ -55,6 +55,8 @@ type taskInputArtifact struct {
 }
 
 type nodeAgentTaskPayload struct {
+	LocalProviderID         string                     `json:"localProviderId,omitempty"`
+	PermissionProfile       domain.PermissionProfile   `json:"permissionProfile,omitempty"`
 	Kind                    string                     `json:"kind"`
 	SourceConversationID    string                     `json:"sourceConversationId"`
 	Content                 string                     `json:"content"`
@@ -183,6 +185,20 @@ func (s *Server) executionTaskSubmit(w http.ResponseWriter, r *http.Request) {
 // is reported only after the Agent turn has been read back from storage.
 func (s *Server) cloudAgentTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(r.PathValue("id"))
+	source, err := s.store.Conversation(r.Context(), s.workspaceID, conversationID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	p, _, _, err := s.store.ProviderSecret(r.Context(), s.workspaceID, source.ProviderID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if p.Kind == storage.DeviceModelReferenceKind {
+		write(w, 409, map[string]string{"error": "此会话使用本地电脑模型；云端执行需要选择已配置的云端模型，请新建云端会话或使用续接流程"})
+		return
+	}
 	var input struct {
 		Content     string   `json:"content"`
 		ArtifactIDs []string `json:"artifactIds,omitempty"`
@@ -259,10 +275,11 @@ func (s *Server) cloudAgentTaskSubmit(w http.ResponseWriter, r *http.Request) {
 func (s *Server) nodeAgentTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(r.PathValue("id"))
 	var input struct {
-		TargetNodeID string   `json:"targetNodeId"`
-		Content      string   `json:"content"`
-		WaitForNode  bool     `json:"waitForNode"`
-		ArtifactIDs  []string `json:"artifactIds,omitempty"`
+		TargetNodeID    string   `json:"targetNodeId"`
+		LocalProviderID string   `json:"localProviderId,omitempty"`
+		Content         string   `json:"content"`
+		WaitForNode     bool     `json:"waitForNode"`
+		ArtifactIDs     []string `json:"artifactIds,omitempty"`
 	}
 	if !decode(w, r, &input) {
 		return
@@ -290,7 +307,7 @@ func (s *Server) nodeAgentTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if existing, lookupErr := s.store.ExecutionTaskByIdempotencyKey(r.Context(), s.workspaceID, key); lookupErr == nil {
 		var saved nodeAgentTaskPayload
-		if existing.NodeID != input.TargetNodeID || json.Unmarshal(existing.Payload, &saved) != nil || saved.Kind != "agent_prompt" || saved.SourceConversationID != conversationID || saved.Content != input.Content || !sameTaskInputArtifacts(saved.Attachments, attachments) {
+		if existing.NodeID != input.TargetNodeID || json.Unmarshal(existing.Payload, &saved) != nil || saved.Kind != "agent_prompt" || saved.SourceConversationID != conversationID || saved.Content != input.Content || !sameTaskInputArtifacts(saved.Attachments, attachments) || saved.LocalProviderID != input.LocalProviderID {
 			write(w, http.StatusConflict, map[string]string{"error": "idempotency key is already bound to a different local task request"})
 			return
 		}
@@ -329,6 +346,28 @@ func (s *Server) nodeAgentTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	} else if !errors.Is(lookupErr, domain.ErrNotFound) {
 		fail(w, lookupErr)
 		return
+	}
+	if input.LocalProviderID != "" {
+		catalog, err := s.store.ExecutionNodeCatalog(r.Context(), input.TargetNodeID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		modelAvailable, permissionAvailable := false, false
+		for _, model := range catalog.Models {
+			if model.ID == input.LocalProviderID {
+				modelAvailable = true
+			}
+		}
+		for _, p := range catalog.PermissionProfiles {
+			if p == conversation.PermissionProfile {
+				permissionAvailable = true
+			}
+		}
+		if !modelAvailable || !permissionAvailable {
+			write(w, 409, map[string]string{"error": "目标电脑不支持所选模型或权限，请刷新设备列表"})
+			return
+		}
 	}
 	rawTaskID := make([]byte, 16)
 	if _, err := rand.Read(rawTaskID); err != nil {
@@ -442,7 +481,7 @@ func (s *Server) nodeAgentTaskSubmit(w http.ResponseWriter, r *http.Request) {
 		fail(w, fmt.Errorf("persist cloud conversation context artifact: %w", err))
 		return
 	}
-	payload, err := json.Marshal(nodeAgentTaskPayload{Kind: "agent_prompt", SourceConversationID: conversationID, Content: input.Content, Title: conversation.Title, SourceContextArtifactID: contextArtifact.ID, SourceContextSHA256: contextArtifact.SHA256, SourceContextByteSize: contextArtifact.ByteSize, SourceProjectDelta: sourceProjectDelta, Attachments: attachments})
+	payload, err := json.Marshal(nodeAgentTaskPayload{LocalProviderID: input.LocalProviderID, PermissionProfile: conversation.PermissionProfile, Kind: "agent_prompt", SourceConversationID: conversationID, Content: input.Content, Title: conversation.Title, SourceContextArtifactID: contextArtifact.ID, SourceContextSHA256: contextArtifact.SHA256, SourceContextByteSize: contextArtifact.ByteSize, SourceProjectDelta: sourceProjectDelta, Attachments: attachments})
 	if err != nil {
 		fail(w, err)
 		return

@@ -283,7 +283,17 @@ func (s *Service) Update(ctx context.Context, userID, id string, in Input) (doma
 }
 
 func (s *Service) List(ctx context.Context, userID string) ([]domain.Provider, error) {
-	return s.store.ListProviders(ctx, userID)
+	records, err := s.store.ListProviders(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]domain.Provider, 0, len(records))
+	for _, p := range records {
+		if p.Kind != storage.DeviceModelReferenceKind {
+			result = append(result, p)
+		}
+	}
+	return result, nil
 }
 
 func (s *Service) Test(ctx context.Context, userID, id string) error {
@@ -728,6 +738,9 @@ func (s *Service) secret(ctx context.Context, userID, id string) (domain.Provide
 	p, cipher, nonce, err := s.store.ProviderSecret(ctx, userID, id)
 	if err != nil {
 		return p, "", err
+	}
+	if p.Kind == storage.DeviceModelReferenceKind {
+		return p, "", errors.New("此会话使用电脑上的模型，请选择对应电脑执行，或在新会话中选择云端模型")
 	}
 	if len(cipher) == 0 {
 		return p, "", nil

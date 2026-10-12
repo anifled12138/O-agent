@@ -1,8 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent, RefObject } from 'react';
-import { Plus, Layers, Settings as SettingsIcon, Activity, ClipboardList, ArrowUp, Square, Pause, Sparkles, KeyRound, AlertCircle, Info, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight, GitFork, Shield, Copy, PanelLeftClose, PanelLeftOpen, Trash2, Laptop, Paperclip } from 'lucide-react';
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent, RefObject, ReactNode } from 'react';
+import { Plus, Layers, Settings as SettingsIcon, Activity, ArrowUp, Square, Pause, Sparkles, KeyRound, AlertCircle, Info, ChevronDown, Check, X, Pencil, Folder, FolderPlus, MoreHorizontal, LogOut, ChevronRight, GitFork, Shield, Copy, PanelLeftClose, PanelLeftOpen, Trash2, Paperclip, SlidersHorizontal } from 'lucide-react';
 import UnifiedPluginCenter from './UnifiedPluginCenter';
 import ObservabilityModal from './ObservabilityModal';
 import { Settings } from './SettingsModal';
@@ -10,8 +10,11 @@ import ProjectModal from './ProjectModal';
 import { copyToClipboard, MarkdownView } from './MarkdownView';
 import WebAppControls from './WebAppControls';
 import AuthenticationGate from './AuthenticationGate';
+import DeviceAccount,{DeviceApproval} from './DeviceAccount';
 import CloudTaskCenter from './CloudTaskCenter';
 import ExecutionNodesModal from './ExecutionNodesModal';
+import ExecutionLocation from './ExecutionLocation';
+import { conversationTaskBarrier, requireExecutionNode, type ExecutionTarget, type RoutedExecutionTask } from './executionRouting';
 import { API_V2, request, UnifiedPlugin, getUnifiedPlugins, updateConversationTitle, generateConversationTitle, deleteConversation as deleteConversationRequest, getDeletedConversations, restoreConversation as restoreConversationRequest, DeletedConversation, Project, getProjects, updateConversationProject, updateConversationPermissionProfile, ConversationPermissionProfile, ApprovalRequest, getConversationApprovals, resolveAgentApproval, ExecutionNode, getExecutionNodes, submitLocalAgentTask, uploadArtifactFile, UserArtifact } from './api';
 
 export type Provider = { id: string; name: string; kind: string; baseUrl: string; model: string; contextWindow: number; supportsVision?: boolean | null; hasApiKey: boolean };
@@ -45,7 +48,9 @@ function localCalendarDayKey(date = new Date()) {
 }
 
 export default function OApp() {
- return <AuthenticationGate>{({onLogout,remoteAuthenticated}) => <WorkspaceApp onLogout={remoteAuthenticated ? onLogout : undefined} />}</AuthenticationGate>;
+ const [deviceLogin,setDeviceLogin]=useState(false);
+ useEffect(()=>{const timer=setTimeout(()=>setDeviceLogin(new URLSearchParams(window.location.search).has('device_login')),0);return()=>clearTimeout(timer)},[]);
+ return <AuthenticationGate>{({onLogout,remoteAuthenticated}) => deviceLogin ? <DeviceApproval/> : <WorkspaceApp onLogout={remoteAuthenticated ? onLogout : undefined} />}</AuthenticationGate>;
 }
 
 function skipConversationDeleteConfirmationToday() {
@@ -286,9 +291,15 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
   const observeTurnRef = useRef<(turnId: string, conversationId: string) => Promise<void>>(async () => {});
 
   const [notice, setNoticeMessage] = useState('');
-  const [executionTarget, setExecutionTarget] = useState<'current' | 'cloud' | 'local'>('current');
+  const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>('current');
+  const [executionTasks, setExecutionTasks] = useState<RoutedExecutionTask[]>([]);
+  const [executionReadError, setExecutionReadError] = useState('正在读取执行状态…');
+  const [routingBusy, setRoutingBusy] = useState(false);
+  const executionMutationRef = useRef(false);
+  const [focusedTaskId, setFocusedTaskId] = useState('');
   const [executionNodes, setExecutionNodes] = useState<ExecutionNode[]>([]);
   const [selectedExecutionNodeId, setSelectedExecutionNodeId] = useState('');
+ const [selectedNodeProviderId,setSelectedNodeProviderId]=useState('');
   const [activeCloudTaskId, setActiveCloudTaskId] = useState('');
   const [cloudTaskConversationId, setCloudTaskConversationId] = useState('');
   const [noticeTone, setNoticeTone] = useState<'info' | 'error'>('info');
@@ -296,22 +307,73 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
     setNoticeMessage(message);
     setNoticeTone(tone);
   }, []);
+  const refreshExecutionState = useCallback(async () => {
+    const [nodes, tasks] = await Promise.all([getExecutionNodes(), request<RoutedExecutionTask[]>('/tasks')]);
+    if (!Array.isArray(tasks) || !Array.isArray(nodes)) throw new Error('执行状态格式无效，请重试。');
+    return { nodes, tasks };
+  }, []);
   useEffect(() => {
-    let active = true;
-    const refreshNodes = async () => {
+    let mounted = true;
+    let timer: number;
+    const refresh = async () => {
       try {
-        const nodes = await getExecutionNodes();
-        if (active) setExecutionNodes(nodes);
-      } catch {
-        if (active) setExecutionNodes([]);
+        const state = await refreshExecutionState();
+        if (mounted) { setExecutionNodes(state.nodes); setExecutionTasks(state.tasks); setExecutionReadError(''); }
+      } catch (cause) {
+        if (mounted) setExecutionReadError(cause instanceof Error ? `执行状态读取失败：${cause.message}` : '执行状态读取失败');
+      } finally {
+        if (mounted) timer = window.setTimeout(() => void refresh(), 5000);
       }
     };
-    void refreshNodes();
-    const interval = window.setInterval(() => void refreshNodes(), 10_000);
-    return () => { active = false; window.clearInterval(interval); };
-  }, []);
-  const onlineExecutionNodes = executionNodes.filter((node) => node.connectivity === 'connected' && !node.revokedAt);
-  const selectedExecutionNode = onlineExecutionNodes.find((node) => node.id === selectedExecutionNodeId) ?? onlineExecutionNodes[0];
+    void refresh();
+    return () => { mounted = false; window.clearTimeout(timer); };
+  }, [refreshExecutionState]);
+  const taskBarrier = conversationTaskBarrier(executionTasks, active?.id);
+  const selectedExecutionNode = executionNodes.find((node) => node.id === selectedExecutionNodeId);
+  const selectedNodeProvider = selectedExecutionNode?.catalog?.models.find((model) => model.id === selectedNodeProviderId) ?? selectedExecutionNode?.catalog?.models[0];
+  function newConversationInput(projectId?: string, permissionProfile?: ConversationPermissionProfile) {
+    const input = { title: '新对话', projectId, permissionProfile };
+    if (executionTarget === 'local') {
+      const node = requireExecutionNode(executionNodes, selectedExecutionNodeId);
+      if (!selectedNodeProvider) throw new Error('请在所选电脑上配置模型，再在模型菜单中选择。');
+      return { ...input, targetNodeId: node.id, localProviderId: selectedNodeProvider.id };
+    }
+    const providerId = selectedProviderId || providers[0]?.id;
+    if (!providerId) throw new Error('请先配置当前执行节点的模型。');
+    return { ...input, providerId };
+  }
+
+  function openTaskHandoff(task = taskBarrier) {
+    setFocusedTaskId(task?.id ?? '');
+    if (mobileViewport) setSidebarCollapsed(true);
+    setCloudTasksOpen(true);
+  }
+  async function changeExecutionTarget(target: ExecutionTarget, nodeId = '') {
+    if (executionMutationRef.current) return;
+    executionMutationRef.current = true;
+    const sourceId = activeRef.current?.id;
+    setRoutingBusy(true);
+    try {
+      const state = await refreshExecutionState();
+      setExecutionNodes(state.nodes); setExecutionTasks(state.tasks); setExecutionReadError('');
+      const conversationId = activeRef.current?.id;
+      if (conversationId !== sourceId) throw new Error('会话已切换，请重新选择执行位置。');
+      const barrier = conversationTaskBarrier(state.tasks, conversationId);
+      if (barrier) {
+        openTaskHandoff(barrier);
+        setNotice('先在任务中心完成安全暂停、会话与产物同步，再打开续接会话切换执行位置。');
+        return;
+      }
+      if (conversationId && runningConvosRef.current[conversationId]) throw new Error('当前会话仍在执行，请等回合结束后切换执行位置。');
+      if (target === 'local') requireExecutionNode(state.nodes, nodeId);
+      setExecutionTarget(target);
+      setSelectedExecutionNodeId(target === 'local' ? nodeId : '');
+      setSelectedNodeProviderId('');
+      setNotice('');
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '执行位置切换失败', 'error');
+    } finally { executionMutationRef.current = false; setRoutingBusy(false); }
+  }
   const [trace, setTrace] = useState<TraceEvent[]>([]);
   const [turns, setTurns] = useState<AgentTurn[]>([]);
   const [queuedInputs, setQueuedInputs] = useState<Record<string, InboxInput[]>>({});
@@ -708,18 +770,14 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
   }, [projects, setNotice]);
 
   async function handleNewInProject(projectId: string) {
-    if (!providers.length) {
+    if (executionTarget !== 'local' && !providers.length) {
       setSettingsOpen(true);
       return;
     }
     try {
       const created = await request<Conversation>('/conversations', {
         method: 'POST',
-        body: JSON.stringify({
-          title: '新对话',
-          providerId: selectedProviderId || providers[0]?.id,
-          projectId,
-        }),
+        body: JSON.stringify(newConversationInput(projectId)),
       });
       setConversations((items) => [created, ...items]);
       await openConversation(created.id);
@@ -747,106 +805,126 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
   }
 
   async function send(content: string, inputArtifacts: UserArtifact[] = []): Promise<boolean> {
-    if (!content.trim()) return false;
-    if (executionTarget !== 'cloud' && active && runningConvosRef.current[active.id]) {
-      if (inputArtifacts.length > 0) {
-        setNotice('附件任务需要创建独立的云端或本地执行任务；请等当前回合结束后再提交附件。', 'error');
+    if (!content.trim() || executionMutationRef.current) return false;
+    executionMutationRef.current = true;
+    const sourceId = activeRef.current?.id;
+    setRoutingBusy(true);
+    try {
+      try {
+        const state = await refreshExecutionState();
+        setExecutionNodes(state.nodes); setExecutionTasks(state.tasks); setExecutionReadError('');
+        if (activeRef.current?.id !== sourceId) throw new Error('会话已切换，消息未发送。');
+        const barrier = conversationTaskBarrier(state.tasks, sourceId);
+        if (barrier) { openTaskHandoff(barrier); throw new Error('会话与产物尚未完成交接，请先打开同步后的续接会话。'); }
+        if (executionTarget === 'local') requireExecutionNode(state.nodes, selectedExecutionNodeId);
+      } catch (cause) {
+        setNotice(cause instanceof Error ? cause.message : '执行状态核验失败，消息未发送', 'error');
         return false;
       }
+      if (executionTarget !== 'cloud' && active && runningConvosRef.current[active.id]) {
+        if (inputArtifacts.length > 0) {
+          setNotice('附件任务需要创建独立的云端或本地执行任务；请等当前回合结束后再提交附件。', 'error');
+          return false;
+        }
+        try {
+          const item = await request<InboxInput>(`${API_V2}/agent/conversations/${encodeURIComponent(active.id)}/inbox`, {
+            method: 'POST',
+            body: JSON.stringify({ content }),
+          });
+          if (item.status === 'queued') {
+            setQueuedInputs((prev) => ({ ...prev, [active.id]: [...(prev[active.id] ?? []), item] }));
+            setNotice('消息已加入队列，当前任务结束后会自动开始。');
+          } else if (item.turnId) {
+            void observeTurn(item.turnId, active.id);
+            void refreshConversation(active.id);
+            setNotice(item.status === 'claimed' ? '消息已开始处理。' : inboxTurnStatusLabel(item.status));
+          } else {
+            setNotice(`消息状态：${item.status}`);
+          }
+          return true;
+        } catch (error) {
+          setNotice(error instanceof Error ? error.message : '加入消息队列失败', 'error');
+          return false;
+        }
+      }
+
+      setNotice('');
       try {
-        const item = await request<InboxInput>(`${API_V2}/agent/conversations/${encodeURIComponent(active.id)}/inbox`, {
+        let target = active;
+        if (!target) {
+          if (executionTarget !== 'local' && !providers.length) {
+            setSettingsOpen(true);
+            return false;
+          }
+          const created = await request<Conversation>('/conversations', {
+            method: 'POST',
+            body: JSON.stringify(newConversationInput()),
+          });
+          target = { ...created, messages: [] };
+          activeIdRef.current = created.id;
+          setConversations((items) => [created, ...items]);
+          setActive(target);
+        }
+        const pending: Message = { id: `pending-${Date.now()}`, role: 'user', content, createdAt: new Date().toISOString() };
+        if (executionTarget !== 'local') setActive({ ...target, messages: [...target.messages, pending] });
+        if (executionTarget === 'cloud') {
+          const key = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          const submitted = await request<{ task: CloudExecutionTask; created: boolean }>(`/conversations/${encodeURIComponent(target.id)}/tasks/cloud`, {
+            method: 'POST',
+            headers: { 'Idempotency-Key': key },
+            body: JSON.stringify({ content, artifactIds: inputArtifacts.map((artifact) => artifact.id) }),
+          });
+          if (submitted.task.status !== 'queued' || !submitted.task.id) throw new Error('云端任务没有读回为已排队状态。');
+          setActiveCloudTaskId(submitted.task.id);
+          setCloudTaskConversationId(target.id);
+          setNotice(`任务 ${submitted.task.id} 已持久进入云端队列。`);
+          void monitorCloudTask(submitted.task.id, target.id);
+          return true;
+        }
+        if (executionTarget === 'local') {
+          const node = requireExecutionNode(await getExecutionNodes(), selectedExecutionNodeId);
+          const nodeProviderId = selectedNodeProviderId || node.catalog?.models[0]?.id;
+          if (!nodeProviderId || !node.catalog?.models.some((model) => model.id === nodeProviderId)) throw new Error('所选电脑未上报此模型，请重新选择电脑模型。');
+          const key = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          const submitted = await submitLocalAgentTask(target.id, node.id, content, key, inputArtifacts.map((artifact) => artifact.id), nodeProviderId);
+          if (submitted.task.status !== 'queued' || submitted.task.nodeId !== node.id || !submitted.task.id) throw new Error('本地任务没有读回为指定设备上的排队状态。');
+          setActiveCloudTaskId(submitted.task.id);
+          setCloudTaskConversationId(target.id);
+          setNotice(`任务已发给 ${node.name}；本地会话和完整记录会归档到云端任务。`);
+          void monitorCloudTask(submitted.task.id, target.id, 'local');
+          return true;
+        }
+        const receipt = await request<TurnReceipt>(`${API_V2}/agent/conversations/${target.id}/turns`, {
           method: 'POST',
           body: JSON.stringify({ content }),
         });
-        if (item.status === 'queued') {
-          setQueuedInputs((prev) => ({ ...prev, [active.id]: [...(prev[active.id] ?? []), item] }));
-          setNotice('消息已加入队列，当前任务结束后会自动开始。');
-        } else if (item.turnId) {
-          void observeTurn(item.turnId, active.id);
-          void refreshConversation(active.id);
-          setNotice(item.status === 'claimed' ? '消息已开始处理。' : inboxTurnStatusLabel(item.status));
+        if (receipt.status === 'queued') {
+          setNotice('运行容量已满，消息已安全加入队列，空闲时会自动开始。');
+          void refreshConversation(target.id);
         } else {
-          setNotice(`消息状态：${item.status}`);
+          if (receipt.turnId) void observeTurn(receipt.turnId, target.id);
+          void refreshConversation(target.id);
         }
         return true;
       } catch (error) {
-        setNotice(error instanceof Error ? error.message : '加入消息队列失败', 'error');
+        if (activeRef.current?.id) await refreshConversation(activeRef.current.id);
+        setNotice(error instanceof Error ? error.message : 'Agent 运行失败', 'error');
         return false;
       }
-    }
-
-    setNotice('');
-    try {
-      let target = active;
-      if (!target) {
-        if (!providers.length) {
-          setSettingsOpen(true);
-          return false;
-        }
-        const created = await request<Conversation>('/conversations', {
-          method: 'POST',
-          body: JSON.stringify({ title: '新对话', providerId: selectedProviderId || providers[0]?.id }),
-        });
-        target = { ...created, messages: [] };
-        activeIdRef.current = created.id;
-        setConversations((items) => [created, ...items]);
-        setActive(target);
-      }
-      const pending: Message = { id: `pending-${Date.now()}`, role: 'user', content, createdAt: new Date().toISOString() };
-      if (executionTarget !== 'local') setActive({ ...target, messages: [...target.messages, pending] });
-      if (executionTarget === 'cloud') {
-        const key = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        const submitted = await request<{ task: CloudExecutionTask; created: boolean }>(`/conversations/${encodeURIComponent(target.id)}/tasks/cloud`, {
-          method: 'POST',
-          headers: { 'Idempotency-Key': key },
-          body: JSON.stringify({ content, artifactIds: inputArtifacts.map((artifact) => artifact.id) }),
-        });
-        if (submitted.task.status !== 'queued' || !submitted.task.id) throw new Error('云端任务没有读回为已排队状态。');
-        setActiveCloudTaskId(submitted.task.id);
-        setCloudTaskConversationId(target.id);
-        setNotice(`任务 ${submitted.task.id} 已持久进入云端队列。`);
-        void monitorCloudTask(submitted.task.id, target.id);
-        return true;
-      }
-      if (executionTarget === 'local') {
-        const node = selectedExecutionNode;
-        if (!node) throw new Error('没有在线的本地执行设备；请先在“执行设备”中登记电脑并启动本地 O 节点代理。');
-        const key = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        const submitted = await submitLocalAgentTask(target.id, node.id, content, key, inputArtifacts.map((artifact) => artifact.id));
-        if (submitted.task.status !== 'queued' || submitted.task.nodeId !== node.id || !submitted.task.id) throw new Error('本地任务没有读回为指定设备上的排队状态。');
-        setActiveCloudTaskId(submitted.task.id);
-        setCloudTaskConversationId(target.id);
-        setNotice(`任务已发给 ${node.name}；本地会话和完整记录会归档到云端任务。`);
-        void monitorCloudTask(submitted.task.id, target.id, 'local');
-        return true;
-      }
-      const receipt = await request<TurnReceipt>(`${API_V2}/agent/conversations/${target.id}/turns`, {
-        method: 'POST',
-        body: JSON.stringify({ content }),
-      });
-      if (receipt.status === 'queued') {
-        setNotice('运行容量已满，消息已安全加入队列，空闲时会自动开始。');
-        void refreshConversation(target.id);
-      } else {
-        if (receipt.turnId) void observeTurn(receipt.turnId, target.id);
-        void refreshConversation(target.id);
-      }
-      return true;
-    } catch (error) {
-      if (activeRef.current?.id) await refreshConversation(activeRef.current.id);
-      setNotice(error instanceof Error ? error.message : 'Agent 运行失败', 'error');
-      return false;
-    }
+    } finally { executionMutationRef.current = false; setRoutingBusy(false); }
   }
 
   async function cancelTurn() {
     if (!active) return;
-    if (activeCloudTaskId && cloudTaskConversationId === active.id) {
+    const taskToCancel = taskBarrier && !['reported_succeeded', 'needs_reconciliation'].includes(taskBarrier.status) ? taskBarrier.id : cloudTaskConversationId === active.id ? activeCloudTaskId : '';
+    if (taskToCancel) {
       try {
-        const receipt = await request<CloudExecutionTask>(`/tasks/${encodeURIComponent(activeCloudTaskId)}/cancel`, { method: 'POST', body: '{}' });
+        const receipt = await request<CloudExecutionTask>(`/tasks/${encodeURIComponent(taskToCancel)}/cancel`, { method: 'POST', body: '{}' });
         if (!receipt.cancelRequested && !['cancelled', 'completed', 'reported_failed', 'needs_reconciliation'].includes(receipt.status)) throw new Error('取消状态未从云端读回。');
-        setNotice(`云端任务状态：${receipt.status}`);
-        setActiveCloudTaskId('');
+        const state = await refreshExecutionState();
+        setExecutionTasks(state.tasks); setExecutionNodes(state.nodes);
+        setNotice(receipt.cancelRequested ? '停止请求已记录，等待执行设备确认。' : `任务状态：${receipt.status}`);
+        if (['cancelled', 'completed', 'reported_failed', 'needs_reconciliation'].includes(receipt.status)) setActiveCloudTaskId('');
         return;
       } catch (error) {
         setNotice(error instanceof Error ? error.message : '无法取消云端任务', 'error');
@@ -888,10 +966,9 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
           return;
         }
         if (task.status === 'reported_succeeded' && destination === 'local') {
-          const result = task.result as { assistantText?: unknown; assistantTextTruncated?: unknown; transcriptArtifact?: { id?: unknown; fileName?: unknown } } | undefined;
-          const assistantText = typeof result?.assistantText === 'string' ? result.assistantText : '';
-          const previewSuffix = result?.assistantTextTruncated === true ? '（回复较长，完整内容请到任务中心下载）' : '';
-          if (activeIdRef.current === conversationId) setNotice(`本地节点已报告执行成功，完整会话已归档到云端任务记录。${assistantText ? ` ${assistantText}` : ''}${previewSuffix}`);
+          if (activeIdRef.current === conversationId) setNotice('本地记录与产物已归档，请从侧边栏打开同步与交接，继承完整会话后继续。');
+          const state = await refreshExecutionState();
+          setExecutionTasks(state.tasks); setExecutionNodes(state.nodes);
           setActiveCloudTaskId((current) => current === taskId ? '' : current);
           return;
         }
@@ -986,7 +1063,7 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
     }
   }
 
-  const isCurrentSending = active ? !!runningConvos[active.id] || (activeCloudTaskId !== '' && cloudTaskConversationId === active.id) : false;
+  const isCurrentSending = active ? !!runningConvos[active.id] || (activeCloudTaskId !== '' && cloudTaskConversationId === active.id) || !!(taskBarrier && !['reported_succeeded', 'needs_reconciliation'].includes(taskBarrier.status)) : false;
   const currentTurn = active ? turns.find((turn) => turn.id === runningConvos[active.id]?.turnId) : undefined;
   const currentTrace = active ? (runningConvos[active.id]?.trace ?? trace) : [];
   const backgroundRunningCount = useMemo(() => {
@@ -1012,10 +1089,12 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
           {sidebarCollapsed ? <PanelLeftOpen size={17} strokeWidth={1.8} aria-hidden="true" /> : <PanelLeftClose size={17} strokeWidth={1.8} aria-hidden="true" />}
         </button>
         <WebAppControls />
+ {!onLogout && <DeviceAccount/>}
  {onLogout && <button type="button" className="sidebar-toggle-button" disabled={logoutBusy} onClick={() => void logout()} title="退出登录" aria-label="退出登录"><LogOut size={17} aria-hidden="true" /></button>}
       </div>
       {mobileViewport && !sidebarCollapsed && <div className="mobile-sidebar-backdrop" onClick={() => setSidebarCollapsed(true)} aria-hidden="true" />}
       <Sidebar
+        executionLocation={<ExecutionLocation target={taskBarrier ? (taskBarrier.payload?.sourceConversationId ? 'local' : 'cloud') : executionTarget} nodeId={taskBarrier?.payload?.sourceConversationId ? taskBarrier.nodeId : selectedExecutionNodeId} nodes={executionNodes} barrier={taskBarrier} error={executionReadError} busy={routingBusy} onChange={(target, nodeId) => void changeExecutionTarget(target, nodeId)} onDevices={() => { if (mobileViewport) setSidebarCollapsed(true); setExecutionNodesOpen(true); }} onTasks={() => openTaskHandoff()} />}
         collapsed={sidebarCollapsed}
         mobileNavigation={mobileViewport}
         onCloseMobile={() => setSidebarCollapsed(true)}
@@ -1260,12 +1339,6 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
             </div>
           )}
           <div className="header-actions">
-            <button type="button" className="icon-button" style={{ minWidth: 44, minHeight: 44 }} aria-label="打开执行设备管理" title="执行设备" onClick={() => setExecutionNodesOpen(true)}>
-              <Laptop size={16} strokeWidth={1.75} aria-hidden="true" />
-            </button>
-            <button type="button" className="icon-button" aria-label="打开云端任务" title="云端任务" onClick={() => setCloudTasksOpen(true)}>
-              <ClipboardList size={16} strokeWidth={1.75} aria-hidden="true" />
-            </button>
             <button type="button" className="icon-button" aria-label="打开工具可观测性" title="工具可观测性" onClick={() => setObservabilityOpen(true)}>
               <Activity size={16} strokeWidth={1.75} aria-hidden="true" />
             </button>
@@ -1319,14 +1392,9 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
                   return true;
                 }
 
-                const providerId = selectedProviderId || providers[0]?.id;
-                if (!providerId) {
-                  setNotice('请先配置模型服务，再为新会话保存权限。', 'error');
-                  return false;
-                }
                 const created = await request<Conversation>('/conversations', {
                   method: 'POST',
-                  body: JSON.stringify({ title: '新对话', providerId, permissionProfile: profile }),
+                  body: JSON.stringify(newConversationInput(undefined, profile)),
                 });
                 if (created.permissionProfile !== profile) {
                   throw new Error('新会话权限读回与所选档位不一致');
@@ -1348,10 +1416,11 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
             onNotice={setNotice}
             onSend={send}
             executionTarget={executionTarget}
-            onExecutionTargetChange={setExecutionTarget}
-            executionNodes={onlineExecutionNodes}
-            selectedExecutionNodeId={selectedExecutionNode?.id ?? ''}
-            onExecutionNodeChange={setSelectedExecutionNodeId}
+            routingBusy={routingBusy}
+            executionNodes={executionNodes}
+            selectedExecutionNodeId={selectedExecutionNodeId}
+            selectedNodeProviderId={selectedNodeProvider?.id??''}
+            onNodeProviderChange={setSelectedNodeProviderId}
             onCancel={cancelTurn}
             onRetry={retryTurn}
             onReconcileTurn={reconcileTurn}
@@ -1382,7 +1451,7 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
       )}
 
       {observabilityOpen && <ObservabilityModal onClose={() => setObservabilityOpen(false)} />}
-      {cloudTasksOpen && <CloudTaskCenter onClose={() => setCloudTasksOpen(false)} onOpenConversation={(id) => {
+      {cloudTasksOpen && <CloudTaskCenter focusedTaskId={focusedTaskId} onClose={() => setCloudTasksOpen(false)} onOpenConversation={(id) => {
         setCloudTasksOpen(false);
         void (async () => {
           try {
@@ -1390,6 +1459,14 @@ function WorkspaceApp({onLogout}: {onLogout?: () => Promise<void>}) {
             setConversations(latest);
             if (mobileViewport) setSidebarCollapsed(true);
             await openConversation(id);
+            const state = await refreshExecutionState();
+            setExecutionTasks(state.tasks); setExecutionNodes(state.nodes);
+            setExecutionTarget('cloud'); setSelectedExecutionNodeId('');
+            const continuedTask = conversationTaskBarrier(state.tasks, id);
+            if (continuedTask && !['reported_succeeded', 'needs_reconciliation'].includes(continuedTask.status)) {
+              setActiveCloudTaskId(continuedTask.id); setCloudTaskConversationId(id);
+              void monitorCloudTask(continuedTask.id, id);
+            }
           } catch (cause) {
             setNotice(cause instanceof Error ? `打开云端续接会话失败：${cause.message}` : '打开云端续接会话失败', 'error');
           }
@@ -1545,6 +1622,7 @@ function deduplicateNewChats(list: Conversation[]): Conversation[] {
 }
 
 function Sidebar({
+  executionLocation,
   collapsed,
   mobileNavigation,
   onCloseMobile,
@@ -1565,6 +1643,7 @@ function Sidebar({
   hasRecentlyDeleted,
   onOpenRecentlyDeleted,
 }: {
+  executionLocation: ReactNode;
   collapsed: boolean;
   mobileNavigation: boolean;
   onCloseMobile: () => void;
@@ -1615,6 +1694,7 @@ function Sidebar({
   return (
     <aside className="sidebar" id="app-sidebar" inert={collapsed} aria-hidden={collapsed} role={mobileNavigation ? 'dialog' : undefined} aria-modal={mobileNavigation || undefined} aria-label={mobileNavigation ? '会话与设置' : undefined} tabIndex={mobileNavigation ? -1 : undefined}>
       {mobileNavigation && <button type="button" className="mobile-sidebar-close" onClick={onCloseMobile} aria-label="关闭侧边栏"><X size={20} aria-hidden="true" /></button>}
+      {executionLocation}
       <div className="brand">
         <div className="brand-mark">
           <Sparkles size={13} strokeWidth={2.2} />
@@ -2194,10 +2274,11 @@ function Chat({
   queuedInputs,
   onSend,
   executionTarget,
-  onExecutionTargetChange,
+  routingBusy,
   executionNodes,
   selectedExecutionNodeId,
-  onExecutionNodeChange,
+  selectedNodeProviderId,
+  onNodeProviderChange,
   onCancel,
   onRetry,
   onReconcileTurn,
@@ -2226,10 +2307,11 @@ function Chat({
   queuedInputs: InboxInput[];
   onSend: (content: string, inputArtifacts?: UserArtifact[]) => Promise<boolean>;
   executionTarget: 'current' | 'cloud' | 'local';
-  onExecutionTargetChange: (target: 'current' | 'cloud' | 'local') => void;
+  routingBusy: boolean;
   executionNodes: ExecutionNode[];
   selectedExecutionNodeId: string;
-  onExecutionNodeChange: (nodeId: string) => void;
+  selectedNodeProviderId: string;
+  onNodeProviderChange: (id: string) => void;
   onCancel: () => void;
   onRetry: (turnId: string, editedContent?: string) => Promise<boolean>;
   onReconcileTurn: (turnId: string, outcome: 'no_effect_applied' | 'effect_applied' | 'still_unknown', note: string) => Promise<boolean>;
@@ -2237,6 +2319,17 @@ function Chat({
   onConfigure: () => void;
   onOpenPlugins: (type?: 'all' | 'mcp' | 'skill' | 'core' | 'release') => void;
 }) {
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!moreMenuOpen) return;
+    function close(event: MouseEvent | KeyboardEvent) {
+      if (event instanceof KeyboardEvent) { if (event.key === 'Escape') { setMoreMenuOpen(false); moreMenuRef.current?.querySelector('button')?.focus(); } }
+      else if (!moreMenuRef.current?.contains(event.target as Node)) setMoreMenuOpen(false);
+    }
+    document.addEventListener('mousedown', close); document.addEventListener('keydown', close);
+    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', close); };
+  }, [moreMenuOpen]);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState('');
   const [editingMessageContent, setEditingMessageContent] = useState('');
@@ -2282,8 +2375,9 @@ function Chat({
       }
     }
     if (modelMenuOpen) {
-      document.addEventListener('mousedown', handleClickOutside);
-      return () => document.removeEventListener('mousedown', handleClickOutside);
+      const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') { setModelMenuOpen(false); modelMenuRef.current?.querySelector('button')?.focus(); } };
+      document.addEventListener('mousedown', handleClickOutside); document.addEventListener('keydown', escape);
+      return () => { document.removeEventListener('mousedown', handleClickOutside); document.removeEventListener('keydown', escape); };
     }
   }, [modelMenuOpen]);
 
@@ -2306,7 +2400,11 @@ function Chat({
     }
   }, [permissionMenuOpen]);
 
+  const selectableProviders = useMemo<Array<Pick<Provider, 'id' | 'name' | 'model' | 'supportsVision'>>>(() => executionTarget === 'local'
+    ? (executionNodes.find((node) => node.id === selectedExecutionNodeId)?.catalog?.models ?? []).map((model) => ({ ...model }))
+    : providers, [executionTarget, executionNodes, selectedExecutionNodeId, providers]);
   const currentProvider = useMemo(() => {
+    if (executionTarget === 'local') return selectableProviders.find((item) => item.id === selectedNodeProviderId) ?? selectableProviders[0] ?? null;
     if (active?.providerId) {
       const p = providers.find((item) => item.id === active.providerId);
       if (p) return p;
@@ -2316,7 +2414,7 @@ function Chat({
       if (p) return p;
     }
     return providers[0] || null;
-  }, [active, selectedProviderId, providers]);
+  }, [active, selectedProviderId, providers, executionTarget, selectableProviders, selectedNodeProviderId]);
   const sessionId = active?.id || '__new__';
   const pendingApprovalEvents = liveTrace.filter((event) => event.kind.startsWith('approval.') || event.kind === 'tool.authorization_denied');
   const approvalRefreshKey = useMemo(() => [...new Map([...trace, ...liveTrace]
@@ -2543,7 +2641,7 @@ function Chat({
   const [submitting, setSubmitting] = useState(false);
   const submit = async () => {
     const textValue = draft.trim();
-    if (!submitting && (textValue || attachments.length > 0 || taskFiles.length > 0)) {
+    if (!submitting && !routingBusy && !permissionSaving && (textValue || attachments.length > 0 || taskFiles.length > 0)) {
       let fullContent = textValue;
       const taskInputMode = executionTarget !== 'current';
       if (attachments.length > 0 && !taskInputMode) {
@@ -2631,14 +2729,14 @@ function Chat({
               <h2 className="empty-title">今天想探讨什么任务？</h2>
               <p className="empty-subtitle">输入目标与约束条件，本地 Agent 将自主调用工具与模型协同推进。</p>
             </div>
-            {!providers.length ? (
+            {!selectableProviders.length ? (
               <button type="button" className="setup-card" onClick={onConfigure}>
                 <div className="setup-card-icon">
                   <KeyRound size={16} strokeWidth={2} />
                 </div>
                 <div className="setup-card-body">
-                  <b>连接模型服务</b>
-                  <small>配置 One-API、Claude 或 OpenAI 兼容接口，即可开启完整能力</small>
+                  <b>{executionTarget === 'local' ? '电脑尚未提供模型' : '连接模型服务'}</b>
+                  <small>{executionTarget === 'local' ? '请在所选电脑的 O 中配置模型服务，并保持电脑在线。' : '配置 One-API、Claude 或 OpenAI 兼容接口，即可开启完整能力'}</small>
                 </div>
                 <span className="setup-card-arrow">前往配置 →</span>
               </button>
@@ -2831,40 +2929,35 @@ function Chat({
             }
           }}
           placeholder={
-            !providers.length
-              ? '请先配置模型服务…'
+            !selectableProviders.length
+              ? (executionTarget === 'local' ? '请先选择有模型的在线电脑…' : '请先配置模型服务…')
               : sending
               ? '可以先输入下一条消息，当前任务完成后发送…'
               : '描述目标、约束，或者下一步行动…'
           }
-          disabled={!providers.length || permissionSaving}
+          disabled={!selectableProviders.length || permissionSaving}
           aria-label="输入消息内容"
         />
         <div className="composer-row">
           <button type="button" className="composer-icon-button composer-attach-button" onClick={() => taskFileInputRef.current?.click()} disabled={executionTarget === 'current' || submitting || sending} title={executionTarget === 'current' ? '附件任务请选择云端或本地执行' : '附加文件到云端或本地任务'} aria-label="附加任务文件"><Paperclip size={14} /></button>
+          <div className="composer-more-anchor" ref={moreMenuRef}>
+            <button type="button" className="composer-icon-button" aria-label="附件与插件" aria-haspopup="dialog" aria-expanded={moreMenuOpen} onClick={() => { setPermissionMenuConversationId(''); setModelMenuOpen(false); setMoreMenuOpen(!moreMenuOpen); }}><Plus size={22} aria-hidden="true" /></button>
+            {moreMenuOpen && <div className="composer-more-menu" role="dialog" aria-label="附件与插件">
+              <button type="button" disabled={executionTarget === 'current' || submitting || sending || routingBusy} onClick={() => { setMoreMenuOpen(false); taskFileInputRef.current?.click(); }}><Paperclip size={18} aria-hidden="true" /><span>添加任务文件</span></button>
+              {executionTarget === 'current' && <p>在侧边栏选择云端或电脑后可附加文件</p>}
+              <button type="button" onClick={() => { setMoreMenuOpen(false); onOpenPlugins('all'); }}><Layers size={18} aria-hidden="true" /><span>插件与能力</span><small>{activeExtensionCount}</small></button>
+            </div>}
+          </div>
           <div className="composer-capability-bar" role="toolbar" aria-label="扩展能力入口">
-            <label className="capability-btn" title="选择任务执行位置">
-              <span>执行于</span>
-              <select aria-label="任务执行位置" value={executionTarget} disabled={sending} onChange={(event) => onExecutionTargetChange(event.target.value as 'current' | 'cloud' | 'local')}>
-                <option value="current">当前服务节点</option>
-                <option value="cloud">云端任务队列</option>
-                <option value="local" disabled={executionNodes.length === 0}>本地电脑任务{executionNodes.length === 0 ? '（暂无在线设备）' : ''}</option>
-              </select>
-            </label>
-            {executionTarget === 'local' && <label className="capability-btn" title="选择接收此任务的在线本地电脑">
-              <span>设备</span>
-              <select aria-label="本地任务执行设备" value={selectedExecutionNodeId} disabled={sending || executionNodes.length === 0} onChange={(event) => onExecutionNodeChange(event.target.value)}>
-                {executionNodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {node.platform}</option>)}
-              </select>
-            </label>}
             <button
               type="button"
-              className="capability-btn"
+              className="capability-btn composer-plugin-trigger"
               onClick={() => onOpenPlugins('all')}
               title="查看和管理插件、Skill 与 MCP 服务"
               aria-label={`Plugin，已启用 ${activeExtensionCount} 个能力`}
             >
-              <span>Plugin</span>
+              <Layers size={18} className="composer-mobile-icon" aria-hidden="true" />
+              <span className="composer-control-label">插件</span>
               <span className="cap-badge">{activeExtensionCount}</span>
             </button>
             <div className="permission-profile-anchor" ref={permissionMenuRef}>
@@ -2875,8 +2968,8 @@ function Chat({
                 aria-label={`会话权限模式：${permissionProfileLabel(currentPermissionProfile)}`}
                 aria-haspopup="dialog"
                 aria-expanded={permissionMenuOpen}
-                disabled={permissionSaving}
-                onClick={() => setPermissionMenuConversationId(permissionMenuOpen ? '' : permissionMenuKey)}
+                disabled={permissionSaving || routingBusy || submitting}
+                onClick={() => { setMoreMenuOpen(false); setModelMenuOpen(false); setPermissionMenuConversationId(permissionMenuOpen ? '' : permissionMenuKey); }}
               >
                 <Shield size={13} strokeWidth={1.8} aria-hidden="true" />
                 <span className="permission-profile-current">{permissionProfileLabel(currentPermissionProfile)}</span>
@@ -2932,10 +3025,14 @@ function Chat({
               <button
                 type="button"
                 className={`model-select-pill ${modelMenuOpen ? 'active' : ''}`}
-                onClick={() => setModelMenuOpen((v) => !v)}
+                disabled={routingBusy || submitting}
+                onClick={() => { setMoreMenuOpen(false); setPermissionMenuConversationId(''); setModelMenuOpen((v) => !v); }}
                 title={currentProvider ? `当前模型: ${currentProvider.model || currentProvider.name}` : '未配置模型服务'}
-                aria-label="选择模型"
+                aria-label={currentProvider ? `选择模型，当前 ${currentProvider.model || currentProvider.name}` : '选择模型'}
+                aria-expanded={modelMenuOpen}
+                aria-haspopup="dialog"
               >
+                <SlidersHorizontal size={20} strokeWidth={1.8} className="composer-mobile-icon" aria-hidden="true" />
                 <span className="model-name-label">
                   {currentProvider ? (currentProvider.model || currentProvider.name) : '选择模型'}
                 </span>
@@ -2943,7 +3040,7 @@ function Chat({
               </button>
 
               {modelMenuOpen && (
-                <div className="model-dropdown-menu">
+                <div className="model-dropdown-menu" role="dialog" aria-label="选择模型">
                   <div className="model-dropdown-header">
                     <span>切换模型</span>
                     <button
@@ -2958,9 +3055,9 @@ function Chat({
                     </button>
                   </div>
                   <div className="model-dropdown-list">
-                    {providers.length === 0 ? (
+                    {selectableProviders.length === 0 ? (
                       <div className="model-dropdown-empty">
-                        <p>尚未启用任何模型服务</p>
+                        <p>{executionTarget === 'local' ? '电脑尚未上报可用模型，请在该电脑上配置模型服务。' : '尚未启用任何模型服务'}</p>
                         <button
                           type="button"
                           onClick={() => {
@@ -2972,15 +3069,17 @@ function Chat({
                         </button>
                       </div>
                     ) : (
-                      providers.map((p) => {
+                      selectableProviders.map((p) => {
                         const isSelected = p.id === currentProvider?.id;
                         return (
                           <button
                             type="button"
                             key={p.id}
                             className={`model-option-item ${isSelected ? 'selected' : ''}`}
+                            aria-pressed={isSelected}
                             onClick={() => {
-                              onSelectProvider(p.id);
+                              if (executionTarget === 'local') onNodeProviderChange(p.id);
+                              else onSelectProvider(p.id);
                               setModelMenuOpen(false);
                             }}
                           >
@@ -3008,7 +3107,7 @@ function Chat({
                 type="button"
                 className="composer-icon-button send-btn"
                 onClick={() => void submit()}
-                disabled={(!draft.trim() && attachments.length === 0 && taskFiles.length === 0) || !providers.length || submitting || permissionSaving}
+                disabled={(!draft.trim() && attachments.length === 0 && taskFiles.length === 0) || !selectableProviders.length || submitting || permissionSaving || routingBusy}
                 title={active?.executionPaused ? '会话已暂停；发送新消息后继续' : '发送'}
                 aria-label={active?.executionPaused ? '发送消息并继续已暂停的会话' : '发送'}
               >

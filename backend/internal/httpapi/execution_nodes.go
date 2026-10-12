@@ -258,6 +258,7 @@ func (s *Server) persistExecutionNodeHandoffCheckpoint(w http.ResponseWriter, r 
 }
 
 type executionNodeResponse struct {
+	Catalog      *storage.NodeCatalog           `json:"catalog,omitempty"`
 	ID           string                         `json:"id"`
 	Name         string                         `json:"name"`
 	Platform     string                         `json:"platform"`
@@ -289,7 +290,14 @@ func (s *Server) executionNodeList(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	result := make([]executionNodeResponse, 0, len(nodes))
 	for _, node := range nodes {
-		result = append(result, nodeResponse(node, now))
+		response := nodeResponse(node, now)
+		catalog, err := s.store.ExecutionNodeCatalog(r.Context(), node.ID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		response.Catalog = &catalog
+		result = append(result, response)
 	}
 	write(w, http.StatusOK, result)
 }
@@ -350,6 +358,7 @@ func (s *Server) executionNodeHeartbeat(w http.ResponseWriter, r *http.Request) 
 		Platform     string                          `json:"platform"`
 		Capabilities []string                        `json:"capabilities"`
 		Resources    *storage.ExecutionNodeResources `json:"resources,omitempty"`
+		Catalog      *storage.NodeCatalog            `json:"catalog,omitempty"`
 	}
 	if !decode(w, r, &input) {
 		return
@@ -364,7 +373,7 @@ func (s *Server) executionNodeHeartbeat(w http.ResponseWriter, r *http.Request) 
 	if input.Resources != nil {
 		resources = *input.Resources
 	}
-	node, err := s.store.HeartbeatExecutionNodeWithResources(r.Context(), hashToken(provided), platform, capabilities, resources, time.Now().UTC())
+	node, err := s.store.HeartbeatExecutionNodeWithCatalog(r.Context(), hashToken(provided), platform, capabilities, resources, input.Catalog, time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, domain.ErrUnauthorized) {
 			write(w, http.StatusUnauthorized, map[string]string{"error": "node credential was revoked during heartbeat"})
@@ -386,7 +395,16 @@ func (s *Server) executionNodeHeartbeat(w http.ResponseWriter, r *http.Request) 
 		write(w, http.StatusConflict, map[string]string{"error": "heartbeat did not read back as current node state"})
 		return
 	}
-	write(w, http.StatusOK, nodeResponse(readBack, time.Now().UTC()))
+	response := nodeResponse(readBack, time.Now().UTC())
+	if input.Catalog != nil {
+		catalog, err := s.store.ExecutionNodeCatalog(r.Context(), readBack.ID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		response.Catalog = &catalog
+	}
+	write(w, http.StatusOK, response)
 }
 
 func (s *Server) executionNodeRevoke(w http.ResponseWriter, r *http.Request) {

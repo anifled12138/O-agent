@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('oDesktop', Object.freeze({
   apiOrigin,
   platform: process.platform,
   version: process.versions.electron,
+  openExternal: (url) => ipcRenderer.invoke('o-open-account-login', url),
   copyText: (text) => ipcRenderer.invoke('o-clipboard-write', text),
   selectDirectory: (options) => ipcRenderer.invoke('o-select-directory', options),
 }));

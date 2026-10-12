@@ -7,6 +7,14 @@ The user starts `O.exe`; the Electron Main process owns the UI and a private Go
 Host process for the entire application lifetime. A development Web UI remains
 available, but it is no longer the delivery boundary.
 
+The packaged renderer uses exactly `oapp://app`. The backend accepts that
+origin only for the local execution role bound to loopback, without requiring
+public HTTPS or an authentication bootstrap token. Public Web and cloud hosts
+retain their HTTPS and authentication requirements; other custom origins are
+rejected. The Windows package smoke uses this real renderer origin for API
+requests and verifies remote polling and durable conversation read-back after
+restart.
+
 ## Process topology
 
 ```text
@@ -96,10 +104,29 @@ upgrading. Version 0.2.1 advances the installer version from previous 0.2.0
 builds. The application data directory remains `%APPDATA%\O\data`; upgrading
 program files must not replace that directory.
 
-Remote control still requires registering this Windows computer on the cloud
-Web interface and supplying its one-time node credential through the startup
-environment, together with `O_NODE_CONTROL_URL` (the public HTTPS origin).
-Restart O after changing the startup environment. If there are multiple local
-model providers, `O_NODE_PROVIDER_ID` selects the local provider used by remote
-tasks. The cloud device list must report a live heartbeat before the computer
-is treated as connected. Installing the updated program alone does not pair it.
+Local sign-in is optional. Open **账户与远程连接**, enter your self-hosted
+server's HTTPS origin and a computer name, and sign in to that server in the
+system browser. Confirm the displayed computer. The local client never needs
+the account password: it exchanges a private device code for an encrypted,
+revocable node credential and persists it before starting the remote worker.
+The computer appears automatically in that account's device list. Only a
+verified heartbeat and model/permission catalog read-back count as connected.
+Restarting O restores the same device identity without adding another computer.
+
+Remote Web can select that computer's actual model and permissions; selecting a
+local computer does not require configuring a model on the cloud server. Cloud
+conversation model references contain routing metadata, not API keys or a fake
+cloud provider. A model removed locally is rejected before a new task is queued.
+Cloud execution still requires a real model configured on the cloud server.
+
+Logout stops remote work before reporting a disconnected state. If the server
+is unreachable, credential revocation remains encrypted on disk and retries
+after connectivity returns; the UI explicitly reports the pending revocation.
+The server cannot be declared revoked until its acknowledgement is verified.
+Local conversations and models remain usable without an account or a server.
+
+Existing manual `O_NODE_CONTROL_URL` / node-credential startup configuration is
+retained for legacy clients under advanced pairing. It is not needed for normal
+account login and cannot run a second account worker alongside the legacy worker.
+Both the local client and cloud backend must include this feature; updating
+only the Windows program cannot add the cloud authorization endpoints.

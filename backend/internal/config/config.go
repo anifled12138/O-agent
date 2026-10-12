@@ -217,10 +217,12 @@ func (c Config) Validate() error {
 		return fmt.Errorf("cloud task workspace quota settings require O_EXECUTION_ROLE=cloud")
 	}
 	frontendOrigin, err := url.Parse(c.FrontendOrigin)
-	if err != nil || !frontendOrigin.IsAbs() || (frontendOrigin.Scheme != "https" && frontendOrigin.Scheme != "http") || frontendOrigin.Hostname() == "" || frontendOrigin.User != nil || frontendOrigin.RawQuery != "" || frontendOrigin.Fragment != "" || (frontendOrigin.Path != "" && frontendOrigin.Path != "/") {
-		return fmt.Errorf("O_FRONTEND_ORIGIN must be an HTTP(S) origin without credentials, query, fragment, or path")
+	// The packaged Electron origin is valid only for a loopback local Host.
+	desktopOrigin := c.FrontendOrigin == "oapp://app" && c.ExecutionRole == "local" && isLoopbackBind(c.Addr)
+	if err != nil || !frontendOrigin.IsAbs() || (!desktopOrigin && frontendOrigin.Scheme != "https" && frontendOrigin.Scheme != "http") || frontendOrigin.Hostname() == "" || frontendOrigin.User != nil || frontendOrigin.RawQuery != "" || frontendOrigin.Fragment != "" || (frontendOrigin.Path != "" && frontendOrigin.Path != "/") {
+		return fmt.Errorf("O_FRONTEND_ORIGIN must be an HTTP(S) origin without credentials, query, fragment, or path, or oapp://app for a loopback local desktop Host")
 	}
-	publicFrontend := !isLoopbackHost(frontendOrigin.Hostname())
+	publicFrontend := !desktopOrigin && !isLoopbackHost(frontendOrigin.Hostname())
 	if c.ExecutionRole == "cloud" && frontendOrigin.Scheme != "https" {
 		return fmt.Errorf("O_FRONTEND_ORIGIN must use HTTPS when O_EXECUTION_ROLE=cloud")
 	}

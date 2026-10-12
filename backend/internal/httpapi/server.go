@@ -24,6 +24,7 @@ import (
 	"axiom.local/agent/internal/artifactstore"
 	"axiom.local/agent/internal/bootstrap"
 	"axiom.local/agent/internal/core"
+	"axiom.local/agent/internal/deviceaccount"
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/evalharness"
 	"axiom.local/agent/internal/evolution"
@@ -33,34 +34,38 @@ import (
 	"axiom.local/agent/internal/plugins"
 	"axiom.local/agent/internal/projectpolicy"
 	"axiom.local/agent/internal/provider"
+	"axiom.local/agent/internal/secure"
 	"axiom.local/agent/internal/storage"
 	"axiom.local/agent/internal/websearch"
 )
 
 type Server struct {
-	workspaceID           string
-	providers             *provider.Service
-	agent                 *agent.Service
-	evolution             *evolution.Service
-	evals                 *evalharness.Service
-	bootstrap             *bootstrap.Service
-	forge                 *pluginforge.Service
-	store                 *storage.Store
-	artifacts             *artifactstore.Service
-	plugins               *core.Manager
-	webSearch             *websearch.Service
-	gitCredentials        *gitcredential.Service
-	frontendOrigin        string
-	authBootstrapToken    string
-	authOwnerEmail        string
-	authMailer            VerificationMailer
-	authHumanVerifier     HumanVerifier
-	authTurnstileSiteKey  string
-	projectDeltas         projectDeltaSnapshotter
-	projectPublicationMu  sync.Mutex
-	projectPublicationOps map[string]struct{}
-	nodeWakeMu            sync.Mutex
-	nodeWakeSubs          map[string]map[*nodeWakeSubscription]struct{}
+	deviceVault               *secure.Vault
+	deviceAccount             *deviceaccount.Service
+	deviceAccountStartupError error
+	workspaceID               string
+	providers                 *provider.Service
+	agent                     *agent.Service
+	evolution                 *evolution.Service
+	evals                     *evalharness.Service
+	bootstrap                 *bootstrap.Service
+	forge                     *pluginforge.Service
+	store                     *storage.Store
+	artifacts                 *artifactstore.Service
+	plugins                   *core.Manager
+	webSearch                 *websearch.Service
+	gitCredentials            *gitcredential.Service
+	frontendOrigin            string
+	authBootstrapToken        string
+	authOwnerEmail            string
+	authMailer                VerificationMailer
+	authHumanVerifier         HumanVerifier
+	authTurnstileSiteKey      string
+	projectDeltas             projectDeltaSnapshotter
+	projectPublicationMu      sync.Mutex
+	projectPublicationOps     map[string]struct{}
+	nodeWakeMu                sync.Mutex
+	nodeWakeSubs              map[string]map[*nodeWakeSubscription]struct{}
 }
 
 func (s *Server) beginProjectPublicationOperation(id string) bool {
@@ -100,6 +105,8 @@ func New(workspaceID string, providerService *provider.Service, agentService *ag
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.authRoutes(mux)
+	s.deviceAuthorizationRoutes(mux)
+	s.deviceAccountRoutes(mux)
 	s.executionNodeRoutes(mux)
 	s.artifactRoutes(mux)
 	mux.HandleFunc("GET /api/v1/health", s.health)
@@ -850,11 +857,25 @@ func (s *Server) conversationCreate(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Title             string                   `json:"title"`
 		ProviderID        string                   `json:"providerId"`
+		TargetNodeID      string                   `json:"targetNodeId,omitempty"`
+		LocalProviderID   string                   `json:"localProviderId,omitempty"`
 		ProjectID         string                   `json:"projectId"`
 		PermissionProfile domain.PermissionProfile `json:"permissionProfile"`
 	}
 	if !decode(w, r, &in) {
 		return
+	}
+	if in.TargetNodeID != "" || in.LocalProviderID != "" {
+		if in.TargetNodeID == "" || in.LocalProviderID == "" {
+			fail(w, domain.ErrInvalid)
+			return
+		}
+		reference, err := s.store.EnsureDeviceModelReference(r.Context(), s.workspaceID, in.TargetNodeID, in.LocalProviderID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		in.ProviderID = reference.ID
 	}
 	c, err := s.agent.CreateWithProjectAndPermissionProfile(r.Context(), s.workspaceID, in.Title, in.ProviderID, in.ProjectID, in.PermissionProfile)
 	if err != nil {

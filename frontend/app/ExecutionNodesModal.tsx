@@ -120,7 +120,7 @@ export default function ExecutionNodesModal({ onClose }: { onClose: () => void }
 
       <div role="note" style={{ display: 'flex', gap: 9, alignItems: 'flex-start', border: '1px solid #d9a441', borderRadius: 10, padding: 11, marginTop: 13, fontSize: 13 }}>
         <ShieldAlert size={16} aria-hidden="true" style={{ flex: '0 0 auto', marginTop: 1 }} />
-        <span>配对后，在那台电脑启动本地 O 节点代理即可领取任务。提交本地任务时会把当前云端会话历史作为上下文快照传给所选电脑；本地创建独立会话并归档完整消息、Agent turn 与执行 trace。项目工作区和运行中检查点仍需分别同步。</span>
+        <span>在电脑上的 O 中打开“账户与远程连接”，登录此服务器的同一账户。电脑保持 O 运行时会自动出现并接收任务。提交本地任务时会把当前云端会话历史作为上下文快照传给所选电脑；本地创建独立会话并归档完整消息、Agent turn 与执行 trace。项目工作区和运行中检查点仍需分别同步。</span>
       </div>
 
       {error && <p role="alert" style={{ display: 'flex', gap: 7, color: '#a22828', fontSize: 13 }}><AlertCircle size={15} aria-hidden="true" />{error}</p>}
@@ -134,11 +134,11 @@ export default function ExecutionNodesModal({ onClose }: { onClose: () => void }
         {copyMessage && <p role="status" style={{ fontSize: 12, margin: '6px 0 0' }}>{copyMessage}</p>}
       </div>}
 
-      <form onSubmit={(event) => void pair(event)} style={{ display: 'flex', alignItems: 'end', flexWrap: 'wrap', gap: 8, padding: '14px 0', borderBottom: '1px solid var(--border, #deddd5)' }}>
+      <details><summary>高级：手动连接旧版本节点</summary><form onSubmit={(event) => void pair(event)} style={{ display: 'flex', alignItems: 'end', flexWrap: 'wrap', gap: 8, padding: '14px 0', borderBottom: '1px solid var(--border, #deddd5)' }}>
         <label style={{ display: 'grid', gap: 4, flex: '1 1 180px', fontSize: 12 }}>设备名称<input className="settings-input" value={name} onChange={(event) => setName(event.target.value)} required maxLength={100} placeholder="例如：书房 Linux" /></label>
         <label style={{ display: 'grid', gap: 4, flex: '0 1 150px', fontSize: 12 }}>操作系统<select className="settings-input" value={platform} onChange={(event) => setPlatform(event.target.value)}><option value="linux">Linux</option><option value="windows">Windows</option><option value="darwin">macOS</option></select></label>
         <button type="submit" className="upc-btn-primary" style={{ minHeight: 44 }} disabled={busy || !name.trim()}><Laptop size={14} /><span>{busy ? '处理中…' : '登记电脑'}</span></button>
-      </form>
+      </form></details>
 
       <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
         {nodes.length === 0 ? <li style={{ color: 'var(--muted, #77776e)', padding: '20px 4px', fontSize: 13 }}>云端还没有登记设备。</li> : nodes.map((node) => <li key={node.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 2px', borderBottom: '1px solid var(--border, #deddd5)' }}>

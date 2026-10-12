@@ -69,23 +69,38 @@ func (e *NodeTaskOutcomeError) Error() string {
 func (e *NodeTaskOutcomeError) Unwrap() error { return e.Err }
 
 type NodeWorker struct {
-	client         *nodeAPIClient
-	executor       NodeTaskExecutor
-	platform       string
-	capabilities   []string
-	heartbeatEvery time.Duration
-	pulseEvery     time.Duration
-	pollEvery      time.Duration
-	concurrency    int
-	resourceMu     sync.Mutex
-	resourceAt     time.Time
-	resources      storage.ExecutionNodeResources
-	wakeMu         sync.Mutex
-	wakeEvent      chan struct{}
-	wakeOnline     atomic.Bool
-	activeTasks    atomic.Int32
-	resourceReader func() (storage.ExecutionNodeResources, error)
-	outbox         *nodeTaskOutbox
+	client             *nodeAPIClient
+	executor           NodeTaskExecutor
+	platform           string
+	capabilities       []string
+	heartbeatEvery     time.Duration
+	pulseEvery         time.Duration
+	pollEvery          time.Duration
+	concurrency        int
+	resourceMu         sync.Mutex
+	resourceAt         time.Time
+	resources          storage.ExecutionNodeResources
+	wakeMu             sync.Mutex
+	wakeEvent          chan struct{}
+	wakeOnline         atomic.Bool
+	activeTasks        atomic.Int32
+	resourceReader     func() (storage.ExecutionNodeResources, error)
+	outbox             *nodeTaskOutbox
+	catalogReader      func(context.Context) (storage.NodeCatalog, error)
+	connectionObserver func()
+}
+
+// SetAccountReporting is configured before Run. No credentials or API endpoints are advertised.
+func (w *NodeWorker) SetAccountReporting(nodeID string, catalog func(context.Context) (storage.NodeCatalog, error), observed func()) {
+	w.client.expectedNodeID = nodeID
+	w.catalogReader = catalog
+	w.connectionObserver = observed
+}
+
+// IsNodeCredentialRejected distinguishes revoked credentials from transient failures.
+func IsNodeCredentialRejected(err error) bool {
+	var e *nodeControlHTTPError
+	return errors.Is(err, domain.ErrUnauthorized) || errors.As(err, &e) && (e.StatusCode == 401 || e.StatusCode == 403)
 }
 
 // SetOutboxDirectory enables crash-safe local result persistence. The outbox
@@ -103,9 +118,10 @@ func (w *NodeWorker) SetOutboxDirectory(path string) error {
 }
 
 type nodeAPIClient struct {
-	baseURL    string
-	credential string
-	http       *http.Client
+	expectedNodeID string
+	baseURL        string
+	credential     string
+	http           *http.Client
 }
 
 type nodeClaim struct {
@@ -173,11 +189,14 @@ func (w *NodeWorker) Run(ctx context.Context) error {
 	heartbeatDone := make(chan error, 1)
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
-	go func() { heartbeatDone <- w.heartbeatLoop(heartbeatCtx) }()
+	heartbeatExited := make(chan struct{})
+	go func() { defer close(heartbeatExited); heartbeatDone <- w.heartbeatLoop(heartbeatCtx) }()
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	wakeFailure := make(chan error, 1)
-	go w.wakeLoop(workerCtx, wakeFailure)
+	wakeExited := make(chan struct{})
+	go func() { defer close(wakeExited); w.wakeLoop(workerCtx, wakeFailure) }()
+	defer func() { cancelHeartbeat(); cancelWorkers(); <-heartbeatExited; <-wakeExited }()
 	var workers sync.WaitGroup
 	workerCount := nodeWorkerPollerCount(w.concurrency, resources.LogicalCPUs)
 	for i := 0; i < workerCount; i++ {
@@ -450,12 +469,23 @@ func (w *NodeWorker) reportResources(ctx context.Context, resources storage.Exec
 	if !force && !w.resourceAt.IsZero() && time.Since(w.resourceAt) < 10*time.Second && w.resources.MaxConcurrentTasks == resources.MaxConcurrentTasks {
 		return nil
 	}
-	if err := w.client.heartbeatWithResources(ctx, w.platform, w.capabilities, resources); err != nil {
+	var catalog *storage.NodeCatalog
+	if w.catalogReader != nil {
+		c, err := w.catalogReader(ctx)
+		if err != nil {
+			return err
+		}
+		catalog = &c
+	}
+	if err := w.client.heartbeatWithCatalog(ctx, w.platform, w.capabilities, resources, catalog); err != nil {
 		return err
 	}
 	capacityIncreased := resources.MaxConcurrentTasks > w.resources.MaxConcurrentTasks
 	w.resources = resources
 	w.resourceAt = time.Now()
+	if w.connectionObserver != nil {
+		w.connectionObserver()
+	}
 	if capacityIncreased {
 		// A sleeping poller may have been parked after the host ran out of
 		// memory/CPU slots. Wake it as soon as a verified heartbeat reports
@@ -736,19 +766,47 @@ func (c *nodeAPIClient) heartbeat(ctx context.Context, platform string, capabili
 }
 
 func (c *nodeAPIClient) heartbeatWithResources(ctx context.Context, platform string, capabilities []string, resources storage.ExecutionNodeResources) error {
+	return c.heartbeatWithCatalog(ctx, platform, capabilities, resources, nil)
+}
+func (c *nodeAPIClient) heartbeatWithCatalog(ctx context.Context, platform string, capabilities []string, resources storage.ExecutionNodeResources, catalog *storage.NodeCatalog) error {
 	if err := resources.Validate(); err != nil {
 		return err
 	}
 	var readBack struct {
+		Catalog      *storage.NodeCatalog           `json:"catalog,omitempty"`
+		ID           string                         `json:"id"`
+		Connectivity string                         `json:"connectivity"`
+		LastSeen     *time.Time                     `json:"lastSeen"`
+		RevokedAt    *time.Time                     `json:"revokedAt"`
 		Platform     string                         `json:"platform"`
 		Capabilities []string                       `json:"capabilities"`
 		Resources    storage.ExecutionNodeResources `json:"resources"`
 	}
-	if err := c.callJSON(ctx, http.MethodPost, "/api/v1/nodes/heartbeat", "", map[string]any{"platform": platform, "capabilities": capabilities, "resources": resources}, &readBack); err != nil {
+	payload := map[string]any{"platform": platform, "capabilities": capabilities, "resources": resources}
+	if catalog != nil {
+		payload["catalog"] = catalog
+	}
+	if err := c.callJSON(ctx, http.MethodPost, "/api/v1/nodes/heartbeat", "", payload, &readBack); err != nil {
 		return err
+	}
+	if c.expectedNodeID != "" && (readBack.ID != c.expectedNodeID || readBack.Connectivity != "connected" || readBack.LastSeen == nil || readBack.LastSeen.IsZero() || readBack.RevokedAt != nil) {
+		return errors.New("node heartbeat did not confirm the signed-in computer identity")
 	}
 	if readBack.Platform != platform || !sameStringSequence(readBack.Capabilities, capabilities) || readBack.Resources != resources {
 		return errors.New("node heartbeat response did not read back the reported resources")
+	}
+	if catalog != nil {
+		want, err := json.Marshal(catalog)
+		if err != nil {
+			return err
+		}
+		got, err := json.Marshal(readBack.Catalog)
+		if err != nil {
+			return err
+		}
+		if string(want) != string(got) {
+			return errors.New("node heartbeat did not read back the model and permission catalog")
+		}
 	}
 	return nil
 }

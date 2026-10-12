@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, net, protocol, session, ipcMain, clipboard, Tray, Menu } = require('electron');
+const { app, BrowserWindow, dialog, net, protocol, session, ipcMain, clipboard, Tray, Menu, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -346,6 +346,13 @@ app.whenReady().then(async () => {
         return true;
       }
       return false;
+    });
+    ipcMain.handle('o-open-account-login', async (event, rawURL) => {
+      if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame || typeof rawURL !== 'string') throw new Error('Invalid login page');
+      const url = new URL(rawURL);
+      const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+      if (url.username || url.password || (url.protocol !== 'https:' && !(url.protocol === 'http:' && local)) || !url.searchParams.has('device_login')) throw new Error('Invalid account login URL');
+      await shell.openExternal(url.href);
     });
     ipcMain.handle('o-select-directory', async (_event, options) => {
       if (!mainWindow) return null;

@@ -22,6 +22,7 @@ import (
 	"axiom.local/agent/internal/browsercontrol"
 	"axiom.local/agent/internal/config"
 	"axiom.local/agent/internal/core"
+	"axiom.local/agent/internal/deviceaccount"
 	"axiom.local/agent/internal/domain"
 	"axiom.local/agent/internal/evalharness"
 	"axiom.local/agent/internal/evolution"
@@ -362,8 +363,50 @@ func run() error {
 	if err := evalHarnessService.Recover(ctx, workspaceID); err != nil {
 		return err
 	}
+	var accountService *deviceaccount.Service
+	var accountStartupError error
+	if cfg.ExecutionRole == "local" && cfg.NodeControlURL == "" {
+		localExecutor, err := execution.NewLocalAgentExecutor(agentService, providerService, workspaceID, "")
+		if err != nil {
+			return err
+		}
+		accountService, err = deviceaccount.New(ctx, store, vaultService, func(workerCtx context.Context, b deviceaccount.Binding, observed func()) error {
+			worker, err := execution.NewNodeWorker(b.ServerURL, b.Credential, runtime.GOOS, []string{"agent-runtime", "conversation-transcript", "sandboxed-tools", "safe-handoff"}, localExecutor)
+			if err != nil {
+				return err
+			}
+			if err = worker.SetConcurrency(cfg.NodeWorkerConcurrency); err != nil {
+				return err
+			}
+			if err = worker.SetOutboxDirectory(filepath.Join(absoluteData, "node-task-outbox", b.OutboxKey())); err != nil {
+				return err
+			}
+			worker.SetAccountReporting(b.NodeID, func(c context.Context) (storage.NodeCatalog, error) {
+				providers, err := providerService.List(c, workspaceID)
+				if err != nil {
+					return storage.NodeCatalog{}, err
+				}
+				catalog := storage.NodeCatalog{Models: []storage.NodeModel{}, PermissionProfiles: []domain.PermissionProfile{domain.PermissionProfileReadOnly, domain.PermissionProfileWorkspaceAutonomy, domain.PermissionProfileRequestApproval, domain.PermissionProfileFullyAutonomous}}
+				for _, p := range providers {
+					catalog.Models = append(catalog.Models, storage.NodeModel{ID: p.ID, Name: p.Name, Model: p.Model, SupportsVision: p.SupportsVision})
+				}
+				return catalog, nil
+			}, observed)
+			return worker.Run(workerCtx)
+		}, execution.IsNodeCredentialRejected)
+		if err != nil {
+			accountStartupError = err
+			slog.Error("optional local account could not be restored; local Agent remains available", "error", err)
+		}
+		if accountService != nil {
+			defer accountService.Close()
+		}
+	}
 	api := httpapi.New(workspaceID, providerService, agentService, evolutionService, evalHarnessService, bootstrapService, forgeService, store, plugins, cfg.FrontendOrigin, searchService)
 	api.SetArtifactStore(artifactService)
+	api.SetDeviceAuthorizationVault(vaultService)
+	api.SetDeviceAccount(accountService)
+	api.SetDeviceAccountStartupError(accountStartupError)
 	api.SetRemoteAuthentication(cfg.AuthBootstrapToken)
 	if err := api.SetEmailAuthentication(httpapi.EmailAuthConfig{OwnerEmail: cfg.AuthOwnerEmail, ResendAPIKey: cfg.ResendAPIKey, MailFrom: cfg.AuthMailFrom, TurnstileSiteKey: cfg.TurnstileSiteKey, TurnstileSecret: cfg.TurnstileSecretKey}); err != nil {
 		return fmt.Errorf("initialize account authentication: %w", err)

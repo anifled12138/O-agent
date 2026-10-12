@@ -43,6 +43,7 @@ const control = http.createServer(async (req, res) => {
 await new Promise((resolve, reject) => { control.once('error', reject); control.listen(0, '127.0.0.1', resolve); });
 const controlUrl = `http://127.0.0.1:${control.address().port}`;
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(O_|AXIOM_)/i.test(name)));
+const rendererOrigin = 'oapp://app';
 async function start() {
   const listener = http.createServer();
   await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve); });
@@ -55,7 +56,7 @@ async function start() {
     env: { ...cleanEnv, O_ADDR: `127.0.0.1:${port}`, O_EXECUTION_ROLE: 'local',
       O_DATA_DIR: path.join(scratch, 'data'), O_WORKSPACE_ROOT: path.join(scratch, 'workspace'),
       O_AGENT_TEMP_DIR: path.join(scratch, 'temp'), O_DESKTOP_STDIN: '1',
-      O_FRONTEND_ORIGIN: url, O_NODE_CONTROL_URL: controlUrl, O_NODE_CREDENTIAL: credential },
+      O_FRONTEND_ORIGIN: rendererOrigin, O_NODE_CONTROL_URL: controlUrl, O_NODE_CREDENTIAL: credential },
   });
   let logs = '';
   child.stdout.on('data', chunk => { logs = (logs + chunk).slice(-12000); });
@@ -87,7 +88,7 @@ async function stop() {
   finally { clearTimeout(timer); child = undefined; }
 }
 async function request(url, route, method = 'GET', body) {
-  const response = await fetch(url + route, { method, headers: { Origin: url, 'Content-Type': 'application/json' },
+  const response = await fetch(url + route, { method, headers: { Origin: rendererOrigin, 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(5000) });
   const data = await response.json();
   assert.ok(response.ok, `packaged API ${route} failed: ${JSON.stringify(data)}`);
@@ -95,6 +96,10 @@ async function request(url, route, method = 'GET', body) {
 }
 try {
   let url = await start();
+  const untrusted = await fetch(`${url}/api/v1/providers`, {
+    headers: { Origin: 'oapp://other' }, signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(untrusted.status, 403, 'untrusted renderer origin was accepted');
   const provider = await request(url, '/api/v1/providers', 'POST', {
     name: 'Package smoke fixture', kind: 'openai-compatible', baseUrl: controlUrl,
     model: 'package-smoke-fixture', apiKey: 'synthetic-package-smoke-key',
@@ -113,7 +118,7 @@ try {
   assert.equal(afterRestart.title, conversation.title);
   await stop();
   if (protocolError) throw protocolError;
-  process.stdout.write('Packaged Windows host verified: remote heartbeat/polling and conversation persistence across restart.\n');
+  process.stdout.write('Packaged Windows host verified: desktop renderer origin, rejected foreign origin, remote heartbeat/polling and conversation persistence across restart.\n');
 } catch (error) {
   mainError = error;
   throw error;

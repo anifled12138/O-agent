@@ -287,3 +287,34 @@ func TestCloudQuotaRequiresExplicitOptInIncludingLegacyInstallations(t *testing.
 		t.Fatal("malformed quota switch was silently ignored")
 	}
 }
+
+func TestPackagedDesktopOriginRemainsLocal(t *testing.T) {
+	for _, name := range []string{"O_ADDR", "AXIOM_ADDR", "O_FRONTEND_ORIGIN", "AXIOM_FRONTEND_ORIGIN", "O_EXECUTION_ROLE", "AXIOM_EXECUTION_ROLE", "O_AUTH_BOOTSTRAP_TOKEN", "AXIOM_AUTH_BOOTSTRAP_TOKEN"} {
+		t.Setenv(name, "")
+	}
+	base := Load()
+	base.FrontendOrigin = "oapp://app"
+	if err := base.Validate(); err != nil {
+		t.Fatalf("packaged local desktop required Web-only configuration: %v", err)
+	}
+	for _, origin := range []string{"oapp://other", "oapp://app/", "oapp://app/path", "oapp://app:80", "oapp://user@app", "oapp://app?query=1", "oapp://app#fragment", "file:///index.html"} {
+		cfg := base
+		cfg.FrontendOrigin = origin
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("unexpected desktop origin accepted: %s", origin)
+		}
+	}
+	for _, role := range []string{"local", "cloud"} {
+		cfg := base
+		cfg.ExecutionRole = role
+		if role == "local" {
+			cfg.Addr = "0.0.0.0:9171"
+		}
+		cfg.AuthBootstrapToken = "01234567890123456789012345678901"
+		cfg.TLSCertFile = "server.crt"
+		cfg.TLSKeyFile = "server.key"
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("desktop origin accepted for role=%s addr=%s", role, cfg.Addr)
+		}
+	}
+}

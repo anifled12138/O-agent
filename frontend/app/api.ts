@@ -1,6 +1,6 @@
 declare global {
   interface Window {
-    oDesktop?: Readonly<{ apiOrigin: string; platform: string; version: string; copyText?: (text: string) => Promise<boolean> | boolean }>;
+    oDesktop?: Readonly<{ apiOrigin: string; platform: string; version: string; openExternal?: (url: string) => Promise<void>; copyText?: (text: string) => Promise<boolean> | boolean }>;
   }
 }
 
@@ -670,6 +670,7 @@ export async function getProjectPublications(id: string): Promise<ProjectPublica
 }
 
 export interface ExecutionNode {
+  catalog?: {models: {id: string; name: string; model: string; supportsVision?: boolean | null}[]; permissionProfiles: ConversationPermissionProfile[]};
   id: string;
   name: string;
   platform: string;
@@ -726,11 +727,11 @@ export interface ExecutionTask {
   updatedAt: string;
 }
 
-export async function submitLocalAgentTask(conversationId: string, targetNodeId: string, content: string, idempotencyKey: string, artifactIds: string[] = []): Promise<{ task: ExecutionTask; created: boolean }> {
+export async function submitLocalAgentTask(conversationId: string, targetNodeId: string, content: string, idempotencyKey: string, artifactIds: string[] = [], localProviderId?: string): Promise<{ task: ExecutionTask; created: boolean }> {
   return request<{ task: ExecutionTask; created: boolean }>(`/conversations/${encodeURIComponent(conversationId)}/tasks/nodes`, {
     method: 'POST',
     headers: { 'Idempotency-Key': idempotencyKey },
-    body: JSON.stringify({ targetNodeId, content, waitForNode: false, artifactIds }),
+    body: JSON.stringify({ targetNodeId, content, waitForNode: false, artifactIds, localProviderId }),
   });
 }
 

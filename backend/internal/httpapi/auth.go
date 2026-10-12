@@ -314,7 +314,7 @@ func (s *Server) requireAuthentication(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/api/v1/nodes/heartbeat" || r.URL.Path == "/api/v1/nodes/connect" || strings.HasPrefix(r.URL.Path, "/api/v1/nodes/tasks/") {
+		if r.URL.Path == "/api/v1/nodes/self/revoke" || r.URL.Path == "/api/v1/nodes/heartbeat" || r.URL.Path == "/api/v1/nodes/connect" || strings.HasPrefix(r.URL.Path, "/api/v1/nodes/tasks/") {
 			provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if provided == "" || provided == r.Header.Get("Authorization") {
 				write(w, http.StatusUnauthorized, map[string]string{"error": "node credential required"})
@@ -322,6 +322,17 @@ func (s *Server) requireAuthentication(next http.Handler) http.Handler {
 			}
 			node, err := s.store.ExecutionNodeForToken(r.Context(), hashToken(provided))
 			if err != nil {
+				if r.Method == http.MethodPost && r.URL.Path == "/api/v1/nodes/self/revoke" {
+					revoked, readErr := s.store.DeviceCredentialRevoked(r.Context(), s.workspaceID, hashToken(provided))
+					if readErr != nil {
+						fail(w, readErr)
+						return
+					}
+					if revoked {
+						write(w, 200, map[string]string{"status": "revoked"})
+						return
+					}
+				}
 				write(w, http.StatusUnauthorized, map[string]string{"error": "node credential is invalid or revoked"})
 				return
 			}

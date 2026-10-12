@@ -31,6 +31,8 @@ type LocalAgentExecutor struct {
 }
 
 type localAgentPrompt struct {
+	LocalProviderID         string                    `json:"localProviderId,omitempty"`
+	PermissionProfile       domain.PermissionProfile  `json:"permissionProfile,omitempty"`
 	Kind                    string                    `json:"kind"`
 	SourceConversationID    string                    `json:"sourceConversationId"`
 	Content                 string                    `json:"content"`
@@ -355,7 +357,10 @@ func (e *LocalAgentExecutor) executeNodeTask(ctx context.Context, task storage.E
 	if err != nil {
 		return nil, fmt.Errorf("list local model providers: %w", err)
 	}
-	providerID := e.providerID
+	providerID := input.LocalProviderID
+	if providerID == "" {
+		providerID = e.providerID
+	}
 	if providerID == "" && len(configured) == 1 {
 		providerID = configured[0].ID
 	}
@@ -367,7 +372,7 @@ func (e *LocalAgentExecutor) executeNodeTask(ctx context.Context, task storage.E
 		}
 	}
 	if !providerAvailable {
-		return nil, errors.New("local provider selection is ambiguous or unavailable; configure O_NODE_PROVIDER_ID or leave exactly one local provider configured")
+		return nil, errors.New("所选本地模型不可用，请在远程页面重新选择这台电脑上的模型")
 	}
 	var localProject domain.Project
 	projectID, projectCommit, sourceProjectID := "", "", ""
@@ -479,7 +484,17 @@ func (e *LocalAgentExecutor) executeNodeTask(ctx context.Context, task storage.E
 		return nil, errors.Join(fmt.Errorf("stage task input artifacts in the local workspace: %w", err), removeNodeTaskInputDirectory(inputDir, inputWorkspace))
 	}
 	input.Content += inputPrompt
-	conversation, err := e.agent.CreateWithProject(ctx, e.workspace, input.Title, providerID, projectID)
+	profile := input.PermissionProfile
+	if profile == "" {
+		profile = sourceContext.Conversation.PermissionProfile
+	}
+	if profile == "" {
+		profile = domain.DefaultPermissionProfile()
+	}
+	if !profile.Valid() {
+		return nil, errors.Join(domain.ErrInvalid, removeNodeTaskInputDirectory(inputDir, inputWorkspace))
+	}
+	conversation, err := e.agent.CreateWithProjectAndPermissionProfile(ctx, e.workspace, input.Title, providerID, projectID, profile)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("create local task conversation: %w", err), removeNodeTaskInputDirectory(inputDir, inputWorkspace))
 	}
